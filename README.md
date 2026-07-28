@@ -52,7 +52,6 @@ xcodebuild -project DarthScriptum.xcodeproj -scheme DarthScriptum -destination '
 
 - `src/`: application, document synchronization, editor, presentation, theme, and workspace code
 - `tests/`: unit, integration, race-regression, and performance tests
-- `ui-tests/`: application launch and native UI checks
 - `scripts/`: reproducible verification entry point
 - `.context/`: ignored planning, handoff, and validation evidence
 
