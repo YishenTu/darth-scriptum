@@ -1,0 +1,158 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		F00000000000000000000001 /* MarkdownEngine in Frameworks */ = {isa = PBXBuildFile; productRef = F00000000000000000000002 /* MarkdownEngine */; };
+		F00000000000000000000004 /* MarkdownEngineLatex in Frameworks */ = {isa = PBXBuildFile; productRef = F00000000000000000000005 /* MarkdownEngineLatex */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		D00000000000000000000001 = {isa = PBXContainerItemProxy; containerPortal = A00000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = B00000000000000000000001; remoteInfo = DarthMD; };
+		D00000000000000000000002 = {isa = PBXContainerItemProxy; containerPortal = A00000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = B00000000000000000000001; remoteInfo = DarthMD; };
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A00000000000000000000003 /* DarthMD.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DarthMD.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000004 /* DarthMDTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DarthMDTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000005 /* DarthMDUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DarthMDUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		C00000000000000000000004 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (info.plist,); target = B00000000000000000000001 /* DarthMD */; };
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		C00000000000000000000001 /* src */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (C00000000000000000000004,); path = src; sourceTree = "<group>"; };
+		C00000000000000000000002 /* tests */ = {isa = PBXFileSystemSynchronizedRootGroup; path = tests; sourceTree = "<group>"; };
+		C00000000000000000000003 /* ui-tests */ = {isa = PBXFileSystemSynchronizedRootGroup; path = "ui-tests"; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		E00000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (F00000000000000000000001 /* MarkdownEngine in Frameworks */, F00000000000000000000004 /* MarkdownEngineLatex in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+		E00000000000000000000004 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		E00000000000000000000007 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A00000000000000000000002 = {isa = PBXGroup; children = (C00000000000000000000001 /* src */, C00000000000000000000002 /* tests */, C00000000000000000000003 /* ui-tests */, A00000000000000000000006 /* Products */,); sourceTree = "<group>"; };
+		A00000000000000000000006 /* Products */ = {isa = PBXGroup; children = (A00000000000000000000003 /* DarthMD.app */, A00000000000000000000004 /* DarthMDTests.xctest */, A00000000000000000000005 /* DarthMDUITests.xctest */,); name = Products; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		B00000000000000000000001 /* DarthMD */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = H00000000000000000000002;
+			buildPhases = (E00000000000000000000002, E00000000000000000000001, E00000000000000000000003,);
+			buildRules = ();
+			dependencies = ();
+			fileSystemSynchronizedGroups = (C00000000000000000000001 /* src */,);
+			name = DarthMD;
+			packageProductDependencies = (F00000000000000000000002 /* MarkdownEngine */, F00000000000000000000005 /* MarkdownEngineLatex */,);
+			productName = DarthMD;
+			productReference = A00000000000000000000003 /* DarthMD.app */;
+			productType = "com.apple.product-type.application";
+		};
+		B00000000000000000000002 /* DarthMDTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = H00000000000000000000003;
+			buildPhases = (E00000000000000000000005, E00000000000000000000004, E00000000000000000000006,);
+			buildRules = ();
+			dependencies = (D00000000000000000000003,);
+			fileSystemSynchronizedGroups = (C00000000000000000000002 /* tests */,);
+			name = DarthMDTests;
+			productName = DarthMDTests;
+			productReference = A00000000000000000000004 /* DarthMDTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		B00000000000000000000003 /* DarthMDUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = H00000000000000000000004;
+			buildPhases = (E00000000000000000000008, E00000000000000000000007, E00000000000000000000009,);
+			buildRules = ();
+			dependencies = (D00000000000000000000004,);
+			fileSystemSynchronizedGroups = (C00000000000000000000003 /* ui-tests */,);
+			name = DarthMDUITests;
+			productName = DarthMDUITests;
+			productReference = A00000000000000000000005 /* DarthMDUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A00000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2640;
+				LastUpgradeCheck = 2640;
+				TargetAttributes = {
+					B00000000000000000000001 = {CreatedOnToolsVersion = 26.4;};
+					B00000000000000000000002 = {CreatedOnToolsVersion = 26.4; TestTargetID = B00000000000000000000001;};
+					B00000000000000000000003 = {CreatedOnToolsVersion = 26.4; TestTargetID = B00000000000000000000001;};
+				};
+			};
+			buildConfigurationList = H00000000000000000000001;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base,);
+			mainGroup = A00000000000000000000002;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (F00000000000000000000003 /* swift-markdown-engine */,);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = A00000000000000000000006 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (B00000000000000000000001 /* DarthMD */, B00000000000000000000002 /* DarthMDTests */, B00000000000000000000003 /* DarthMDUITests */,);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		E00000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		E00000000000000000000006 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		E00000000000000000000009 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		E00000000000000000000002 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		E00000000000000000000005 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		E00000000000000000000008 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		D00000000000000000000003 = {isa = PBXTargetDependency; target = B00000000000000000000001 /* DarthMD */; targetProxy = D00000000000000000000001; };
+		D00000000000000000000004 = {isa = PBXTargetDependency; target = B00000000000000000000001 /* DarthMD */; targetProxy = D00000000000000000000002; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		G00000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; MACOSX_DEPLOYMENT_TARGET = 14.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = macosx; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; SWIFT_OPTIMIZATION_LEVEL = "-Onone";}; name = Debug;};
+		G00000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_COMPILATION_MODE = wholemodule;}; name = Release;};
+		G00000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = "app-icon"; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; ENABLE_APP_SANDBOX = NO; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = src/info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMD; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_TREAT_WARNINGS_AS_ERRORS = YES; SWIFT_VERSION = 6.0;}; name = Debug;};
+		G00000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = "app-icon"; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; ENABLE_APP_SANDBOX = NO; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = src/info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMD; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_TREAT_WARNINGS_AS_ERRORS = YES; SWIFT_VERSION = 6.0;}; name = Release;};
+		G00000000000000000000005 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMDTests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DarthMD.app/Contents/MacOS/DarthMD";}; name = Debug;};
+		G00000000000000000000006 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMDTests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DarthMD.app/Contents/MacOS/DarthMD";}; name = Release;};
+		G00000000000000000000007 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMDUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 6.0; TEST_TARGET_NAME = DarthMD;}; name = Debug;};
+		G00000000000000000000008 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMDUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 6.0; TEST_TARGET_NAME = DarthMD;}; name = Release;};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		H00000000000000000000001 = {isa = XCConfigurationList; buildConfigurations = (G00000000000000000000001, G00000000000000000000002,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+		H00000000000000000000002 = {isa = XCConfigurationList; buildConfigurations = (G00000000000000000000003, G00000000000000000000004,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+		H00000000000000000000003 = {isa = XCConfigurationList; buildConfigurations = (G00000000000000000000005, G00000000000000000000006,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+		H00000000000000000000004 = {isa = XCConfigurationList; buildConfigurations = (G00000000000000000000007, G00000000000000000000008,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release;};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		F00000000000000000000003 /* swift-markdown-engine */ = {isa = XCRemoteSwiftPackageReference; repositoryURL = "https://github.com/nodes-app/swift-markdown-engine.git"; requirement = {kind = exactVersion; version = 0.10.1;};};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		F00000000000000000000002 /* MarkdownEngine */ = {isa = XCSwiftPackageProductDependency; package = F00000000000000000000003 /* swift-markdown-engine */; productName = MarkdownEngine;};
+		F00000000000000000000005 /* MarkdownEngineLatex */ = {isa = XCSwiftPackageProductDependency; package = F00000000000000000000003 /* swift-markdown-engine */; productName = MarkdownEngineLatex;};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = A00000000000000000000001 /* Project object */;
+}
