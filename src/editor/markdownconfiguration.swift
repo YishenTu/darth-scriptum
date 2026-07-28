@@ -5,14 +5,14 @@ import MarkdownEngineCodeBlocks
 import MarkdownEngineLatex
 
 @MainActor
-enum DarthMarkdownConfiguration {
-    private static let latexRenderer = DarthLatexRenderer()
+enum MarkdownConfigurationFactory {
+    private static let latexRenderer = AdaptiveLatexRenderer()
     private static let syntaxHighlighter = HighlighterSwiftBridge(
         lightTheme: "atom-one-dark",
         darkTheme: "atom-one-dark",
         autoSwitchAppearance: false,
-        lightBackground: DarthTheme.codeBackground,
-        darkBackground: DarthTheme.codeBackground,
+        lightBackground: AppTheme.codeBackground,
+        darkBackground: AppTheme.codeBackground,
         preferredFontNames: [
             "DejaVu Sans Mono for Powerline",
             "SF Mono",
@@ -24,28 +24,28 @@ enum DarthMarkdownConfiguration {
         rawSourceMode: Bool,
         fontSize: CGFloat,
         documentURL: URL?,
-        latexRenderer: DarthLatexRenderer? = nil
+        latexRenderer: AdaptiveLatexRenderer? = nil
     ) -> MarkdownEditorConfiguration {
         let activeLatexRenderer = latexRenderer ?? self.latexRenderer
         let theme = MarkdownEditorTheme(
-            bodyText: DarthTheme.foreground,
-            mutedText: DarthTheme.mutedForeground,
-            disabledText: DarthTheme.mutedForeground.withAlphaComponent(0.65),
-            headingMarker: DarthTheme.accent,
-            link: DarthTheme.accent,
-            incompleteLink: DarthTheme.accent,
-            findMatchHighlight: DarthTheme.selectionBackground,
-            findCurrentMatchHighlight: DarthTheme.accent,
-            latexLightModeText: DarthTheme.foreground,
-            latexDarkModeText: DarthTheme.foreground,
-            strikethroughColor: DarthTheme.mutedForeground,
-            highlightColor: DarthTheme.selectionBackground
+            bodyText: AppTheme.foreground,
+            mutedText: AppTheme.mutedForeground,
+            disabledText: AppTheme.mutedForeground.withAlphaComponent(0.65),
+            headingMarker: AppTheme.accent,
+            link: AppTheme.accent,
+            incompleteLink: AppTheme.accent,
+            findMatchHighlight: AppTheme.selectionBackground,
+            findCurrentMatchHighlight: AppTheme.accent,
+            latexLightModeText: AppTheme.foreground,
+            latexDarkModeText: AppTheme.foreground,
+            strikethroughColor: AppTheme.mutedForeground,
+            highlightColor: AppTheme.selectionBackground
         )
         var configuration = MarkdownEditorConfiguration.default
         configuration.theme = theme
         configuration.services = MarkdownEditorServices(
-            images: DarthMarkdownImageProvider(documentURL: documentURL),
-            syntaxHighlighter: DarthSyntaxHighlighter(
+            images: MarkdownImageProvider(documentURL: documentURL),
+            syntaxHighlighter: CodeSyntaxHighlighter(
                 highlighter: syntaxHighlighter,
                 appearanceDidChangeNotification:
                     activeLatexRenderer.updateNotification
@@ -74,7 +74,7 @@ enum DarthMarkdownConfiguration {
     }
 }
 
-private struct DarthSyntaxHighlighter: SyntaxHighlighter {
+private struct CodeSyntaxHighlighter: SyntaxHighlighter {
     let highlighter: HighlighterSwiftBridge
     let appearanceDidChangeNotification: Notification.Name?
 
@@ -90,7 +90,7 @@ private struct DarthSyntaxHighlighter: SyntaxHighlighter {
         code: String,
         language: String?
     ) -> NSAttributedString? {
-        guard DarthSyntaxHighlightingPolicy.shouldHighlight(
+        guard SyntaxHighlightingPolicy.shouldHighlight(
             code: code,
             language: language
         ) else {
@@ -98,7 +98,7 @@ private struct DarthSyntaxHighlighter: SyntaxHighlighter {
         }
         return highlighter.highlight(
             code: code,
-            language: DarthSyntaxHighlightingPolicy.supportedLanguage(
+            language: SyntaxHighlightingPolicy.supportedLanguage(
                 language
             )
         )
@@ -106,7 +106,7 @@ private struct DarthSyntaxHighlighter: SyntaxHighlighter {
 
 }
 
-enum DarthSyntaxHighlightingPolicy {
+enum SyntaxHighlightingPolicy {
     static let maximumCodeUTF8Bytes = 64 * 1_024
     private static let maximumLanguageUTF8Bytes = 64
     private static let aliases = [
@@ -190,7 +190,7 @@ enum DarthSyntaxHighlightingPolicy {
     }
 }
 
-final class DarthMarkdownImageProvider: EmbeddedImageProvider, @unchecked Sendable {
+final class MarkdownImageProvider: EmbeddedImageProvider, @unchecked Sendable {
     private static let maximumImageFileBytes = 8 * 1_024 * 1_024
     private static let maximumDecodedImageCost = 32 * 1_024 * 1_024
 

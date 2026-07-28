@@ -1,7 +1,7 @@
 import XCTest
 
 @MainActor
-final class DarthMDUITests: XCTestCase {
+final class DarthScriptumUITests: XCTestCase {
     private static let editorLaunchArguments = [
         "-ApplePersistenceIgnoreState", "YES",
         "--skip-opening-untitled-document"

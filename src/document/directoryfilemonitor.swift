@@ -21,7 +21,7 @@ final class DirectoryFileMonitor: @unchecked Sendable {
         self.onChange = onChange
         self.onDescriptorClosed = onDescriptorClosed
         queue = DispatchQueue(
-            label: "com.yishentu.DarthMD.directory-monitor.\(UUID().uuidString)",
+            label: "com.yishentu.DarthScriptum.directory-monitor.\(UUID().uuidString)",
             qos: .utility
         )
     }

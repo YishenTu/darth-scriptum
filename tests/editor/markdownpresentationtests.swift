@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 @MainActor
 final class MarkdownPresentationTests: XCTestCase {

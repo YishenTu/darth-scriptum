@@ -12,9 +12,9 @@ final class WorkspaceModel: ObservableObject {
     let secondaryPane: EditorPaneModel
 
     init() {
-        let latexRenderer = DarthLatexRenderer(
+        let latexRenderer = AdaptiveLatexRenderer(
             updateNotification: Notification.Name(
-                "DarthMD.LatexRendererDidUpdate.\(UUID().uuidString)"
+                "DarthScriptum.LatexRendererDidUpdate.\(UUID().uuidString)"
             )
         )
         let primaryPane = EditorPaneModel(latexRenderer: latexRenderer)
@@ -80,18 +80,18 @@ struct MarkdownWorkspace: View {
 
     var body: some View {
         ZStack {
-            DarthMaterialView()
+            MaterialView()
                 .ignoresSafeArea()
-            Color(nsColor: DarthTheme.background)
+            Color(nsColor: AppTheme.background)
                 .opacity(
                     NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
                         ? 1
-                        : DarthTheme.backgroundOverlayOpacity
+                        : AppTheme.backgroundOverlayOpacity
                 )
                 .ignoresSafeArea()
             VStack(spacing: 0) {
                 editorSurface
-                Divider().overlay(Color(nsColor: DarthTheme.separator))
+                Divider().overlay(Color(nsColor: AppTheme.separator))
                 statusBar
             }
         }
@@ -145,7 +145,7 @@ struct MarkdownWorkspace: View {
                         performStatusAction(action)
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(Color(nsColor: DarthTheme.accent))
+                    .foregroundStyle(Color(nsColor: AppTheme.accent))
                     .accessibilityLabel(action.label)
                 }
                 if statusPresentation.offersLocalRevisionRestore {
@@ -153,7 +153,7 @@ struct MarkdownWorkspace: View {
                         syncCoordinator.restoreLatestRecovery()
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(Color(nsColor: DarthTheme.accent))
+                    .foregroundStyle(Color(nsColor: AppTheme.accent))
                     .accessibilityLabel("Restore Local Revision")
                 }
                 if statusPresentation.offersRawRecoveryDiscard {
@@ -161,7 +161,7 @@ struct MarkdownWorkspace: View {
                         syncCoordinator.resumeSynchronization()
                     }
                     .buttonStyle(.plain)
-                    .foregroundStyle(Color(nsColor: DarthTheme.failure))
+                    .foregroundStyle(Color(nsColor: AppTheme.failure))
                     .accessibilityLabel(
                         "Discard Raw Recovery and Resume Synchronization"
                     )
@@ -182,7 +182,7 @@ struct MarkdownWorkspace: View {
                 )
             }
             .buttonStyle(.plain)
-            .foregroundStyle(Color(nsColor: DarthTheme.accent))
+            .foregroundStyle(Color(nsColor: AppTheme.accent))
             .help(model.sourceMode ? "Use Live Preview" : "Use Source Mode")
             .accessibilityLabel("Toggle Source Mode")
             Button {
@@ -191,17 +191,17 @@ struct MarkdownWorkspace: View {
                 Image(systemName: model.isSplit ? "rectangle" : "rectangle.split.2x1")
             }
             .buttonStyle(.plain)
-            .foregroundStyle(Color(nsColor: DarthTheme.accent))
+            .foregroundStyle(Color(nsColor: AppTheme.accent))
             .help(model.isSplit ? "Close Split" : "Split Editor")
             .accessibilityLabel("Toggle Split")
         }
         .font(.system(size: 11, weight: .medium, design: .monospaced))
-        .foregroundStyle(Color(nsColor: DarthTheme.mutedForeground))
+        .foregroundStyle(Color(nsColor: AppTheme.mutedForeground))
         .padding(.horizontal, 12)
         .frame(height: 28)
         .background(
-            Color(nsColor: DarthTheme.background)
-                .opacity(DarthTheme.statusBarOverlayOpacity)
+            Color(nsColor: AppTheme.background)
+                .opacity(AppTheme.statusBarOverlayOpacity)
         )
     }
 
@@ -224,9 +224,9 @@ struct MarkdownWorkspace: View {
     ) -> Color {
         switch tone {
         case .failure:
-            Color(nsColor: DarthTheme.failure)
+            Color(nsColor: AppTheme.failure)
         case .accent:
-            Color(nsColor: DarthTheme.accent)
+            Color(nsColor: AppTheme.accent)
         }
     }
 
@@ -421,7 +421,7 @@ enum TabShortcutPolicy {
 @MainActor
 enum TabShortcutPresentation {
     private static let labelIdentifier = NSUserInterfaceItemIdentifier(
-        "DarthMD.TabShortcut"
+        "DarthScriptum.TabShortcut"
     )
 
     static func update(windows: [NSWindow]) {
@@ -509,7 +509,7 @@ final class MarkdownWindowController: NSWindowController, NSWindowDelegate {
         window.isMovableByWindowBackground = true
         super.init(window: window)
         window.delegate = self
-        window.setAccessibilityLabel("DarthMD — \(displayName)")
+        window.setAccessibilityLabel("DarthScriptum — \(displayName)")
     }
 
     func windowDidResignKey(_ notification: Notification) {

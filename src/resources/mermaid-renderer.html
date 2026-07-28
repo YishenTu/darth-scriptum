@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; font-src 'none'; media-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+  >
+  <meta name="color-scheme" content="dark">
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: transparent;
+    }
+
+    #render-target {
+      position: fixed;
+      left: -100000px;
+      top: 0;
+      width: 4096px;
+      visibility: hidden;
+    }
+  </style>
+  <script defer src="Mermaid.bundle/mermaid.min.js"></script>
+  <script defer src="mermaid-renderer.js"></script>
+</head>
+<body>
+  <div id="render-target" aria-hidden="true"></div>
+</body>
+</html>

@@ -19,7 +19,7 @@ enum CommitRecoveryJournalStore {
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first!.appendingPathComponent(
-            "DarthMD/recovery",
+            "DarthScriptum/recovery",
             isDirectory: true
         )
     }()

@@ -1,6 +1,6 @@
 import Combine
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 @MainActor
 final class MarkdownSourceBufferTests: XCTestCase {

@@ -5,17 +5,26 @@ import SwiftUI
 @MainActor
 final class EditorPaneModel: ObservableObject, Identifiable {
     let id = UUID()
-    let latexRenderer: DarthLatexRenderer
+    let latexRenderer: AdaptiveLatexRenderer
+    let mermaidRenderer: MermaidRenderer
     @Published var selectedRange = NSRange(location: 0, length: 0)
     @Published var visibleOrigin = NSPoint.zero
     @Published var line = 1
     @Published var column = 1
     @Published var isPositionPending = false
 
-    init(latexRenderer: DarthLatexRenderer? = nil) {
-        self.latexRenderer = latexRenderer ?? DarthLatexRenderer(
+    init(
+        latexRenderer: AdaptiveLatexRenderer? = nil,
+        mermaidRenderer: MermaidRenderer? = nil
+    ) {
+        self.latexRenderer = latexRenderer ?? AdaptiveLatexRenderer(
             updateNotification: Notification.Name(
-                "DarthMD.LatexRendererDidUpdate.\(UUID().uuidString)"
+                "DarthScriptum.LatexRendererDidUpdate.\(UUID().uuidString)"
+            )
+        )
+        self.mermaidRenderer = mermaidRenderer ?? MermaidRenderer(
+            updateNotification: Notification.Name(
+                "DarthScriptum.MermaidRendererDidUpdate.\(UUID().uuidString)"
             )
         )
     }
@@ -78,13 +87,13 @@ struct LivePreviewTextView: NSViewRepresentable {
         )
         return NativeTextViewWrapper(
             text: editorText,
-            configuration: DarthMarkdownConfiguration.make(
+            configuration: MarkdownConfigurationFactory.make(
                 rawSourceMode: rawSourceMode,
                 fontSize: fontSize,
                 documentURL: documentURL,
                 latexRenderer: pane.latexRenderer
             ),
-            fontName: DarthTheme.editorFont(size: fontSize).fontName,
+            fontName: AppTheme.editorFont(size: fontSize).fontName,
             fontSize: fontSize,
             documentId: pane.id.uuidString,
             retainedScrollDocumentIds: [pane.id.uuidString]

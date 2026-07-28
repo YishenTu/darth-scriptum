@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-enum DarthTheme {
+enum AppTheme {
     static let background = NSColor(hex: 0x1A1614)
     static let backgroundOverlayOpacity: CGFloat = 0.55
     static let statusBarOverlayOpacity: CGFloat = 0.66
@@ -98,7 +98,7 @@ extension NSColor {
     }
 }
 
-struct DarthMaterialView: NSViewRepresentable {
+struct MaterialView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()
         view.material = .underWindowBackground

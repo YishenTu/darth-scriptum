@@ -1,6 +1,6 @@
 import AppKit
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 @MainActor
 final class WorkspaceModelTests: XCTestCase {

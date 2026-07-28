@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 final class DirectoryFileMonitorTests: XCTestCase {
     func testCancellationClosesTheOwnedDescriptor() throws {

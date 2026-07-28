@@ -1,10 +1,10 @@
 import AppKit
 import MarkdownEngine
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 @MainActor
-final class DarthLatexRendererTests: XCTestCase {
+final class AdaptiveLatexRendererTests: XCTestCase {
     func testMathJaxRendersBlackScholesFormulaWithDfrac() async throws {
         let renderer = MathJaxFallbackRenderer()
         let formula = #"""
@@ -75,14 +75,14 @@ final class DarthLatexRendererTests: XCTestCase {
         let center = NotificationCenter()
         let counter = LockedCounter()
         let observer = center.addObserver(
-            forName: .darthLatexRendererDidUpdate,
+            forName: .latexRendererDidUpdate,
             object: nil,
             queue: nil
         ) { _ in
             counter.increment()
         }
         defer { center.removeObserver(observer) }
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback,
             notificationCenter: center
@@ -126,14 +126,14 @@ final class DarthLatexRendererTests: XCTestCase {
         let center = NotificationCenter()
         let counter = LockedCounter()
         let observer = center.addObserver(
-            forName: .darthLatexRendererDidUpdate,
+            forName: .latexRendererDidUpdate,
             object: nil,
             queue: nil
         ) { _ in
             counter.increment()
         }
         defer { center.removeObserver(observer) }
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback,
             notificationCenter: center
@@ -173,7 +173,7 @@ final class DarthLatexRendererTests: XCTestCase {
             result: Self.makeResult(),
             delay: .milliseconds(100)
         )
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback
         )
@@ -210,12 +210,12 @@ final class DarthLatexRendererTests: XCTestCase {
             result: Self.makeResult(),
             delay: .milliseconds(200)
         )
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback
         )
 
-        for index in 0..<(DarthLatexRenderer.maximumPendingEntries + 10) {
+        for index in 0..<(AdaptiveLatexRenderer.maximumPendingEntries + 10) {
             XCTAssertNil(
                 renderer.render(
                     latex: "formula-\(index)",
@@ -226,11 +226,11 @@ final class DarthLatexRendererTests: XCTestCase {
         }
 
         try await waitUntil {
-            fallback.callCount == DarthLatexRenderer.maximumPendingEntries
+            fallback.callCount == AdaptiveLatexRenderer.maximumPendingEntries
         }
         XCTAssertEqual(
             fallback.callCount,
-            DarthLatexRenderer.maximumPendingEntries
+            AdaptiveLatexRenderer.maximumPendingEntries
         )
     }
 
@@ -241,21 +241,21 @@ final class DarthLatexRendererTests: XCTestCase {
         let center = NotificationCenter()
         let counter = LockedCounter()
         let observer = center.addObserver(
-            forName: .darthLatexRendererDidUpdate,
+            forName: .latexRendererDidUpdate,
             object: nil,
             queue: nil
         ) { _ in
             counter.increment()
         }
         defer { center.removeObserver(observer) }
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback,
             notificationCenter: center
         )
         let theme = MarkdownEditorTheme()
         let staleFormulas = (
-            0..<(DarthLatexRenderer.maximumPendingEntries + 4)
+            0..<(AdaptiveLatexRenderer.maximumPendingEntries + 4)
         ).map { "stale-\($0)" }
         let currentFormula = "current-presentation"
         let source = (staleFormulas + [currentFormula])
@@ -278,7 +278,7 @@ final class DarthLatexRendererTests: XCTestCase {
         }
         try await waitUntil {
             fallback.startedFormulas.count
-                == DarthLatexRenderer.maximumPendingEntries
+                == AdaptiveLatexRenderer.maximumPendingEntries
         }
 
         renderer.prepareForPresentation(
@@ -302,7 +302,7 @@ final class DarthLatexRendererTests: XCTestCase {
         XCTAssertEqual(fallback.startedFormulas.last, currentFormula)
         XCTAssertFalse(
             fallback.startedFormulas.contains(
-                staleFormulas[DarthLatexRenderer.maximumPendingEntries]
+                staleFormulas[AdaptiveLatexRenderer.maximumPendingEntries]
             )
         )
         XCTAssertEqual(counter.value, 0)
@@ -320,7 +320,7 @@ final class DarthLatexRendererTests: XCTestCase {
         )
 
         for formula in staleFormulas[
-            1..<DarthLatexRenderer.maximumPendingEntries
+            1..<AdaptiveLatexRenderer.maximumPendingEntries
         ] {
             fallback.complete(formula: formula)
         }
@@ -337,21 +337,21 @@ final class DarthLatexRendererTests: XCTestCase {
         let center = NotificationCenter()
         let counter = LockedCounter()
         let observer = center.addObserver(
-            forName: .darthLatexRendererDidUpdate,
+            forName: .latexRendererDidUpdate,
             object: nil,
             queue: nil
         ) { _ in
             counter.increment()
         }
         defer { center.removeObserver(observer) }
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback,
             notificationCenter: center
         )
         let theme = MarkdownEditorTheme()
         let formulas = (
-            0..<(DarthLatexRenderer.maximumPendingEntries + 4)
+            0..<(AdaptiveLatexRenderer.maximumPendingEntries + 4)
         ).map { "formula-\($0)" }
         let source = formulas.joined(separator: "\n")
 
@@ -372,7 +372,7 @@ final class DarthLatexRendererTests: XCTestCase {
         }
         try await waitUntil {
             fallback.startedFormulas.count
-                == DarthLatexRenderer.maximumPendingEntries
+                == AdaptiveLatexRenderer.maximumPendingEntries
         }
 
         renderer.prepareForPresentation(
@@ -382,7 +382,7 @@ final class DarthLatexRendererTests: XCTestCase {
             source: source
         )
         for formula in formulas.prefix(
-            DarthLatexRenderer.maximumPendingEntries
+            AdaptiveLatexRenderer.maximumPendingEntries
         ) {
             fallback.complete(formula: formula)
         }
@@ -392,7 +392,7 @@ final class DarthLatexRendererTests: XCTestCase {
         }
         XCTAssertEqual(
             fallback.startedFormulas.count,
-            DarthLatexRenderer.maximumPendingEntries
+            AdaptiveLatexRenderer.maximumPendingEntries
         )
         XCTAssertEqual(counter.value, 0)
     }
@@ -403,14 +403,14 @@ final class DarthLatexRendererTests: XCTestCase {
         let center = NotificationCenter()
         let counter = LockedCounter()
         let observer = center.addObserver(
-            forName: .darthLatexRendererDidUpdate,
+            forName: .latexRendererDidUpdate,
             object: nil,
             queue: nil
         ) { _ in
             counter.increment()
         }
         defer { center.removeObserver(observer) }
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: primary,
             fallback: fallback,
             notificationCenter: center
@@ -459,12 +459,12 @@ final class DarthLatexRendererTests: XCTestCase {
 
     func testHybridRendererBoundsSuccessfulPrimaryCache() {
         let primary = CountingSupportedLatexRenderer()
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: primary,
             fallback: StubMathJaxFallback(result: nil)
         )
         let theme = MarkdownEditorTheme()
-        let formulaCount = DarthLatexRenderer.maximumTrackedEntries + 1
+        let formulaCount = AdaptiveLatexRenderer.maximumTrackedEntries + 1
 
         for index in 0..<formulaCount {
             XCTAssertNotNil(
@@ -489,12 +489,12 @@ final class DarthLatexRendererTests: XCTestCase {
 
     func testHybridRendererEvictsLeastRecentlyUsedEntryAtCapacity() async throws {
         let fallback = StubMathJaxFallback(result: Self.makeResult())
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback
         )
         let theme = MarkdownEditorTheme()
-        let formulas = (0..<DarthLatexRenderer.maximumTrackedEntries)
+        let formulas = (0..<AdaptiveLatexRenderer.maximumTrackedEntries)
             .map { "formula-\($0)" }
 
         renderer.prepareForPresentation(
@@ -619,7 +619,7 @@ final class DarthLatexRendererTests: XCTestCase {
                 .rendered(Self.makeOutput())
             ]
         )
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback
         )
@@ -666,12 +666,12 @@ final class DarthLatexRendererTests: XCTestCase {
 
     func testHybridRendererBoundsTransientFailureState() async throws {
         let fallback = AlwaysTransientMathJaxFallback()
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback
         )
         let theme = MarkdownEditorTheme()
-        let formulas = (0...DarthLatexRenderer.maximumTrackedEntries)
+        let formulas = (0...AdaptiveLatexRenderer.maximumTrackedEntries)
             .map { "transient-\($0)" }
 
         renderer.prepareForPresentation(
@@ -683,10 +683,10 @@ final class DarthLatexRendererTests: XCTestCase {
         for batchStart in stride(
             from: 0,
             to: formulas.count,
-            by: DarthLatexRenderer.maximumPendingEntries
+            by: AdaptiveLatexRenderer.maximumPendingEntries
         ) {
             let batchEnd = min(
-                batchStart + DarthLatexRenderer.maximumPendingEntries,
+                batchStart + AdaptiveLatexRenderer.maximumPendingEntries,
                 formulas.count
             )
             for formula in formulas[batchStart..<batchEnd] {
@@ -705,7 +705,7 @@ final class DarthLatexRendererTests: XCTestCase {
 
         XCTAssertEqual(
             renderer.transientFailureEntryCountForTesting,
-            DarthLatexRenderer.maximumTrackedEntries
+            AdaptiveLatexRenderer.maximumTrackedEntries
         )
     }
 
@@ -714,14 +714,14 @@ final class DarthLatexRendererTests: XCTestCase {
         let center = NotificationCenter()
         let counter = LockedCounter()
         let observer = center.addObserver(
-            forName: .darthLatexRendererDidUpdate,
+            forName: .latexRendererDidUpdate,
             object: nil,
             queue: nil
         ) { _ in
             counter.increment()
         }
         defer { center.removeObserver(observer) }
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback,
             notificationCenter: center
@@ -759,14 +759,14 @@ final class DarthLatexRendererTests: XCTestCase {
         let center = NotificationCenter()
         let counter = LockedCounter()
         let observer = center.addObserver(
-            forName: .darthLatexRendererDidUpdate,
+            forName: .latexRendererDidUpdate,
             object: nil,
             queue: nil
         ) { _ in
             counter.increment()
         }
         defer { center.removeObserver(observer) }
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback,
             notificationCenter: center
@@ -806,7 +806,7 @@ final class DarthLatexRendererTests: XCTestCase {
             result: nil,
             delay: .milliseconds(10)
         )
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback
         )
@@ -835,7 +835,7 @@ final class DarthLatexRendererTests: XCTestCase {
 
     func testHybridRendererRejectsOversizedInputBeforeFallback() async {
         let fallback = StubMathJaxFallback(result: Self.makeResult())
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback
         )
@@ -844,7 +844,7 @@ final class DarthLatexRendererTests: XCTestCase {
             renderer.render(
                 latex: String(
                     repeating: "x",
-                    count: DarthLatexRenderer.maximumLatexUTF8Bytes + 1
+                    count: AdaptiveLatexRenderer.maximumLatexUTF8Bytes + 1
                 ),
                 fontSize: 14,
                 theme: MarkdownEditorTheme()
@@ -856,13 +856,13 @@ final class DarthLatexRendererTests: XCTestCase {
 
     func testHybridRendererMeasuresCombiningMarksByStorageLength() async {
         let fallback = StubMathJaxFallback(result: Self.makeResult())
-        let renderer = DarthLatexRenderer(
+        let renderer = AdaptiveLatexRenderer(
             primary: UnsupportedLatexRenderer(),
             fallback: fallback
         )
         let oversizedSingleGrapheme = "a" + String(
             repeating: "\u{0301}",
-            count: DarthLatexRenderer.maximumLatexUTF8Bytes
+            count: AdaptiveLatexRenderer.maximumLatexUTF8Bytes
         )
 
         XCTAssertEqual(oversizedSingleGrapheme.count, 1)

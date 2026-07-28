@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 final class SourceTypesTests: XCTestCase {
     func testEditUsesUTF16Ranges() throws {

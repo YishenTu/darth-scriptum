@@ -1,4 +1,4 @@
-# DarthMD Development Instructions
+# DarthScriptum Development Instructions
 
 ## Build and verification
 
@@ -8,8 +8,8 @@
 
 ```sh
 xcodebuild \
-  -project darth-md.xcodeproj \
-  -scheme darth-md \
+  -project DarthScriptum.xcodeproj \
+  -scheme DarthScriptum \
   -configuration Debug \
   -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath DerivedData \
@@ -21,7 +21,7 @@ xcodebuild \
 
 ## Relaunch after code changes
 
-- After a successful build of any runtime-affecting change, gracefully quit the currently running DarthMD process, launch `DerivedData/Build/Products/Debug/DarthMD.app`, and confirm that its window is visible.
+- After a successful build of any runtime-affecting change, gracefully quit the currently running DarthScriptum process, launch `DerivedData/Build/Products/Debug/DarthScriptum.app`, and confirm that its window is visible.
 - Leave the relaunched Debug app running so the user can test the result.
 - Do not relaunch for documentation-only, test-only, or other non-runtime changes.
 - Do not copy the app into `/Applications` during normal development. Installing is only necessary when the user explicitly asks for it or when testing packaging, signing, updates, or distribution behavior.

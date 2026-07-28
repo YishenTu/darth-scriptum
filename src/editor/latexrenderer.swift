@@ -5,8 +5,8 @@ import MarkdownEngineLatex
 import WebKit
 
 extension Notification.Name {
-    static let darthLatexRendererDidUpdate = Notification.Name(
-        "DarthMD.LatexRendererDidUpdate"
+    static let latexRendererDidUpdate = Notification.Name(
+        "DarthScriptum.LatexRendererDidUpdate"
     )
 }
 
@@ -45,7 +45,7 @@ private struct UncachedSwiftMathRenderer: LatexRenderer {
 }
 
 @MainActor
-final class DarthLatexRenderer: LatexRenderer, @unchecked Sendable {
+final class AdaptiveLatexRenderer: LatexRenderer, @unchecked Sendable {
     static let maximumLatexUTF8Bytes = 32_768
     static let maximumPendingEntries = 8
 
@@ -127,7 +127,7 @@ final class DarthLatexRenderer: LatexRenderer, @unchecked Sendable {
         primary: any LatexRenderer = UncachedSwiftMathRenderer(),
         fallback: (any MathJaxFallbackRendering)? = nil,
         notificationCenter: NotificationCenter = .default,
-        updateNotification: Notification.Name = .darthLatexRendererDidUpdate
+        updateNotification: Notification.Name = .latexRendererDidUpdate
     ) {
         self.primary = primary
         self.fallback = fallback ?? MathJaxFallbackRenderer()
@@ -744,7 +744,7 @@ final class DarthLatexRenderer: LatexRenderer, @unchecked Sendable {
 final class MathJaxFallbackRenderer: NSObject, MathJaxFallbackRendering {
     private static let maximumSVGBytes = 2 * 1_024 * 1_024
     private static let maximumQueuedRenders =
-        DarthLatexRenderer.maximumPendingEntries
+        AdaptiveLatexRenderer.maximumPendingEntries
 
     private(set) var lastError: String?
     private lazy var webView = makeWebView()
@@ -786,7 +786,7 @@ final class MathJaxFallbackRenderer: NSObject, MathJaxFallbackRendering {
         do {
             let value = try await webView.callAsyncJavaScript(
                 """
-                return await window.darthRenderLatex(
+                return await window.renderLatex(
                     latex,
                     fontSize,
                     color
@@ -894,7 +894,7 @@ final class MathJaxFallbackRenderer: NSObject, MathJaxFallbackRendering {
         let decodedByteCount = pixelWidth * pixelHeight * 4
         let total = decodedByteCount + Double(svgByteCount)
         guard total.isFinite,
-              total <= Double(DarthLatexRenderer.maximumCacheCost),
+              total <= Double(AdaptiveLatexRenderer.maximumCacheCost),
               total <= Double(Int.max) else {
             return nil
         }

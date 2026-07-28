@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 @MainActor
 final class LivePreviewTextViewTests: XCTestCase {
@@ -107,7 +107,7 @@ final class LivePreviewTextViewTests: XCTestCase {
     }
 
     func testConfiguredLatexRendererSupportsFinancialFormula() {
-        let configuration = DarthMarkdownConfiguration.make(
+        let configuration = MarkdownConfigurationFactory.make(
             rawSourceMode: false,
             fontSize: 14,
             documentURL: nil
@@ -146,7 +146,7 @@ final class LivePreviewTextViewTests: XCTestCase {
             )
         )
         XCTAssertTrue(
-            DarthMarkdownConfiguration.make(
+            MarkdownConfigurationFactory.make(
                 rawSourceMode: MarkdownPresentationPolicy.usesRawSource(
                     requestedSourceMode: false,
                     text: overLimit
@@ -235,9 +235,9 @@ final class LivePreviewTextViewTests: XCTestCase {
                     .compactMap(\.identifier?.rawValue)
             )
             return identifiers.contains(
-                "DarthMD.MarkdownEditor.\(primaryPane.id.uuidString)"
+                "DarthScriptum.MarkdownEditor.\(primaryPane.id.uuidString)"
             ) && identifiers.contains(
-                "DarthMD.MarkdownEditor.\(secondaryPane.id.uuidString)"
+                "DarthScriptum.MarkdownEditor.\(secondaryPane.id.uuidString)"
             )
         }
 
@@ -255,7 +255,7 @@ final class LivePreviewTextViewTests: XCTestCase {
             descendantTextViews(in: hostingView)
                 .first(where: {
                     $0.identifier?.rawValue
-                        == "DarthMD.MarkdownEditor."
+                        == "DarthScriptum.MarkdownEditor."
                             + secondaryPane.id.uuidString
                 })
         )
@@ -312,7 +312,7 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
         try await waitUntil {
             textView.identifier?.rawValue
-                == "DarthMD.MarkdownEditor.\(pane.id.uuidString)"
+                == "DarthScriptum.MarkdownEditor.\(pane.id.uuidString)"
         }
         textView.setSelectedRange(NSRange(location: 0, length: 0))
         NotificationCenter.default.post(
@@ -507,7 +507,7 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
         try await waitUntil {
             textView.identifier?.rawValue
-                == "DarthMD.MarkdownEditor.\(pane.id.uuidString)"
+                == "DarthScriptum.MarkdownEditor.\(pane.id.uuidString)"
         }
 
         let nsSource = source as NSString
@@ -566,7 +566,7 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
         try await waitUntil {
             textView.identifier?.rawValue
-                == "DarthMD.MarkdownEditor.\(pane.id.uuidString)"
+                == "DarthScriptum.MarkdownEditor.\(pane.id.uuidString)"
         }
 
         let contentRange = (source as NSString).range(of: "\n  \(formula)\n")
@@ -640,7 +640,7 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
         try await waitUntil {
             textView.identifier?.rawValue
-                == "DarthMD.MarkdownEditor.\(pane.id.uuidString)"
+                == "DarthScriptum.MarkdownEditor.\(pane.id.uuidString)"
         }
         textView.setSelectedRange(NSRange(location: 8, length: 0))
 
@@ -688,7 +688,7 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
         try await waitUntil {
             textView.identifier?.rawValue
-                == "DarthMD.MarkdownEditor.\(pane.id.uuidString)"
+                == "DarthScriptum.MarkdownEditor.\(pane.id.uuidString)"
         }
         window.makeKeyAndOrderFront(nil)
         XCTAssertTrue(window.makeFirstResponder(textView))

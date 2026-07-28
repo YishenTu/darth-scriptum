@@ -12,18 +12,18 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
-		D00000000000000000000001 = {isa = PBXContainerItemProxy; containerPortal = A00000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = B00000000000000000000001; remoteInfo = DarthMD; };
-		D00000000000000000000002 = {isa = PBXContainerItemProxy; containerPortal = A00000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = B00000000000000000000001; remoteInfo = DarthMD; };
+		D00000000000000000000001 = {isa = PBXContainerItemProxy; containerPortal = A00000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = B00000000000000000000001; remoteInfo = DarthScriptum; };
+		D00000000000000000000002 = {isa = PBXContainerItemProxy; containerPortal = A00000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = B00000000000000000000001; remoteInfo = DarthScriptum; };
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		A00000000000000000000003 /* DarthMD.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DarthMD.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		A00000000000000000000004 /* DarthMDTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DarthMDTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		A00000000000000000000005 /* DarthMDUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DarthMDUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000003 /* DarthScriptum.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DarthScriptum.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000004 /* DarthScriptumTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DarthScriptumTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000005 /* DarthScriptumUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DarthScriptumUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		C00000000000000000000004 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (info.plist,); target = B00000000000000000000001 /* DarthMD */; };
+		C00000000000000000000004 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (info.plist,); target = B00000000000000000000001 /* DarthScriptum */; };
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -40,45 +40,45 @@
 
 /* Begin PBXGroup section */
 		A00000000000000000000002 = {isa = PBXGroup; children = (C00000000000000000000001 /* src */, C00000000000000000000002 /* tests */, C00000000000000000000003 /* ui-tests */, A00000000000000000000006 /* Products */,); sourceTree = "<group>"; };
-		A00000000000000000000006 /* Products */ = {isa = PBXGroup; children = (A00000000000000000000003 /* DarthMD.app */, A00000000000000000000004 /* DarthMDTests.xctest */, A00000000000000000000005 /* DarthMDUITests.xctest */,); name = Products; sourceTree = "<group>"; };
+		A00000000000000000000006 /* Products */ = {isa = PBXGroup; children = (A00000000000000000000003 /* DarthScriptum.app */, A00000000000000000000004 /* DarthScriptumTests.xctest */, A00000000000000000000005 /* DarthScriptumUITests.xctest */,); name = Products; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		B00000000000000000000001 /* DarthMD */ = {
+		B00000000000000000000001 /* DarthScriptum */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = H00000000000000000000002;
 			buildPhases = (E00000000000000000000002, E00000000000000000000001, E00000000000000000000003,);
 			buildRules = ();
 			dependencies = ();
 			fileSystemSynchronizedGroups = (C00000000000000000000001 /* src */,);
-			name = DarthMD;
+			name = DarthScriptum;
 			packageProductDependencies = (F00000000000000000000002 /* MarkdownEngine */, F00000000000000000000005 /* MarkdownEngineLatex */, F00000000000000000000007 /* MarkdownEngineCodeBlocks */,);
-			productName = DarthMD;
-			productReference = A00000000000000000000003 /* DarthMD.app */;
+			productName = DarthScriptum;
+			productReference = A00000000000000000000003 /* DarthScriptum.app */;
 			productType = "com.apple.product-type.application";
 		};
-		B00000000000000000000002 /* DarthMDTests */ = {
+		B00000000000000000000002 /* DarthScriptumTests */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = H00000000000000000000003;
 			buildPhases = (E00000000000000000000005, E00000000000000000000004, E00000000000000000000006,);
 			buildRules = ();
 			dependencies = (D00000000000000000000003,);
 			fileSystemSynchronizedGroups = (C00000000000000000000002 /* tests */,);
-			name = DarthMDTests;
-			productName = DarthMDTests;
-			productReference = A00000000000000000000004 /* DarthMDTests.xctest */;
+			name = DarthScriptumTests;
+			productName = DarthScriptumTests;
+			productReference = A00000000000000000000004 /* DarthScriptumTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
-		B00000000000000000000003 /* DarthMDUITests */ = {
+		B00000000000000000000003 /* DarthScriptumUITests */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = H00000000000000000000004;
 			buildPhases = (E00000000000000000000008, E00000000000000000000007, E00000000000000000000009,);
 			buildRules = ();
 			dependencies = (D00000000000000000000004,);
 			fileSystemSynchronizedGroups = (C00000000000000000000003 /* ui-tests */,);
-			name = DarthMDUITests;
-			productName = DarthMDUITests;
-			productReference = A00000000000000000000005 /* DarthMDUITests.xctest */;
+			name = DarthScriptumUITests;
+			productName = DarthScriptumUITests;
+			productReference = A00000000000000000000005 /* DarthScriptumUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
 /* End PBXNativeTarget section */
@@ -107,7 +107,7 @@
 			productRefGroup = A00000000000000000000006 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
-			targets = (B00000000000000000000001 /* DarthMD */, B00000000000000000000002 /* DarthMDTests */, B00000000000000000000003 /* DarthMDUITests */,);
+			targets = (B00000000000000000000001 /* DarthScriptum */, B00000000000000000000002 /* DarthScriptumTests */, B00000000000000000000003 /* DarthScriptumUITests */,);
 		};
 /* End PBXProject section */
 
@@ -124,19 +124,19 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
-		D00000000000000000000003 = {isa = PBXTargetDependency; target = B00000000000000000000001 /* DarthMD */; targetProxy = D00000000000000000000001; };
-		D00000000000000000000004 = {isa = PBXTargetDependency; target = B00000000000000000000001 /* DarthMD */; targetProxy = D00000000000000000000002; };
+		D00000000000000000000003 = {isa = PBXTargetDependency; target = B00000000000000000000001 /* DarthScriptum */; targetProxy = D00000000000000000000001; };
+		D00000000000000000000004 = {isa = PBXTargetDependency; target = B00000000000000000000001 /* DarthScriptum */; targetProxy = D00000000000000000000002; };
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		G00000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; DEBUG_INFORMATION_FORMAT = dwarf; ENABLE_TESTABILITY = YES; GCC_C_LANGUAGE_STANDARD = gnu17; GCC_OPTIMIZATION_LEVEL = 0; MACOSX_DEPLOYMENT_TARGET = 14.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = macosx; SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG; SWIFT_OPTIMIZATION_LEVEL = "-Onone";}; name = Debug;};
 		G00000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; CLANG_ENABLE_OBJC_ARC = YES; DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym"; ENABLE_NS_ASSERTIONS = NO; GCC_C_LANGUAGE_STANDARD = gnu17; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_COMPILATION_MODE = wholemodule;}; name = Release;};
-		G00000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = "app-icon"; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; ENABLE_APP_SANDBOX = NO; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = src/info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMD; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_TREAT_WARNINGS_AS_ERRORS = YES; SWIFT_VERSION = 6.0;}; name = Debug;};
-		G00000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = "app-icon"; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; ENABLE_APP_SANDBOX = NO; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = src/info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMD; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_TREAT_WARNINGS_AS_ERRORS = YES; SWIFT_VERSION = 6.0;}; name = Release;};
-		G00000000000000000000005 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMDTests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DarthMD.app/Contents/MacOS/DarthMD";}; name = Debug;};
-		G00000000000000000000006 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMDTests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DarthMD.app/Contents/MacOS/DarthMD";}; name = Release;};
-		G00000000000000000000007 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMDUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 6.0; TEST_TARGET_NAME = DarthMD;}; name = Debug;};
-		G00000000000000000000008 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthMDUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 6.0; TEST_TARGET_NAME = DarthMD;}; name = Release;};
+		G00000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = "app-icon"; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; ENABLE_APP_SANDBOX = NO; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = src/info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthScriptum; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_TREAT_WARNINGS_AS_ERRORS = YES; SWIFT_VERSION = 6.0;}; name = Debug;};
+		G00000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ASSETCATALOG_COMPILER_APPICON_NAME = "app-icon"; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; ENABLE_APP_SANDBOX = NO; ENABLE_HARDENED_RUNTIME = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = src/info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthScriptum; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_DEFAULT_ACTOR_ISOLATION = nonisolated; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_TREAT_WARNINGS_AS_ERRORS = YES; SWIFT_VERSION = 6.0;}; name = Release;};
+		G00000000000000000000005 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthScriptumTests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DarthScriptum.app/Contents/MacOS/DarthScriptum";}; name = Debug;};
+		G00000000000000000000006 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthScriptumTests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/DarthScriptum.app/Contents/MacOS/DarthScriptum";}; name = Release;};
+		G00000000000000000000007 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthScriptumUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 6.0; TEST_TARGET_NAME = DarthScriptum;}; name = Debug;};
+		G00000000000000000000008 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.yishentu.DarthScriptumUITests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 6.0; TEST_TARGET_NAME = DarthScriptum;}; name = Release;};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */

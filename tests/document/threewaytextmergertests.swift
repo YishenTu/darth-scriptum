@@ -1,5 +1,5 @@
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 final class ThreeWayTextMergerTests: XCTestCase {
     private let merger = ThreeWayTextMerger()

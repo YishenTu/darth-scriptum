@@ -1,11 +1,11 @@
 import AppKit
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 @MainActor
-final class DarthMarkdownConfigurationTests: XCTestCase {
+final class MarkdownConfigurationFactoryTests: XCTestCase {
     func testConfiguredSyntaxHighlighterHighlightsPythonCode() throws {
-        let configuration = DarthMarkdownConfiguration.make(
+        let configuration = MarkdownConfigurationFactory.make(
             rawSourceMode: false,
             fontSize: 14,
             documentURL: nil
@@ -26,60 +26,60 @@ final class DarthMarkdownConfigurationTests: XCTestCase {
         XCTAssertGreaterThan(distinctForegroundColors(in: highlighted), 1)
     }
 
-    func testConfiguredSyntaxHighlighterUsesDarthCodeStyling() {
-        let highlighter = DarthMarkdownConfiguration.make(
+    func testConfiguredSyntaxHighlighterUsesCodeStyling() {
+        let highlighter = MarkdownConfigurationFactory.make(
             rawSourceMode: false,
             fontSize: 14,
             documentURL: nil
         ).services.syntaxHighlighter
 
-        XCTAssertEqual(highlighter.backgroundColor(), DarthTheme.codeBackground)
+        XCTAssertEqual(highlighter.backgroundColor(), AppTheme.codeBackground)
         XCTAssertTrue(highlighter.codeFont(size: 14).isFixedPitch)
     }
 
     func testSyntaxHighlighterBoundsAndCanonicalizesLanguageNames() {
         XCTAssertEqual(
-            DarthSyntaxHighlightingPolicy.supportedLanguage(" JS "),
+            SyntaxHighlightingPolicy.supportedLanguage(" JS "),
             "javascript"
         )
         XCTAssertEqual(
-            DarthSyntaxHighlightingPolicy.supportedLanguage("python"),
+            SyntaxHighlightingPolicy.supportedLanguage("python"),
             "python"
         )
         XCTAssertNil(
-            DarthSyntaxHighlightingPolicy.supportedLanguage(
+            SyntaxHighlightingPolicy.supportedLanguage(
                 "unknown-language"
             )
         )
         XCTAssertNil(
-            DarthSyntaxHighlightingPolicy.supportedLanguage(
+            SyntaxHighlightingPolicy.supportedLanguage(
                 String(repeating: "x", count: 65)
             )
         )
     }
 
     func testSyntaxHighlighterRejectsOversizedCodeBeforeHighlighting() {
-        let maximum = DarthSyntaxHighlightingPolicy.maximumCodeUTF8Bytes
+        let maximum = SyntaxHighlightingPolicy.maximumCodeUTF8Bytes
         XCTAssertTrue(
-            DarthSyntaxHighlightingPolicy.shouldHighlight(
+            SyntaxHighlightingPolicy.shouldHighlight(
                 code: String(repeating: "x", count: maximum),
                 language: "plaintext"
             )
         )
         XCTAssertFalse(
-            DarthSyntaxHighlightingPolicy.shouldHighlight(
+            SyntaxHighlightingPolicy.shouldHighlight(
                 code: String(repeating: "x", count: maximum + 1),
                 language: "plaintext"
             )
         )
         XCTAssertFalse(
-            DarthSyntaxHighlightingPolicy.shouldHighlight(
+            SyntaxHighlightingPolicy.shouldHighlight(
                 code: "let value = 1",
                 language: "unknown-language"
             )
         )
 
-        let highlighter = DarthMarkdownConfiguration.make(
+        let highlighter = MarkdownConfigurationFactory.make(
             rawSourceMode: false,
             fontSize: 14,
             documentURL: nil

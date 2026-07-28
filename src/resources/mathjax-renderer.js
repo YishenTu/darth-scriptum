@@ -103,7 +103,7 @@
     ]).finally(() => clearTimeout(timeoutID));
   }
 
-  window.darthRenderLatex = async (latex, fontSize, color) => {
+  window.renderLatex = async (latex, fontSize, color) => {
     try {
       if (
         typeof latex !== "string"

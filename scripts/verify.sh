@@ -2,10 +2,10 @@
 
 set -euo pipefail
 
-project_path="darth-md.xcodeproj"
-scheme_name="darth-md"
+project_path="DarthScriptum.xcodeproj"
+scheme_name="DarthScriptum"
 destination_name="platform=macOS,arch=arm64"
-derived_data="$(mktemp -d "${TMPDIR:-/tmp}/darth-md-verify.XXXXXX")"
+derived_data="$(mktemp -d "${TMPDIR:-/tmp}/darth-scriptum-verify.XXXXXX")"
 
 cleanup() {
   /usr/bin/find "$derived_data" -depth -delete

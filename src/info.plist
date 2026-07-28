@@ -24,7 +24,7 @@
 				<string>net.daringfireball.markdown</string>
 			</array>
 			<key>NSDocumentClass</key>
-			<string>DarthMD.MarkdownDocument</string>
+			<string>DarthScriptum.MarkdownDocument</string>
 		</dict>
 		<dict>
 			<key>CFBundleTypeExtensions</key>
@@ -43,7 +43,7 @@
 				<string>public.plain-text</string>
 			</array>
 			<key>NSDocumentClass</key>
-			<string>DarthMD.MarkdownDocument</string>
+			<string>DarthScriptum.MarkdownDocument</string>
 		</dict>
 	</array>
 	<key>CFBundleExecutable</key>

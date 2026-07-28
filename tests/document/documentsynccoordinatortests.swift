@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 @MainActor
 final class DocumentSyncCoordinatorTests: XCTestCase {

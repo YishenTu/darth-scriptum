@@ -1,7 +1,7 @@
 import AppKit
 import XCTest
 
-@testable import DarthMD
+@testable import DarthScriptum
 
 @MainActor
 final class AppDelegateTests: XCTestCase {
@@ -58,13 +58,13 @@ final class AppDelegateTests: XCTestCase {
             Notification(name: NSApplication.willFinishLaunchingNotification)
         )
 
-        let appMenu = NSApp.mainMenu?.item(withTitle: "DarthMD")?.submenu
+        let appMenu = NSApp.mainMenu?.item(withTitle: "DarthScriptum")?.submenu
         let fileMenu = NSApp.mainMenu?.item(withTitle: "File")?.submenu
         let viewMenu = NSApp.mainMenu?.item(withTitle: "View")?.submenu
         let windowMenu = NSApp.mainMenu?.item(withTitle: "Window")?.submenu
 
         assertShortcut(
-            appMenu?.item(withTitle: "Hide DarthMD"),
+            appMenu?.item(withTitle: "Hide DarthScriptum"),
             key: "h",
             modifiers: [.command],
             action: #selector(NSApplication.hide(_:))

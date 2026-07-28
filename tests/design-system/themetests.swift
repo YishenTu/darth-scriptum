@@ -1,31 +1,31 @@
 import AppKit
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 @MainActor
-final class DarthThemeTests: XCTestCase {
+final class AppThemeTests: XCTestCase {
     func testGhosttyColorTokens() {
-        XCTAssertEqual(DarthTheme.background.usingColorSpace(.sRGB)?.hexRGB, 0x1A1614)
-        XCTAssertLessThan(DarthTheme.backgroundOverlayOpacity, 0.7)
-        XCTAssertGreaterThan(DarthTheme.backgroundOverlayOpacity, 0)
-        XCTAssertLessThan(DarthTheme.statusBarOverlayOpacity, 0.78)
-        XCTAssertGreaterThan(DarthTheme.statusBarOverlayOpacity, 0)
-        XCTAssertEqual(DarthTheme.foreground.usingColorSpace(.sRGB)?.hexRGB, 0xE8D5B7)
-        XCTAssertEqual(DarthTheme.accent.usingColorSpace(.sRGB)?.hexRGB, 0xC4956A)
+        XCTAssertEqual(AppTheme.background.usingColorSpace(.sRGB)?.hexRGB, 0x1A1614)
+        XCTAssertLessThan(AppTheme.backgroundOverlayOpacity, 0.7)
+        XCTAssertGreaterThan(AppTheme.backgroundOverlayOpacity, 0)
+        XCTAssertLessThan(AppTheme.statusBarOverlayOpacity, 0.78)
+        XCTAssertGreaterThan(AppTheme.statusBarOverlayOpacity, 0)
+        XCTAssertEqual(AppTheme.foreground.usingColorSpace(.sRGB)?.hexRGB, 0xE8D5B7)
+        XCTAssertEqual(AppTheme.accent.usingColorSpace(.sRGB)?.hexRGB, 0xC4956A)
         XCTAssertEqual(
-            DarthTheme.selectionBackground.usingColorSpace(.sRGB)?.hexRGB,
+            AppTheme.selectionBackground.usingColorSpace(.sRGB)?.hexRGB,
             0x4A3A2A
         )
     }
 
     func testFontSizeIsClamped() {
-        XCTAssertEqual(DarthTheme.editorFont(size: 1).pointSize, 10, accuracy: 0.01)
-        XCTAssertEqual(DarthTheme.editorFont(size: 100).pointSize, 32, accuracy: 0.01)
+        XCTAssertEqual(AppTheme.editorFont(size: 1).pointSize, 10, accuracy: 0.01)
+        XCTAssertEqual(AppTheme.editorFont(size: 100).pointSize, 32, accuracy: 0.01)
     }
 
     func testHeadingLevelsHaveAStableReadableScale() {
         let sizes = (1...6).map {
-            DarthTheme.headingFont(level: $0, baseSize: 14).pointSize
+            AppTheme.headingFont(level: $0, baseSize: 14).pointSize
         }
 
         for (actual, expected) in zip(
@@ -35,19 +35,19 @@ final class DarthThemeTests: XCTestCase {
             XCTAssertEqual(actual, expected, accuracy: 0.01)
         }
         XCTAssertEqual(
-            DarthTheme.headingFont(level: 1, baseSize: 32).pointSize,
+            AppTheme.headingFont(level: 1, baseSize: 32).pointSize,
             64,
             accuracy: 0.01
         )
     }
 
     func testBlockParagraphStylesAddMarkdownSpacingAndIndentation() {
-        let body = DarthTheme.bodyParagraphStyle(fontSize: 14)
-        let heading = DarthTheme.headingParagraphStyle(
+        let body = AppTheme.bodyParagraphStyle(fontSize: 14)
+        let heading = AppTheme.headingParagraphStyle(
             level: 1,
             fontSize: 14
         )
-        let nestedList = DarthTheme.listParagraphStyle(
+        let nestedList = AppTheme.listParagraphStyle(
             depth: 2,
             fontSize: 14
         )

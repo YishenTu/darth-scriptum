@@ -1,5 +1,5 @@
 import XCTest
-@testable import DarthMD
+@testable import DarthScriptum
 
 final class TextFileCodecTests: XCTestCase {
     func testUTF8BOMAndMixedNewlinesRoundTrip() throws {

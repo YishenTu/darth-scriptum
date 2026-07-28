@@ -4,6 +4,7 @@ import AppKit
 final class EditorPaneStateCoordinator: NSObject {
     private let sourceBuffer: MarkdownSourceBuffer
     private let pane: EditorPaneModel
+    private let mermaidPresenter: MermaidBlockPresenter
     private let onBecameActive: @MainActor () -> Void
     private var presentation: MarkdownSourcePresentation
     private var normalizesDisplayMathSelection: Bool
@@ -24,6 +25,9 @@ final class EditorPaneStateCoordinator: NSObject {
     ) {
         self.sourceBuffer = sourceBuffer
         self.pane = pane
+        mermaidPresenter = MermaidBlockPresenter(
+            renderer: pane.mermaidRenderer
+        )
         self.presentation = presentation ?? MarkdownSourcePresentation.make(
             source: sourceBuffer.revision.text,
             rendersMarkdown: true
@@ -43,6 +47,12 @@ final class EditorPaneStateCoordinator: NSObject {
         lineIndexObservation = sourceBuffer.observeLineIndex { [weak self] in
             self?.updatePaneState()
         }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(renderedContentDidUpdate(_:)),
+            name: pane.mermaidRenderer.updateNotification,
+            object: nil
+        )
     }
 
     func stop() {
@@ -81,6 +91,7 @@ final class EditorPaneStateCoordinator: NSObject {
             pendingSelectionRestore = pane.selectedRange
             hasRestoredState = false
         }
+        scheduleMermaidPresentation()
     }
 
     private func attach(in rootView: NSView) {
@@ -104,7 +115,7 @@ final class EditorPaneStateCoordinator: NSObject {
             clipView = candidate.enclosingScrollView?.contentView
             candidate.setAccessibilityLabel("Markdown editor")
             candidate.identifier = NSUserInterfaceItemIdentifier(
-                "DarthMD.MarkdownEditor.\(pane.id.uuidString)"
+                "DarthScriptum.MarkdownEditor.\(pane.id.uuidString)"
             )
             NotificationCenter.default.addObserver(
                 self,
@@ -126,6 +137,7 @@ final class EditorPaneStateCoordinator: NSObject {
         restoreStateIfNeeded()
         restorePendingSelectionIfNeeded()
         updatePaneState()
+        scheduleMermaidPresentation()
     }
 
     @objc private func selectionDidChange(_ notification: Notification) {
@@ -143,6 +155,7 @@ final class EditorPaneStateCoordinator: NSObject {
                 self.onBecameActive()
             }
             self.updatePaneState()
+            self.scheduleMermaidPresentation()
         }
     }
 
@@ -161,7 +174,12 @@ final class EditorPaneStateCoordinator: NSObject {
             if self.pane.visibleOrigin != origin {
                 self.pane.visibleOrigin = origin
             }
+            self.scheduleMermaidPresentation()
         }
+    }
+
+    @objc private func renderedContentDidUpdate(_ notification: Notification) {
+        scheduleMermaidPresentation()
     }
 
     private func sourceDidChange(
@@ -200,6 +218,7 @@ final class EditorPaneStateCoordinator: NSObject {
         }
         presentation = newPresentation
         lastSourceText = revision.text
+        scheduleMermaidPresentation()
     }
 
     private func restoreStateIfNeeded() {
@@ -282,6 +301,21 @@ final class EditorPaneStateCoordinator: NSObject {
         }
         if pane.column != position.column {
             pane.column = position.column
+        }
+    }
+
+    private func scheduleMermaidPresentation() {
+        DispatchQueue.main.async { [weak self, weak textView] in
+            guard let self,
+                  let textView,
+                  textView === self.textView,
+                  textView.string == self.presentation.text else {
+                return
+            }
+            self.mermaidPresenter.apply(
+                to: textView,
+                rendersMarkdown: self.presentation.rendersMarkdown
+            )
         }
     }
 

@@ -162,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mainMenu = NSMenu()
 
         let appItem = NSMenuItem(
-            title: "DarthMD",
+            title: "DarthScriptum",
             action: nil,
             keyEquivalent: ""
         )
@@ -170,13 +170,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let appMenu = NSMenu()
         appItem.submenu = appMenu
         appMenu.addItem(
-            withTitle: "About DarthMD",
+            withTitle: "About DarthScriptum",
             action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
             keyEquivalent: ""
         )
         appMenu.addItem(.separator())
         let hideItem = appMenu.addItem(
-            withTitle: "Hide DarthMD",
+            withTitle: "Hide DarthScriptum",
             action: #selector(NSApplication.hide(_:)),
             keyEquivalent: "h"
         )
@@ -196,7 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showAllItem.target = NSApp
         appMenu.addItem(.separator())
         let quitItem = appMenu.addItem(
-            withTitle: "Quit DarthMD",
+            withTitle: "Quit DarthScriptum",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )

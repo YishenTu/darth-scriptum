@@ -17,9 +17,9 @@ struct SafeFileCommitter: Sendable {
             case .atomicSwapUnavailable:
                 "This filesystem cannot safely replace the file in place. Use Save As to write a new file."
             case .targetChangedBeforeCommit:
-                "The file changed while DarthMD was preparing to save it."
+                "The file changed while DarthScriptum was preparing to save it."
             case .targetMissingBeforeCommit:
-                "The file was removed while DarthMD was preparing to save it."
+                "The file was removed while DarthScriptum was preparing to save it."
             }
         }
     }
@@ -72,7 +72,7 @@ struct SafeFileCommitter: Sendable {
         let replacementDirectoryResourceIdentifier =
             try DurableFileIO.resourceIdentifier(for: replacementDirectory)
         let candidateURL = replacementDirectory
-            .appendingPathComponent("darth-md-\(UUID().uuidString)")
+            .appendingPathComponent("darth-scriptum-\(UUID().uuidString)")
         var retainedRecoveryArtifact: CommitRecoveryArtifact?
         defer {
             if retainedRecoveryArtifact == nil,
