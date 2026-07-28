@@ -6,6 +6,10 @@ import XCTest
 final class DarthThemeTests: XCTestCase {
     func testGhosttyColorTokens() {
         XCTAssertEqual(DarthTheme.background.usingColorSpace(.sRGB)?.hexRGB, 0x1A1614)
+        XCTAssertLessThan(DarthTheme.backgroundOverlayOpacity, 0.7)
+        XCTAssertGreaterThan(DarthTheme.backgroundOverlayOpacity, 0)
+        XCTAssertLessThan(DarthTheme.statusBarOverlayOpacity, 0.78)
+        XCTAssertGreaterThan(DarthTheme.statusBarOverlayOpacity, 0)
         XCTAssertEqual(DarthTheme.foreground.usingColorSpace(.sRGB)?.hexRGB, 0xE8D5B7)
         XCTAssertEqual(DarthTheme.accent.usingColorSpace(.sRGB)?.hexRGB, 0xC4956A)
         XCTAssertEqual(

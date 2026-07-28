@@ -8,6 +8,7 @@
 /* Begin PBXBuildFile section */
 		F00000000000000000000001 /* MarkdownEngine in Frameworks */ = {isa = PBXBuildFile; productRef = F00000000000000000000002 /* MarkdownEngine */; };
 		F00000000000000000000004 /* MarkdownEngineLatex in Frameworks */ = {isa = PBXBuildFile; productRef = F00000000000000000000005 /* MarkdownEngineLatex */; };
+		F00000000000000000000006 /* MarkdownEngineCodeBlocks in Frameworks */ = {isa = PBXBuildFile; productRef = F00000000000000000000007 /* MarkdownEngineCodeBlocks */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -32,7 +33,7 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		E00000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (F00000000000000000000001 /* MarkdownEngine in Frameworks */, F00000000000000000000004 /* MarkdownEngineLatex in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+		E00000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (F00000000000000000000001 /* MarkdownEngine in Frameworks */, F00000000000000000000004 /* MarkdownEngineLatex in Frameworks */, F00000000000000000000006 /* MarkdownEngineCodeBlocks in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
 		E00000000000000000000004 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 		E00000000000000000000007 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
@@ -51,7 +52,7 @@
 			dependencies = ();
 			fileSystemSynchronizedGroups = (C00000000000000000000001 /* src */,);
 			name = DarthMD;
-			packageProductDependencies = (F00000000000000000000002 /* MarkdownEngine */, F00000000000000000000005 /* MarkdownEngineLatex */,);
+			packageProductDependencies = (F00000000000000000000002 /* MarkdownEngine */, F00000000000000000000005 /* MarkdownEngineLatex */, F00000000000000000000007 /* MarkdownEngineCodeBlocks */,);
 			productName = DarthMD;
 			productReference = A00000000000000000000003 /* DarthMD.app */;
 			productType = "com.apple.product-type.application";
@@ -152,6 +153,7 @@
 /* Begin XCSwiftPackageProductDependency section */
 		F00000000000000000000002 /* MarkdownEngine */ = {isa = XCSwiftPackageProductDependency; package = F00000000000000000000003 /* swift-markdown-engine */; productName = MarkdownEngine;};
 		F00000000000000000000005 /* MarkdownEngineLatex */ = {isa = XCSwiftPackageProductDependency; package = F00000000000000000000003 /* swift-markdown-engine */; productName = MarkdownEngineLatex;};
+		F00000000000000000000007 /* MarkdownEngineCodeBlocks */ = {isa = XCSwiftPackageProductDependency; package = F00000000000000000000003 /* swift-markdown-engine */; productName = MarkdownEngineCodeBlocks;};
 /* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A00000000000000000000001 /* Project object */;

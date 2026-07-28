@@ -14,9 +14,15 @@ enum MarkdownDocumentSaveError: LocalizedError, Equatable {
 
 @MainActor
 final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
+    private struct EncodedDocument {
+        let data: Data
+        let snapshot: DocumentSnapshot
+    }
+
     let syncCoordinator: DocumentSyncCoordinator
     private let saveBridge: SaveTransactionBridge
     private var sourceObservation: UUID?
+    private var lastEncodedDocument: EncodedDocument?
 
     var markdownWindowController: MarkdownWindowController? {
         windowControllers.first as? MarkdownWindowController
@@ -24,6 +30,10 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
 
     var synchronizationFileURL: URL? {
         fileURL
+    }
+
+    var isEmptyUntitledDocument: Bool {
+        fileURL == nil && syncCoordinator.sourceBuffer.revision.text.isEmpty
     }
 
     nonisolated override class var autosavesInPlace: Bool { false }
@@ -71,11 +81,18 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
             return
         }
         existingFrontWindow.addTabbedWindow(newWindow, ordered: .above)
+        controller.refreshTabShortcuts()
     }
 
     override nonisolated func data(ofType typeName: String) throws -> Data {
         return try MainActor.assumeIsolated {
-            try TextFileCodec.encode(syncCoordinator.currentSnapshot)
+            let snapshot = syncCoordinator.currentSnapshot
+            let data = try TextFileCodec.encode(snapshot)
+            lastEncodedDocument = EncodedDocument(
+                data: data,
+                snapshot: snapshot
+            )
+            return data
         }
     }
 
@@ -124,15 +141,37 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
         for saveOperation: NSDocument.SaveOperationType,
         completionHandler: @escaping (Error?) -> Void
     ) {
+        if saveOperation == .saveAsOperation {
+            lastEncodedDocument = nil
+        }
         super.save(
             to: url,
             ofType: typeName,
             for: saveOperation
         ) { [weak self] error in
-            if error == nil, saveOperation == .saveAsOperation {
-                self?.syncCoordinator.attach(to: url)
+            let encoded = self?.lastEncodedDocument
+            self?.lastEncodedDocument = nil
+            guard error == nil, saveOperation == .saveAsOperation else {
+                completionHandler(error)
+                return
             }
-            completionHandler(error)
+            guard let self, let encoded else {
+                self?.syncCoordinator.attach(to: url)
+                completionHandler(nil)
+                return
+            }
+            Task { @MainActor [weak self] in
+                do {
+                    try await self?.syncCoordinator.attachAfterSaveAs(
+                        to: url,
+                        expectedData: encoded.data,
+                        expectedSnapshot: encoded.snapshot
+                    )
+                    completionHandler(nil)
+                } catch {
+                    completionHandler(error)
+                }
+            }
         }
     }
 
@@ -202,6 +241,9 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
         shouldClose shouldCloseSelector: Selector?,
         contextInfo: UnsafeMutableRawPointer?
     ) {
+        if isEmptyUntitledDocument {
+            updateChangeCount(.changeCleared)
+        }
         guard fileURL != nil else {
             super.canClose(
                 withDelegate: delegate,

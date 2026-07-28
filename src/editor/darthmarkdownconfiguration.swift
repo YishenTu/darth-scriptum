@@ -1,17 +1,32 @@
 import AppKit
 import ImageIO
 import MarkdownEngine
+import MarkdownEngineCodeBlocks
 import MarkdownEngineLatex
 
 @MainActor
 enum DarthMarkdownConfiguration {
-    private static let latexRenderer = SwiftMathBridge()
+    private static let latexRenderer = DarthLatexRenderer()
+    private static let syntaxHighlighter = HighlighterSwiftBridge(
+        lightTheme: "atom-one-dark",
+        darkTheme: "atom-one-dark",
+        autoSwitchAppearance: false,
+        lightBackground: DarthTheme.codeBackground,
+        darkBackground: DarthTheme.codeBackground,
+        preferredFontNames: [
+            "DejaVu Sans Mono for Powerline",
+            "SF Mono",
+            "Menlo"
+        ]
+    )
 
     static func make(
         rawSourceMode: Bool,
         fontSize: CGFloat,
-        documentURL: URL?
+        documentURL: URL?,
+        latexRenderer: DarthLatexRenderer? = nil
     ) -> MarkdownEditorConfiguration {
+        let activeLatexRenderer = latexRenderer ?? self.latexRenderer
         let theme = MarkdownEditorTheme(
             bodyText: DarthTheme.foreground,
             mutedText: DarthTheme.mutedForeground,
@@ -30,8 +45,12 @@ enum DarthMarkdownConfiguration {
         configuration.theme = theme
         configuration.services = MarkdownEditorServices(
             images: DarthMarkdownImageProvider(documentURL: documentURL),
-            syntaxHighlighter: DarthSyntaxHighlighter(),
-            latex: latexRenderer
+            syntaxHighlighter: DarthSyntaxHighlighter(
+                highlighter: syntaxHighlighter,
+                appearanceDidChangeNotification:
+                    activeLatexRenderer.updateNotification
+            ),
+            latex: activeLatexRenderer
         )
         configuration.textInsets = TextInsets(horizontal: 32, vertical: 28)
         configuration.headings = HeadingStyle(
@@ -56,23 +75,118 @@ enum DarthMarkdownConfiguration {
 }
 
 private struct DarthSyntaxHighlighter: SyntaxHighlighter {
+    let highlighter: HighlighterSwiftBridge
+    let appearanceDidChangeNotification: Notification.Name?
+
     func codeFont(size: CGFloat) -> NSFont {
-        NSFont.monospacedSystemFont(ofSize: size, weight: .medium)
+        highlighter.codeFont(size: size)
     }
 
     func backgroundColor() -> NSColor {
-        DarthTheme.codeBackground
+        highlighter.backgroundColor()
     }
 
     func highlight(
         code: String,
         language: String?
     ) -> NSAttributedString? {
-        nil
+        guard DarthSyntaxHighlightingPolicy.shouldHighlight(
+            code: code,
+            language: language
+        ) else {
+            return nil
+        }
+        return highlighter.highlight(
+            code: code,
+            language: DarthSyntaxHighlightingPolicy.supportedLanguage(
+                language
+            )
+        )
     }
 
-    var appearanceDidChangeNotification: Notification.Name? {
-        nil
+}
+
+enum DarthSyntaxHighlightingPolicy {
+    static let maximumCodeUTF8Bytes = 64 * 1_024
+    private static let maximumLanguageUTF8Bytes = 64
+    private static let aliases = [
+        "cs": "csharp",
+        "docker": "dockerfile",
+        "fs": "fsharp",
+        "golang": "go",
+        "html": "xml",
+        "js": "javascript",
+        "jsx": "javascript",
+        "kt": "kotlin",
+        "md": "markdown",
+        "objc": "objectivec",
+        "py": "python",
+        "rb": "ruby",
+        "rs": "rust",
+        "sh": "bash",
+        "tex": "latex",
+        "ts": "typescript",
+        "tsx": "typescript",
+        "vue": "xml",
+        "yml": "yaml",
+        "zsh": "bash"
+    ]
+    private static let supportedLanguages = Set(
+        """
+        1c abnf accesslog actionscript ada angelscript apache applescript arcade
+        arduino armasm asciidoc aspectj autohotkey autoit avrasm awk axapta bash
+        basic bnf brainfuck c cal capnproto ceylon clean clojure clojure-repl
+        cmake coffeescript coq cos cpp crmsh crystal csharp csp css d dart delphi
+        diff django dns dockerfile dos dsconfig dts dust ebnf elixir elm erb
+        erlang erlang-repl excel fix flix fortran fsharp gams gauss gcode
+        gherkin glsl gml go golo gradle graphql groovy haml handlebars haskell
+        haxe hsp http hy inform7 ini irpf90 isbl java javascript jboss-cli json
+        julia julia-repl kotlin lasso latex ldif leaf less lisp livecodeserver
+        livescript llvm lsl lua makefile markdown mathematica matlab maxima mel
+        mercury mipsasm mizar mojolicious monkey moonscript n1ql nestedtext nginx
+        nim nix node-repl nsis objectivec ocaml openscad oxygene parser3 perl pf
+        pgsql php php-template plaintext pony powershell processing profile
+        prolog properties protobuf puppet purebasic python python-repl q qml r
+        reasonml rib roboconf routeros rsl ruby ruleslanguage rust sas scala
+        scheme scilab scss shell smali smalltalk sml sqf sql stan stata step21
+        stylus subunit swift taggerscript tap tcl thrift tp twig typescript vala
+        vbnet vbscript vbscript-html verilog vhdl vim wasm wren x86asm xl xml
+        xquery yaml zephir
+        """
+        .split(whereSeparator: \.isWhitespace)
+        .map(String.init)
+    )
+
+    static func supportedLanguage(_ language: String?) -> String? {
+        guard let language,
+              language.utf8.count <= maximumLanguageUTF8Bytes else {
+            return nil
+        }
+        let normalized = language
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalized.isEmpty else { return nil }
+        if let canonical = aliases[normalized] {
+            return canonical
+        }
+        return supportedLanguages.contains(normalized) ? normalized : nil
+    }
+
+    static func shouldHighlight(
+        code: String,
+        language: String?
+    ) -> Bool {
+        guard code.utf8.count <= maximumCodeUTF8Bytes else {
+            return false
+        }
+        guard let language else { return true }
+        guard language.utf8.count <= maximumLanguageUTF8Bytes else {
+            return false
+        }
+        let normalized = language.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        return normalized.isEmpty || supportedLanguage(normalized) != nil
     }
 }
 

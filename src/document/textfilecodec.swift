@@ -31,16 +31,15 @@ enum TextFileCodec {
             text = value
         }
 
-        let crlfCount = text.components(separatedBy: "\r\n").count - 1
-        let lfCount = text.reduce(into: 0) { count, character in
-            if character == "\n" { count += 1 }
-        } - crlfCount
+        let newlineCounts = countNewlines(in: text)
 
         return DocumentSnapshot(
             text: text,
             format: TextFileFormat(
                 encoding: encoding,
-                dominantNewline: crlfCount > lfCount ? .crlf : .lf,
+                dominantNewline: newlineCounts.crlf > newlineCounts.lf
+                    ? .crlf
+                    : .lf,
                 hasFinalNewline: text.utf16.last == 0x000A
             )
         )
@@ -70,5 +69,24 @@ enum TextFileCodec {
             throw CocoaError(.fileWriteInapplicableStringEncoding)
         }
         return Data(bom) + body
+    }
+
+    private nonisolated static func countNewlines(
+        in text: String
+    ) -> (crlf: Int, lf: Int) {
+        var crlf = 0
+        var lf = 0
+        var previousWasCarriageReturn = false
+        for scalar in text.unicodeScalars {
+            if scalar.value == 0x000A {
+                if previousWasCarriageReturn {
+                    crlf += 1
+                } else {
+                    lf += 1
+                }
+            }
+            previousWasCarriageReturn = scalar.value == 0x000D
+        }
+        return (crlf, lf)
     }
 }

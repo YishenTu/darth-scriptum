@@ -1,6 +1,6 @@
 # DarthMD
 
-DarthMD is a focused, native macOS Markdown editor: the speed and document workflow of TextEdit, with an Obsidian-style Live Preview surface. It has no vault, sidebar, database, account, web renderer, or file-management layer.
+DarthMD is a focused, native macOS Markdown editor: the speed and document workflow of TextEdit, with an Obsidian-style Live Preview surface. It has no vault, sidebar, database, account, browser-based document renderer, or file-management layer.
 
 ## Requirements
 
@@ -18,6 +18,7 @@ DarthMD is a focused, native macOS Markdown editor: the speed and document workf
 - Uses native macOS tabs and an optional two-pane view of the same document. Each pane keeps its own selection and scroll position.
 - Preserves UTF-8, UTF-8 BOM, BOM-marked UTF-16, and the file's existing line-ending style.
 - Supports headings, emphasis, strikethrough, inline and fenced code, links, lists, task items, quotes, thematic breaks, and styled tables. Relative local images render inline; remote images and raw HTML remain inert source.
+- Renders inline and display TeX math with a native SwiftMath fast path and a locally bundled MathJax fallback for broad TeX/AMS commands, environments, and macros. Math rendering never contacts a remote server.
 - Never executes raw HTML or downloads remote images.
 - Live Preview uses the engine's synchronous incremental parser, so asynchronous parse jobs cannot accumulate while typing.
 - Files above 2 MiB stay fully editable and automatically use a plain-source presentation fallback instead of blocking on a full Markdown parse.
@@ -35,10 +36,16 @@ xcodebuild -project darth-md.xcodeproj -scheme darth-md -destination 'platform=m
 
 ## Shortcuts
 
+- `Command-T`: open a new tab
+- `Command-1` through `Command-8`: select a numbered tab
+- `Command-9`: select the last tab
+- `Command-D`: split right
+- `Command-[`, `Command-]`: focus the previous or next pane
+- `Control-1`, `Control-2`: focus the left or right pane
 - `Command-Shift-M`: toggle Live Preview/source mode
 - `Command-Shift-X`: toggle a task marker
 - `Command-\`: toggle the same-document split
-- `Command-Option-]`: focus the next pane
+- `Control-Command-F`: enter or leave full screen
 - `Command-Plus`, `Command-Minus`, `Command-0`: editor zoom
 
 ## Structure
@@ -48,6 +55,12 @@ xcodebuild -project darth-md.xcodeproj -scheme darth-md -destination 'platform=m
 - `ui-tests/`: application launch and native UI checks
 - `scripts/`: reproducible verification entry point
 - `.context/`: ignored planning, handoff, and validation evidence
+
+## Math compatibility
+
+Math input is delimited with `$...$` or `$$...$$`. DarthMD supports the broad mathematical TeX/LaTeX subset implemented by MathJax, including AMS commands such as `\dfrac`, matrices, aligned equations, and common extension packages. It does not compile complete LaTeX documents, load arbitrary packages from disk or the network, or execute TeX programs.
+
+The fallback bundles MathJax 3.2.2 under its Apache-2.0 license. Its license and package metadata are included in `src/resources/MathJax.bundle/`.
 
 ## Verification
 

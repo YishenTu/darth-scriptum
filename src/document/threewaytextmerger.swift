@@ -57,18 +57,11 @@ struct ThreeWayTextMerger: Sendable {
             to: lineTokens(in: external)
         )
 
-        for localChange in localChanges {
-            for externalChange in externalChanges
-            where localChange != externalChange {
-                if overlaps(localChange, externalChange) {
-                    return .conflict
-                }
-            }
-        }
-
-        var uniqueChanges = localChanges
-        for change in externalChanges where !uniqueChanges.contains(change) {
-            uniqueChanges.append(change)
+        guard let uniqueChanges = combineNonoverlapping(
+            localChanges,
+            externalChanges
+        ) else {
+            return .conflict
         }
         var merged = baseLines
         for change in uniqueChanges.sorted(by: {
@@ -83,34 +76,56 @@ struct ThreeWayTextMerger: Sendable {
     }
 
     private func change(from base: String, to updated: String) -> Change {
-        let baseUnits = Array(base.utf16)
-        let updatedUnits = Array(updated.utf16)
-        let commonLimit = min(baseUnits.count, updatedUnits.count)
-        var prefix = 0
-        while prefix < commonLimit, baseUnits[prefix] == updatedUnits[prefix] {
-            prefix += 1
-        }
-
-        var suffix = 0
-        while suffix < baseUnits.count - prefix,
-              suffix < updatedUnits.count - prefix,
-              baseUnits[baseUnits.count - suffix - 1]
-                == updatedUnits[updatedUnits.count - suffix - 1] {
-            suffix += 1
-        }
-
-        let range = NSRange(
-            location: prefix,
-            length: baseUnits.count - prefix - suffix
-        )
-        let replacementRange = NSRange(
-            location: prefix,
-            length: updatedUnits.count - prefix - suffix
+        let baseText = base as NSString
+        let updatedText = updated as NSString
+        let difference = UTF16TextDifference.between(
+            original: baseText,
+            updated: updatedText
         )
         return Change(
-            range: range,
-            replacement: (updated as NSString).substring(with: replacementRange)
+            range: difference.originalRange,
+            replacement: updatedText.substring(
+                with: difference.updatedRange
+            )
         )
+    }
+
+    private func combineNonoverlapping(
+        _ local: [LineChange],
+        _ external: [LineChange]
+    ) -> [LineChange]? {
+        var localIndex = 0
+        var externalIndex = 0
+        var combined: [LineChange] = []
+        combined.reserveCapacity(local.count + external.count)
+
+        while localIndex < local.count, externalIndex < external.count {
+            let localChange = local[localIndex]
+            let externalChange = external[externalIndex]
+            if localChange == externalChange {
+                combined.append(localChange)
+                localIndex += 1
+                externalIndex += 1
+            } else if overlaps(localChange, externalChange) {
+                return nil
+            } else if precedes(localChange, externalChange) {
+                combined.append(localChange)
+                localIndex += 1
+            } else {
+                combined.append(externalChange)
+                externalIndex += 1
+            }
+        }
+        combined.append(contentsOf: local[localIndex...])
+        combined.append(contentsOf: external[externalIndex...])
+        return combined
+    }
+
+    private func precedes(_ lhs: LineChange, _ rhs: LineChange) -> Bool {
+        if lhs.range.lowerBound != rhs.range.lowerBound {
+            return lhs.range.lowerBound < rhs.range.lowerBound
+        }
+        return lhs.range.count > rhs.range.count
     }
 
     private func overlaps(_ lhs: Change, _ rhs: Change) -> Bool {

@@ -47,4 +47,128 @@ final class AppDelegateTests: XCTestCase {
         XCTAssertTrue(redoItem?.target === delegate)
         XCTAssertEqual(redoItem?.action, Selector(("redoDocument:")))
     }
+
+    func testCommonMacOSKeyboardShortcutsAreInstalled() {
+        let originalMenu = NSApp.mainMenu
+        defer {
+            NSApp.mainMenu = originalMenu
+        }
+        let delegate = AppDelegate()
+        delegate.applicationWillFinishLaunching(
+            Notification(name: NSApplication.willFinishLaunchingNotification)
+        )
+
+        let appMenu = NSApp.mainMenu?.item(withTitle: "DarthMD")?.submenu
+        let fileMenu = NSApp.mainMenu?.item(withTitle: "File")?.submenu
+        let viewMenu = NSApp.mainMenu?.item(withTitle: "View")?.submenu
+        let windowMenu = NSApp.mainMenu?.item(withTitle: "Window")?.submenu
+
+        assertShortcut(
+            appMenu?.item(withTitle: "Hide DarthMD"),
+            key: "h",
+            modifiers: [.command],
+            action: #selector(NSApplication.hide(_:))
+        )
+        assertShortcut(
+            appMenu?.item(withTitle: "Hide Others"),
+            key: "h",
+            modifiers: [.command, .option],
+            action: #selector(NSApplication.hideOtherApplications(_:))
+        )
+        assertShortcut(
+            fileMenu?.item(withTitle: "New Tab"),
+            key: "t",
+            modifiers: [.command],
+            action: #selector(NSDocumentController.newDocument(_:))
+        )
+        assertShortcut(
+            viewMenu?.item(withTitle: "Split Right"),
+            key: "d",
+            modifiers: [.command],
+            action: Selector(("splitRight:"))
+        )
+        assertShortcut(
+            viewMenu?.item(withTitle: "Focus Previous Pane"),
+            key: "[",
+            modifiers: [.command],
+            action: Selector(("focusPreviousPane:"))
+        )
+        assertShortcut(
+            viewMenu?.item(withTitle: "Focus Next Pane"),
+            key: "]",
+            modifiers: [.command],
+            action: Selector(("focusNextPane:"))
+        )
+        assertShortcut(
+            viewMenu?.item(withTitle: "Focus Left Pane"),
+            key: "1",
+            modifiers: [.control],
+            action: Selector(("focusLeftPane:"))
+        )
+        assertShortcut(
+            viewMenu?.item(withTitle: "Focus Right Pane"),
+            key: "2",
+            modifiers: [.control],
+            action: Selector(("focusRightPane:"))
+        )
+        assertShortcut(
+            windowMenu?.item(withTitle: "Toggle Full Screen"),
+            key: "f",
+            modifiers: [.command, .control],
+            action: Selector(("toggleFullScreen:"))
+        )
+        for number in 1...8 {
+            let item = windowMenu?.item(withTitle: "Show Tab \(number)")
+            assertShortcut(
+                item,
+                key: "\(number)",
+                modifiers: [.command],
+                action: Selector(("selectTab:"))
+            )
+            XCTAssertEqual(item?.tag, number)
+        }
+        let lastTabItem = windowMenu?.item(withTitle: "Show Last Tab")
+        assertShortcut(
+            lastTabItem,
+            key: "9",
+            modifiers: [.command],
+            action: Selector(("selectTab:"))
+        )
+        XCTAssertEqual(lastTabItem?.tag, 9)
+    }
+
+    func testOnlyEmptyUntitledDocumentsCanCloseWithoutSaving() {
+        let document = MarkdownDocument()
+        XCTAssertTrue(document.isEmptyUntitledDocument)
+
+        document.syncCoordinator.sourceBuffer.replace(
+            with: "# Draft",
+            origin: .localEditor(paneID: UUID())
+        )
+        XCTAssertFalse(document.isEmptyUntitledDocument)
+
+        document.syncCoordinator.sourceBuffer.replace(
+            with: "",
+            origin: .localEditor(paneID: UUID())
+        )
+        XCTAssertTrue(document.isEmptyUntitledDocument)
+    }
+
+    private func assertShortcut(
+        _ item: NSMenuItem?,
+        key: String,
+        modifiers: NSEvent.ModifierFlags,
+        action: Selector,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(item?.keyEquivalent, key, file: file, line: line)
+        XCTAssertEqual(
+            item?.keyEquivalentModifierMask,
+            modifiers,
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(item?.action, action, file: file, line: line)
+    }
 }

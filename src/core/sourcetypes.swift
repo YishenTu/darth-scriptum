@@ -29,23 +29,24 @@ struct SourceEdit: Sendable, Equatable {
         guard revision.number == expectedRevision else {
             throw SourceEditError.staleRevision
         }
-        let utf16 = revision.text.utf16
+        let source = revision.text as NSString
         guard range.location >= 0,
               range.length >= 0,
-              range.location <= utf16.count,
-              NSMaxRange(range) <= utf16.count else {
+              range.location <= source.length,
+              NSMaxRange(range) <= source.length,
+              !UTF16TextDifference.splitsSurrogatePair(
+                at: range.location,
+                in: source
+              ),
+              !UTF16TextDifference.splitsSurrogatePair(
+                at: NSMaxRange(range),
+                in: source
+              ) else {
             throw SourceEditError.invalidRange
         }
-        let lowerUTF16 = utf16.index(utf16.startIndex, offsetBy: range.location)
-        let upperUTF16 = utf16.index(lowerUTF16, offsetBy: range.length)
-        guard String.Index(lowerUTF16, within: revision.text) != nil,
-              String.Index(upperUTF16, within: revision.text) != nil,
-              let stringRange = Range(range, in: revision.text) else {
-            throw SourceEditError.invalidRange
-        }
-        var result = revision.text
-        result.replaceSubrange(stringRange, with: replacement)
-        return revision.advanced(to: result)
+        let result = NSMutableString(string: source)
+        result.replaceCharacters(in: range, with: replacement)
+        return revision.advanced(to: result as String)
     }
 }
 
@@ -98,7 +99,7 @@ struct UTF16TextDifference: Sendable, Equatable {
         )
     }
 
-    private static func splitsSurrogatePair(
+    static func splitsSurrogatePair(
         at location: Int,
         in text: NSString
     ) -> Bool {

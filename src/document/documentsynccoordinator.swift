@@ -19,11 +19,32 @@ private struct PendingRecoveryMigration: Equatable {
     let destination: DocumentIdentity
 }
 
+private struct VerifiedAttachment: Sendable {
+    let data: Data
+    let matchesExpectedData: Bool
+}
+
 private enum FailedSynchronizationOperation {
     case localWrite
     case externalRead
     case monitoring
     case destinationRequiresSaveAs
+}
+
+struct DocumentSynchronizationStatusSnapshot: Equatable {
+    let presentedState: SynchronizationState?
+    let failureRequiresSaveAs: Bool
+    let recoveryMigrationIsPending: Bool
+    let rawRecoveryURL: URL?
+    let hasLocalRecovery: Bool
+
+    static let empty = DocumentSynchronizationStatusSnapshot(
+        presentedState: nil,
+        failureRequiresSaveAs: false,
+        recoveryMigrationIsPending: false,
+        rawRecoveryURL: nil,
+        hasLocalRecovery: false
+    )
 }
 
 @MainActor
@@ -47,9 +68,25 @@ final class DocumentSyncCoordinator: ObservableObject {
     static let localWriteDelay: Duration = .milliseconds(100)
     static let externalEventDelay: Duration = .milliseconds(75)
 
-    @Published private(set) var state: SynchronizationState = .idle
+    private(set) var state: SynchronizationState = .idle {
+        didSet {
+            if let persistentState = Self.persistentPresentedState(
+                for: state
+            ) {
+                if presentedStateValue != persistentState {
+                    presentedStateValue = persistentState
+                }
+            } else if state == .idle, presentedStateValue != nil {
+                presentedStateValue = nil
+            }
+            refreshStatusSnapshot()
+        }
+    }
+    private var presentedStateValue: SynchronizationState?
+    @Published private(set) var statusSnapshot:
+        DocumentSynchronizationStatusSnapshot = .empty
     @Published private(set) var format: TextFileFormat
-    @Published private(set) var durableState: DurableFileState?
+    private(set) var durableState: DurableFileState?
     @Published private(set) var fileURL: URL?
 
     let sourceBuffer: MarkdownSourceBuffer
@@ -60,7 +97,9 @@ final class DocumentSyncCoordinator: ObservableObject {
     private let recoveryStore: SessionRecoveryStore
     private let savePreparationHook: (@MainActor () async -> Void)?
     private let externalReadHook: (@MainActor (UInt64) async -> Void)?
-    private var documentIdentity: DocumentIdentity?
+    private var documentIdentity: DocumentIdentity? {
+        didSet { refreshStatusSnapshot() }
+    }
     private var nextGeneration: UInt64 = 1
     private var nextPreparationGeneration: UInt64 = 1
     private var activePreparationGeneration: UInt64?
@@ -71,18 +110,25 @@ final class DocumentSyncCoordinator: ObservableObject {
     private var localPreparationTask: Task<Void, Never>?
     private var externalReadTask: Task<Void, Never>?
     private var externalReadPending = false
+    private var attachmentVerificationInProgress = false
     private var monitor: DirectoryFileMonitor?
     private var saveInFlight: PendingSaveToken?
     private var externalCheckPending = false
-    private var hasRecoverableLocalRevision = false
+    private var hasRecoverableLocalRevision = false {
+        didSet { refreshStatusSnapshot() }
+    }
     private var synchronizationPauseIsLatched = false
-    private var pendingRecoveryMigration: PendingRecoveryMigration?
+    private var pendingRecoveryMigration: PendingRecoveryMigration? {
+        didSet { refreshStatusSnapshot() }
+    }
     private var pendingRecoveryRemoval: RecoveryEntry?
     private var pendingRecoveryMinimumRevision: UInt64?
     private var rawRecoveryRemovalIdentity: DocumentIdentity?
     private var isClosed = false
     private var stateAfterNextSuccessfulSave: SynchronizationState?
-    private var failedOperation: FailedSynchronizationOperation?
+    private var failedOperation: FailedSynchronizationOperation? {
+        didSet { refreshStatusSnapshot() }
+    }
     private var saveAsRequiredFailureMessage: String?
     private var monitorFailureMessage: String?
     private var flushWaiters: [(@MainActor (Bool) -> Void)] = []
@@ -111,31 +157,35 @@ final class DocumentSyncCoordinator: ObservableObject {
         DocumentSnapshot(text: sourceBuffer.revision.text, format: format)
     }
 
+    var presentedState: SynchronizationState? {
+        statusSnapshot.presentedState
+    }
+
     var latestRawRecoveryURL: URL? {
-        guard let documentIdentity else { return nil }
-        return recoveryStore
-            .rawRecoveryEntries(for: documentIdentity)
-            .first?
-            .dataURL
+        statusSnapshot.rawRecoveryURL
     }
 
     var hasLocalRecovery: Bool {
-        hasRecoverableLocalRevision
+        statusSnapshot.hasLocalRecovery
     }
 
     var recoveryMigrationIsPending: Bool {
-        pendingRecoveryMigration != nil
+        statusSnapshot.recoveryMigrationIsPending
     }
 
     var failureRequiresSaveAs: Bool {
-        failedOperation == .destinationRequiresSaveAs
+        statusSnapshot.failureRequiresSaveAs
     }
 
     func loadInitial(_ snapshot: DocumentSnapshot, data: Data, from url: URL?) {
         format = snapshot.format
         sourceBuffer.replace(with: snapshot.text, origin: .initialLoad)
         if let url {
-            attach(to: url, knownData: data)
+            attach(
+                to: url,
+                knownData: data,
+                knownSnapshot: snapshot
+            )
         } else {
             durableState = DurableFileState(
                 snapshot: snapshot,
@@ -150,11 +200,16 @@ final class DocumentSyncCoordinator: ObservableObject {
         }
     }
 
-    func attach(to url: URL, knownData: Data? = nil) {
+    func attach(
+        to url: URL,
+        knownData: Data? = nil,
+        knownSnapshot: DocumentSnapshot? = nil
+    ) {
         guard !isClosed else { return }
         let previousURL = fileURL
         let previousIdentity = documentIdentity
         fileURL = url.standardizedFileURL
+        let monitorNeedsRestart = previousURL != fileURL || monitor == nil
         if previousURL != fileURL,
            failedOperation == .destinationRequiresSaveAs {
             failedOperation = nil
@@ -166,7 +221,9 @@ final class DocumentSyncCoordinator: ObservableObject {
             for: url,
             data: data
         ) {
-            let diskSnapshot = (try? TextFileCodec.decode(data)) ?? currentSnapshot
+            let diskSnapshot = knownSnapshot
+                ?? (try? TextFileCodec.decode(data))
+                ?? currentSnapshot
             durableState = DurableFileState(
                 snapshot: diskSnapshot,
                 fingerprint: fingerprint,
@@ -204,9 +261,73 @@ final class DocumentSyncCoordinator: ObservableObject {
             pendingRecoveryMigration = nil
         }
         refreshRecoveryState()
-        restartMonitor()
+        if monitorNeedsRestart {
+            restartMonitor()
+        }
         if currentSnapshot != durableState?.snapshot {
             scheduleLocalWrite()
+        }
+    }
+
+    func attachAfterSaveAs(
+        to url: URL,
+        expectedData: Data,
+        expectedSnapshot: DocumentSnapshot
+    ) async throws {
+        guard !isClosed else { return }
+        let targetURL = url.standardizedFileURL
+
+        // Monitor before verifying the bytes so a replacement racing the read
+        // cannot fall into a gap between verification and event observation.
+        attachmentVerificationInProgress = true
+        defer {
+            attachmentVerificationInProgress = false
+            if externalReadPending, externalReadTask == nil {
+                externalReadPending = false
+                scheduleExternalRead()
+            }
+        }
+        updateFileURL(targetURL)
+        let verified = try await Task.detached(priority: .utility) {
+            let data = try Data(
+                contentsOf: targetURL,
+                options: [.mappedIfSafe]
+            )
+            return VerifiedAttachment(
+                data: data,
+                matchesExpectedData: data == expectedData
+            )
+        }.value
+        guard !isClosed, fileURL == targetURL else { return }
+
+        attach(
+            to: targetURL,
+            knownData: expectedData,
+            knownSnapshot: expectedSnapshot
+        )
+        guard !verified.matchesExpectedData else {
+            settleState(default: .idle)
+            return
+        }
+
+        // The Save As bytes became the merge base. Reconcile the replacement
+        // observed on disk before reporting save completion, so it is never
+        // overwritten as though it were an ordinary newer local revision.
+        localWriteTask?.cancel()
+        localWriteTask = nil
+        let generation = nextExternalReadGeneration
+        nextExternalReadGeneration &+= 1
+        activeExternalReadGeneration = generation
+        await reconcileExternalData(
+            verified.data,
+            from: targetURL,
+            generation: generation
+        )
+        if case let .failed(message) = state {
+            throw CocoaError(
+                .fileReadUnknown,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
         }
     }
 
@@ -453,7 +574,10 @@ final class DocumentSyncCoordinator: ObservableObject {
         origin: DocumentChangeOrigin
     ) {
         guard !isClosed else { return }
-        format.hasFinalNewline = revision.text.utf16.last == 0x000A
+        let hasFinalNewline = revision.text.utf16.last == 0x000A
+        if format.hasFinalNewline != hasFinalNewline {
+            format.hasFinalNewline = hasFinalNewline
+        }
         switch origin {
         case .localEditor, .undoRedo, .merge, .recovery:
             if fileURL == nil, let url = delegate?.synchronizationFileURL {
@@ -595,6 +719,10 @@ final class DocumentSyncCoordinator: ObservableObject {
 
     private func scheduleExternalRead() {
         guard !isClosed, !synchronizationIsPaused else { return }
+        if attachmentVerificationInProgress {
+            externalReadPending = true
+            return
+        }
         if saveInFlight != nil {
             externalCheckPending = true
             return
@@ -927,12 +1055,37 @@ final class DocumentSyncCoordinator: ObservableObject {
     private func refreshRecoveryState() {
         guard let documentIdentity else {
             hasRecoverableLocalRevision = false
+            refreshStatusSnapshot()
             return
         }
         hasRecoverableLocalRevision =
             recoveryStore.latest(for: documentIdentity) != nil
         if !recoveryStore.rawRecoveryEntries(for: documentIdentity).isEmpty {
             synchronizationPauseIsLatched = true
+        }
+        refreshStatusSnapshot()
+    }
+
+    private func refreshStatusSnapshot() {
+        let rawRecoveryURL: URL?
+        if let documentIdentity {
+            rawRecoveryURL = recoveryStore
+                .rawRecoveryEntries(for: documentIdentity)
+                .first?
+                .dataURL
+        } else {
+            rawRecoveryURL = nil
+        }
+        let snapshot = DocumentSynchronizationStatusSnapshot(
+            presentedState: presentedStateValue,
+            failureRequiresSaveAs:
+                failedOperation == .destinationRequiresSaveAs,
+            recoveryMigrationIsPending: pendingRecoveryMigration != nil,
+            rawRecoveryURL: rawRecoveryURL,
+            hasLocalRecovery: hasRecoverableLocalRevision
+        )
+        if snapshot != statusSnapshot {
+            statusSnapshot = snapshot
         }
     }
 
@@ -955,6 +1108,27 @@ final class DocumentSyncCoordinator: ObservableObject {
             failedOperation = nil
             saveAsRequiredFailureMessage = nil
             state = defaultState
+        }
+    }
+
+    private static func persistentPresentedState(
+        for state: SynchronizationState
+    ) -> SynchronizationState? {
+        switch state {
+        case .idle,
+             .waitingToWrite,
+             .writing,
+             .checkingExternalChange,
+             .reloading,
+             .merging:
+            nil
+        case .recoveredConflict,
+             .readOnly,
+             .missing,
+             .failed,
+             .limitedSyncSafety,
+             .synchronizationPaused:
+            state
         }
     }
 

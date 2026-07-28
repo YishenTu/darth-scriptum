@@ -5,16 +5,26 @@ import SwiftUI
 @MainActor
 final class EditorPaneModel: ObservableObject, Identifiable {
     let id = UUID()
+    let latexRenderer: DarthLatexRenderer
     @Published var selectedRange = NSRange(location: 0, length: 0)
     @Published var visibleOrigin = NSPoint.zero
     @Published var line = 1
     @Published var column = 1
+    @Published var isPositionPending = false
+
+    init(latexRenderer: DarthLatexRenderer? = nil) {
+        self.latexRenderer = latexRenderer ?? DarthLatexRenderer(
+            updateNotification: Notification.Name(
+                "DarthMD.LatexRendererDidUpdate.\(UUID().uuidString)"
+            )
+        )
+    }
 }
 
 @MainActor
 struct LivePreviewTextView: NSViewRepresentable {
     @ObservedObject var sourceBuffer: MarkdownSourceBuffer
-    @ObservedObject var pane: EditorPaneModel
+    let pane: EditorPaneModel
     var sourceMode: Bool
     var fontSize: CGFloat
     var newlineStyle: NewlineStyle
@@ -25,6 +35,8 @@ struct LivePreviewTextView: NSViewRepresentable {
         EditorPaneStateCoordinator(
             sourceBuffer: sourceBuffer,
             pane: pane,
+            presentation: presentation,
+            normalizesDisplayMathSelection: !usesRawSource,
             onBecameActive: onBecameActive
         )
     }
@@ -43,6 +55,8 @@ struct LivePreviewTextView: NSViewRepresentable {
         _ hostingView: NSHostingView<AnyView>,
         context: Context
     ) {
+        context.coordinator.setPresentation(presentation)
+        context.coordinator.setNormalizesDisplayMathSelection(!usesRawSource)
         hostingView.rootView = AnyView(editorView)
         context.coordinator.scheduleAttachment(in: hostingView)
     }
@@ -55,15 +69,20 @@ struct LivePreviewTextView: NSViewRepresentable {
     }
 
     private var editorView: some View {
-        NativeTextViewWrapper(
+        let rawSourceMode = usesRawSource
+        pane.latexRenderer.prepareForPresentation(
+            revisionNumber: sourceBuffer.revision.number,
+            fontSize: fontSize,
+            rawSourceMode: rawSourceMode,
+            source: sourceBuffer.revision.text
+        )
+        return NativeTextViewWrapper(
             text: editorText,
             configuration: DarthMarkdownConfiguration.make(
-                rawSourceMode: MarkdownPresentationPolicy.usesRawSource(
-                    requestedSourceMode: sourceMode,
-                    text: sourceBuffer.revision.text
-                ),
+                rawSourceMode: rawSourceMode,
                 fontSize: fontSize,
-                documentURL: documentURL
+                documentURL: documentURL,
+                latexRenderer: pane.latexRenderer
             ),
             fontName: DarthTheme.editorFont(size: fontSize).fontName,
             fontSize: fontSize,
@@ -73,20 +92,57 @@ struct LivePreviewTextView: NSViewRepresentable {
         .accessibilityLabel("Markdown editor")
     }
 
+    private var usesRawSource: Bool {
+        MarkdownPresentationPolicy.usesRawSource(
+            requestedSourceMode: sourceMode,
+            text: sourceBuffer.revision.text
+        )
+    }
+
+    private var presentation: MarkdownSourcePresentation {
+        MarkdownPresentationPolicy.presentation(
+            requestedSourceMode: sourceMode,
+            text: sourceBuffer.revision.text
+        )
+    }
+
     private var editorText: Binding<String> {
         Binding(
             get: {
-                sourceBuffer.revision.text
+                presentation.text
             },
             set: { updatedText in
-                sourceBuffer.replace(
-                    with: MarkdownEditorTextAdapter.reconcile(
-                        editorText: updatedText,
-                        currentSource: sourceBuffer.revision.text,
-                        newlineStyle: newlineStyle
-                    ),
-                    origin: .localEditor(paneID: pane.id)
+                let revision = sourceBuffer.revision
+                let currentPresentation = MarkdownPresentationPolicy.presentation(
+                    requestedSourceMode: sourceMode,
+                    text: revision.text
                 )
+                guard let edit = MarkdownEditorTextAdapter.sourceEdit(
+                    editorText: updatedText,
+                    currentRevision: revision,
+                    newlineStyle: newlineStyle,
+                    origin: .localEditor(paneID: pane.id),
+                    presentedSourceRange: currentPresentation.sourceRange
+                ) else {
+                    return
+                }
+                do {
+                    try sourceBuffer.apply(edit)
+                } catch {
+                    assertionFailure(
+                        "The editor produced an invalid source edit: \(error)"
+                    )
+                    sourceBuffer.replace(
+                        with: MarkdownEditorTextAdapter.reconcile(
+                            editorText: updatedText,
+                            currentSource: revision.text,
+                            newlineStyle: newlineStyle,
+                            presentedSourceRange:
+                                currentPresentation.sourceRange
+                        ),
+                        origin: .localEditor(paneID: pane.id)
+                    )
+                }
             }
         )
     }
@@ -101,32 +157,121 @@ enum MarkdownPresentationPolicy {
     ) -> Bool {
         requestedSourceMode || text.utf8.count > maximumLivePreviewBytes
     }
+
+    static func presentation(
+        requestedSourceMode: Bool,
+        text: String
+    ) -> MarkdownSourcePresentation {
+        MarkdownSourcePresentation.make(
+            source: text,
+            rendersMarkdown: !usesRawSource(
+                requestedSourceMode: requestedSourceMode,
+                text: text
+            )
+        )
+    }
 }
 
 enum MarkdownEditorTextAdapter {
-    static func reconcile(
+    static func sourceEdit(
         editorText: String,
-        currentSource: String,
-        newlineStyle: NewlineStyle
-    ) -> String {
-        guard editorText != currentSource else { return currentSource }
+        currentRevision: SourceRevision,
+        newlineStyle: NewlineStyle,
+        origin: DocumentChangeOrigin,
+        presentedSourceRange: NSRange? = nil
+    ) -> SourceEdit? {
+        let source = currentRevision.text as NSString
+        let sourceRange = presentedSourceRange ?? NSRange(
+            location: 0,
+            length: source.length
+        )
+        guard sourceRange.location >= 0,
+              sourceRange.length >= 0,
+              NSMaxRange(sourceRange) <= source.length else {
+            assertionFailure("Presented source range is outside the document.")
+            return nil
+        }
+        let presentedSource = source.substring(with: sourceRange)
+        guard editorText != presentedSource else { return nil }
 
-        let source = currentSource as NSString
+        let presented = presentedSource as NSString
         let edited = editorText as NSString
         let difference = UTF16TextDifference.between(
-            original: source,
+            original: presented,
             updated: edited
         )
-        let replacement = normalizeNewlines(
+        let normalizedReplacement = normalizeNewlines(
             edited.substring(with: difference.updatedRange),
             to: newlineStyle
         )
-        let result = NSMutableString(string: currentSource)
-        result.replaceCharacters(
-            in: difference.originalRange,
-            with: replacement
+        return SourceEdit(
+            range: NSRange(
+                location: sourceRange.location
+                    + difference.originalRange.location,
+                length: difference.originalRange.length
+            ),
+            replacement: terminatingFrontMatterNewlineIfNeeded(
+                normalizedReplacement,
+                currentSource: currentRevision.text,
+                sourceRange: sourceRange,
+                newlineStyle: newlineStyle
+            ),
+            expectedRevision: currentRevision.number,
+            origin: origin
         )
-        return result as String
+    }
+
+    static func reconcile(
+        editorText: String,
+        currentSource: String,
+        newlineStyle: NewlineStyle,
+        presentedSourceRange: NSRange? = nil
+    ) -> String {
+        let revision = SourceRevision(number: 0, text: currentSource)
+        guard let edit = sourceEdit(
+            editorText: editorText,
+            currentRevision: revision,
+            newlineStyle: newlineStyle,
+            origin: .localEditor(paneID: UUID()),
+            presentedSourceRange: presentedSourceRange
+        ) else {
+            return currentSource
+        }
+        return (try? edit.applying(to: revision).text) ?? currentSource
+    }
+
+    private static func terminatingFrontMatterNewlineIfNeeded(
+        _ replacement: String,
+        currentSource: String,
+        sourceRange: NSRange,
+        newlineStyle: NewlineStyle
+    ) -> String {
+        let sourceLength = (currentSource as NSString).length
+        guard !replacement.isEmpty,
+              replacement.first != "\n",
+              replacement.first != "\r",
+              sourceLength > 0,
+              sourceRange == NSRange(location: sourceLength, length: 0),
+              MarkdownFrontMatter.bodyRange(in: currentSource)
+                == sourceRange,
+              !isLineTerminator(
+                (currentSource as NSString).character(at: sourceLength - 1)
+              ) else {
+            return replacement
+        }
+        switch newlineStyle {
+        case .lf:
+            return "\n" + replacement
+        case .crlf:
+            return "\r\n" + replacement
+        }
+    }
+
+    private static func isLineTerminator(_ character: unichar) -> Bool {
+        character == 0x0A
+            || character == 0x0D
+            || character == 0x2028
+            || character == 0x2029
     }
 
     private static func normalizeNewlines(

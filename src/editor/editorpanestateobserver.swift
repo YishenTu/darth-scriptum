@@ -1,118 +1,16 @@
 import AppKit
 
-private struct LineColumnRequest: Sendable, Equatable {
-    let revision: UInt64
-    let location: Int
-    let text: String
-}
-
-private struct LineColumnResult: Sendable, Equatable {
-    let request: LineColumnRequest
-    let line: Int
-    let column: Int
-}
-
-private enum LineColumnCalculator {
-    static func calculate(_ request: LineColumnRequest) -> LineColumnResult {
-        let source = request.text as NSString
-        let location = min(max(request.location, 0), source.length)
-        var line = 1
-        var column = 1
-        var index = 0
-        while index < location {
-            if index.isMultiple(of: 4_096), Task.isCancelled {
-                break
-            }
-            let unit = source.character(at: index)
-            if unit == 0x000D {
-                if index + 1 < location,
-                   source.character(at: index + 1) == 0x000A {
-                    index += 1
-                }
-                line += 1
-                column = 1
-            } else if unit == 0x000A {
-                line += 1
-                column = 1
-            } else {
-                column += 1
-            }
-            index += 1
-        }
-        return LineColumnResult(
-            request: request,
-            line: line,
-            column: column
-        )
-    }
-}
-
-@MainActor
-private final class LineColumnScheduler {
-    var onResult: (@MainActor (LineColumnResult) -> Void)?
-
-    private var activeTask: Task<LineColumnResult, Never>?
-    private var completionTask: Task<Void, Never>?
-    private var pendingRequest: LineColumnRequest?
-    private var activeRequest: LineColumnRequest?
-
-    func schedule(_ request: LineColumnRequest) {
-        guard activeRequest != request,
-              pendingRequest != request else {
-            return
-        }
-        pendingRequest = request
-        guard activeTask == nil else { return }
-        launchPendingRequest()
-    }
-
-    func cancel() {
-        pendingRequest = nil
-        onResult = nil
-        activeTask?.cancel()
-        completionTask?.cancel()
-    }
-
-    private func launchPendingRequest() {
-        guard activeTask == nil,
-              let request = pendingRequest else {
-            return
-        }
-        pendingRequest = nil
-        activeRequest = request
-        let task = Task.detached(priority: .utility) {
-            LineColumnCalculator.calculate(request)
-        }
-        activeTask = task
-        completionTask = Task { @MainActor [weak self] in
-            let result = await task.value
-            self?.finished(result)
-        }
-    }
-
-    private func finished(_ result: LineColumnResult) {
-        guard activeRequest == result.request else { return }
-        activeTask = nil
-        completionTask = nil
-        activeRequest = nil
-        if !Task.isCancelled {
-            onResult?(result)
-        }
-        if pendingRequest != nil {
-            launchPendingRequest()
-        }
-    }
-}
-
 @MainActor
 final class EditorPaneStateCoordinator: NSObject {
     private let sourceBuffer: MarkdownSourceBuffer
     private let pane: EditorPaneModel
     private let onBecameActive: @MainActor () -> Void
-    private let lineColumnScheduler = LineColumnScheduler()
+    private var presentation: MarkdownSourcePresentation
+    private var normalizesDisplayMathSelection: Bool
     private weak var textView: NSTextView?
     private weak var clipView: NSClipView?
     private var sourceObservation: UUID?
+    private var lineIndexObservation: UUID?
     private var lastSourceText: String
     private var hasRestoredState = false
     private var pendingSelectionRestore: NSRange?
@@ -120,16 +18,20 @@ final class EditorPaneStateCoordinator: NSObject {
     init(
         sourceBuffer: MarkdownSourceBuffer,
         pane: EditorPaneModel,
+        presentation: MarkdownSourcePresentation? = nil,
+        normalizesDisplayMathSelection: Bool = true,
         onBecameActive: @escaping @MainActor () -> Void = {}
     ) {
         self.sourceBuffer = sourceBuffer
         self.pane = pane
+        self.presentation = presentation ?? MarkdownSourcePresentation.make(
+            source: sourceBuffer.revision.text,
+            rendersMarkdown: true
+        )
+        self.normalizesDisplayMathSelection = normalizesDisplayMathSelection
         self.onBecameActive = onBecameActive
         lastSourceText = sourceBuffer.revision.text
         super.init()
-        lineColumnScheduler.onResult = { [weak self] result in
-            self?.receiveLineColumn(result)
-        }
     }
 
     func start() {
@@ -138,15 +40,21 @@ final class EditorPaneStateCoordinator: NSObject {
             [weak self] revision, origin in
             self?.sourceDidChange(revision, origin: origin)
         }
+        lineIndexObservation = sourceBuffer.observeLineIndex { [weak self] in
+            self?.updatePaneState()
+        }
     }
 
     func stop() {
         NotificationCenter.default.removeObserver(self)
-        lineColumnScheduler.cancel()
         if let sourceObservation {
             sourceBuffer.removeObserver(sourceObservation)
         }
+        if let lineIndexObservation {
+            sourceBuffer.removeLineIndexObserver(lineIndexObservation)
+        }
         sourceObservation = nil
+        lineIndexObservation = nil
         textView = nil
         clipView = nil
     }
@@ -156,6 +64,22 @@ final class EditorPaneStateCoordinator: NSObject {
             guard let self, let rootView else { return }
             rootView.layoutSubtreeIfNeeded()
             self.attach(in: rootView)
+        }
+    }
+
+    func setNormalizesDisplayMathSelection(_ shouldNormalize: Bool) {
+        normalizesDisplayMathSelection = shouldNormalize
+    }
+
+    func setPresentation(_ newPresentation: MarkdownSourcePresentation) {
+        guard presentation != newPresentation else { return }
+        let sourceRangeChanged =
+            presentation.sourceRange.location
+                != newPresentation.sourceRange.location
+        presentation = newPresentation
+        if sourceRangeChanged {
+            pendingSelectionRestore = pane.selectedRange
+            hasRestoredState = false
         }
     }
 
@@ -264,6 +188,17 @@ final class EditorPaneStateCoordinator: NSObject {
                 self?.restorePendingSelectionIfNeeded()
             }
         }
+        let newPresentation = MarkdownSourcePresentation.make(
+            source: revision.text,
+            rendersMarkdown: presentation.rendersMarkdown
+        )
+        if newPresentation.sourceRange.location
+            != presentation.sourceRange.location {
+            pendingSelectionRestore = pendingSelectionRestore
+                ?? pane.selectedRange
+            hasRestoredState = false
+        }
+        presentation = newPresentation
         lastSourceText = revision.text
     }
 
@@ -271,7 +206,12 @@ final class EditorPaneStateCoordinator: NSObject {
         guard !hasRestoredState, let textView else { return }
         hasRestoredState = true
         textView.setSelectedRange(
-            clamped(pane.selectedRange, to: textView.string)
+            clamped(
+                presentation.presentedRange(
+                    forSourceRange: pane.selectedRange
+                ),
+                to: textView.string
+            )
         )
         guard let scrollView = textView.enclosingScrollView else { return }
         scrollView.layoutSubtreeIfNeeded()
@@ -290,10 +230,12 @@ final class EditorPaneStateCoordinator: NSObject {
             }
             return
         }
-        guard textView.string == sourceBuffer.revision.text else { return }
+        guard textView.string == presentation.text else { return }
         self.pendingSelectionRestore = nil
         let restoredRange = clamped(
-            pendingSelectionRestore,
+            presentation.presentedRange(
+                forSourceRange: pendingSelectionRestore
+            ),
             to: textView.string
         )
         if textView.selectedRange() != restoredRange {
@@ -304,42 +246,42 @@ final class EditorPaneStateCoordinator: NSObject {
 
     private func updatePaneState() {
         guard let textView else { return }
-        let selectedRange = textView.selectedRange()
-        if pane.selectedRange != selectedRange {
-            pane.selectedRange = selectedRange
+        let currentSelection = textView.selectedRange()
+        let selectedRange = normalizesDisplayMathSelection
+            && currentSelection.length > 0
+            ? DisplayMathSelectionPolicy.normalized(
+                currentSelection,
+                in: textView.string
+            )
+            : currentSelection
+        if selectedRange != currentSelection {
+            textView.setSelectedRange(selectedRange)
+        }
+        let sourceSelection = presentation.sourceRange(
+            forPresentedRange: selectedRange
+        )
+        if pane.selectedRange != sourceSelection {
+            pane.selectedRange = sourceSelection
         }
         if let clipView, pane.visibleOrigin != clipView.bounds.origin {
             pane.visibleOrigin = clipView.bounds.origin
         }
-        let request = LineColumnRequest(
-            revision: sourceBuffer.revision.number,
-            location: selectedRange.location,
-            text: textView.string
-        )
-        if (textView.string as NSString).length <= 256 * 1_024 {
-            let result = LineColumnCalculator.calculate(request)
-            if pane.line != result.line {
-                pane.line = result.line
+        guard let position = sourceBuffer.position(
+            atUTF16Location: sourceSelection.location
+        ) else {
+            if !pane.isPositionPending {
+                pane.isPositionPending = true
             }
-            if pane.column != result.column {
-                pane.column = result.column
-            }
-        } else {
-            lineColumnScheduler.schedule(request)
-        }
-    }
-
-    private func receiveLineColumn(_ result: LineColumnResult) {
-        guard sourceBuffer.revision.number == result.request.revision,
-              pane.selectedRange.location
-                == result.request.location else {
             return
         }
-        if pane.line != result.line {
-            pane.line = result.line
+        if pane.isPositionPending {
+            pane.isPositionPending = false
         }
-        if pane.column != result.column {
-            pane.column = result.column
+        if pane.line != position.line {
+            pane.line = position.line
+        }
+        if pane.column != position.column {
+            pane.column = position.column
         }
     }
 
@@ -357,5 +299,42 @@ final class EditorPaneStateCoordinator: NSObject {
             location: location,
             length: min(max(range.length, 0), length - location)
         )
+    }
+}
+
+enum DisplayMathSelectionPolicy {
+    static func normalized(
+        _ selection: NSRange,
+        in source: String
+    ) -> NSRange {
+        let text = source as NSString
+        guard selection.length > 0,
+              selection.location >= 2,
+              NSMaxRange(selection) + 2 <= text.length,
+              text.substring(
+                with: NSRange(location: selection.location - 2, length: 2)
+              ) == "$$",
+              text.substring(
+                with: NSRange(location: NSMaxRange(selection), length: 2)
+              ) == "$$" else {
+            return selection
+        }
+
+        var start = selection.location
+        var end = NSMaxRange(selection)
+        while start < end,
+              isRendererTrimmedWhitespace(text.character(at: start)) {
+            start += 1
+        }
+        while end > start,
+              isRendererTrimmedWhitespace(text.character(at: end - 1)) {
+            end -= 1
+        }
+        return NSRange(location: start, length: end - start)
+    }
+
+    private static func isRendererTrimmedWhitespace(_ codeUnit: unichar) -> Bool {
+        guard let scalar = UnicodeScalar(codeUnit) else { return false }
+        return CharacterSet.whitespacesAndNewlines.contains(scalar)
     }
 }

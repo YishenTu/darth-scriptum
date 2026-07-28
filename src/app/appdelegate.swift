@@ -11,7 +11,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
-        true
+        !ProcessInfo.processInfo.arguments.contains(
+            "--skip-opening-untitled-document"
+        )
     }
 
     func applicationShouldSaveSecureApplicationState(
@@ -58,8 +60,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         currentDocument?.markdownWindowController?.workspaceModel.toggleSplit()
     }
 
+    @objc private func splitRight(_ sender: Any?) {
+        currentDocument?.markdownWindowController?.splitRight()
+    }
+
+    @objc private func focusPreviousPane(_ sender: Any?) {
+        currentDocument?.markdownWindowController?.focusPreviousPane()
+    }
+
     @objc private func focusNextPane(_ sender: Any?) {
         currentDocument?.markdownWindowController?.focusNextPane()
+    }
+
+    @objc private func focusLeftPane(_ sender: Any?) {
+        currentDocument?.markdownWindowController?.focusLeftPane()
+    }
+
+    @objc private func focusRightPane(_ sender: Any?) {
+        currentDocument?.markdownWindowController?.focusRightPane()
     }
 
     @objc private func toggleTaskMarker(_ sender: Any?) {
@@ -84,6 +102,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func actualSize(_ sender: Any?) {
         currentDocument?.markdownWindowController?.workspaceModel.resetZoom()
+    }
+
+    @objc private func toggleFullScreen(_ sender: Any?) {
+        NSApp.keyWindow?.toggleFullScreen(sender)
+    }
+
+    @objc private func selectTab(_ sender: NSMenuItem) {
+        guard let currentWindow = NSApp.keyWindow else { return }
+        let windows = currentWindow.tabGroup?.windows ?? [currentWindow]
+        guard let index = TabShortcutPolicy.selectionIndex(
+            for: sender.tag,
+            tabCount: windows.count
+        ) else {
+            return
+        }
+        let targetWindow = windows[index]
+        if let tabGroup = currentWindow.tabGroup {
+            tabGroup.selectedWindow = targetWindow
+        }
+        targetWindow.makeKeyAndOrderFront(sender)
     }
 
     @objc private func restoreLocalRevision(_ sender: Any?) {
@@ -137,11 +175,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             keyEquivalent: ""
         )
         appMenu.addItem(.separator())
-        appMenu.addItem(
+        let hideItem = appMenu.addItem(
+            withTitle: "Hide DarthMD",
+            action: #selector(NSApplication.hide(_:)),
+            keyEquivalent: "h"
+        )
+        hideItem.target = NSApp
+        let hideOthersItem = appMenu.addItem(
+            withTitle: "Hide Others",
+            action: #selector(NSApplication.hideOtherApplications(_:)),
+            keyEquivalent: "h"
+        )
+        hideOthersItem.keyEquivalentModifierMask = [.command, .option]
+        hideOthersItem.target = NSApp
+        let showAllItem = appMenu.addItem(
+            withTitle: "Show All",
+            action: #selector(NSApplication.unhideAllApplications(_:)),
+            keyEquivalent: ""
+        )
+        showAllItem.target = NSApp
+        appMenu.addItem(.separator())
+        let quitItem = appMenu.addItem(
             withTitle: "Quit DarthMD",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )
+        quitItem.target = NSApp
 
         let fileItem = NSMenuItem(title: "File", action: nil, keyEquivalent: "")
         mainMenu.addItem(fileItem)
@@ -153,6 +212,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             keyEquivalent: "n"
         )
         newItem.target = NSDocumentController.shared
+        let newTabItem = fileMenu.addItem(
+            withTitle: "New Tab",
+            action: #selector(NSDocumentController.newDocument(_:)),
+            keyEquivalent: "t"
+        )
+        newTabItem.target = NSDocumentController.shared
         let newWindowItem = fileMenu.addItem(
             withTitle: "New Window",
             action: #selector(newWindow(_:)),
@@ -250,19 +315,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         sourceItem.keyEquivalentModifierMask = [.command, .shift]
         sourceItem.target = self
-        let splitItem = viewMenu.addItem(
+        let splitRightItem = viewMenu.addItem(
+            withTitle: "Split Right",
+            action: #selector(splitRight(_:)),
+            keyEquivalent: "d"
+        )
+        splitRightItem.target = self
+        let toggleSplitItem = viewMenu.addItem(
             withTitle: "Toggle Split",
             action: #selector(toggleSplit(_:)),
             keyEquivalent: "\\"
         )
-        splitItem.target = self
-        let focusItem = viewMenu.addItem(
+        toggleSplitItem.target = self
+        viewMenu.addItem(.separator())
+        let previousPaneItem = viewMenu.addItem(
+            withTitle: "Focus Previous Pane",
+            action: #selector(focusPreviousPane(_:)),
+            keyEquivalent: "["
+        )
+        previousPaneItem.target = self
+        let nextPaneItem = viewMenu.addItem(
             withTitle: "Focus Next Pane",
             action: #selector(focusNextPane(_:)),
             keyEquivalent: "]"
         )
-        focusItem.keyEquivalentModifierMask = [.command, .option]
-        focusItem.target = self
+        nextPaneItem.target = self
+        let leftPaneItem = viewMenu.addItem(
+            withTitle: "Focus Left Pane",
+            action: #selector(focusLeftPane(_:)),
+            keyEquivalent: "1"
+        )
+        leftPaneItem.keyEquivalentModifierMask = [.control]
+        leftPaneItem.target = self
+        let rightPaneItem = viewMenu.addItem(
+            withTitle: "Focus Right Pane",
+            action: #selector(focusRightPane(_:)),
+            keyEquivalent: "2"
+        )
+        rightPaneItem.keyEquivalentModifierMask = [.control]
+        rightPaneItem.target = self
         viewMenu.addItem(.separator())
         for (title, action, key) in [
             ("Zoom In", #selector(zoomIn(_:)), "+"),
@@ -298,6 +389,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             action: #selector(NSWindow.performZoom(_:)),
             keyEquivalent: ""
         )
+        let fullScreenItem = windowMenu.addItem(
+            withTitle: "Toggle Full Screen",
+            action: #selector(toggleFullScreen(_:)),
+            keyEquivalent: ""
+        )
+        fullScreenItem.target = self
         windowMenu.addItem(.separator())
         windowMenu.addItem(
             withTitle: "Show Previous Tab",
@@ -309,6 +406,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             action: #selector(NSWindow.selectNextTab(_:)),
             keyEquivalent: "}"
         )
+        windowMenu.addItem(.separator())
+        for number in 1...8 {
+            let item = windowMenu.addItem(
+                withTitle: "Show Tab \(number)",
+                action: #selector(selectTab(_:)),
+                keyEquivalent: "\(number)"
+            )
+            item.tag = number
+            item.target = self
+        }
+        let lastTabItem = windowMenu.addItem(
+            withTitle: "Show Last Tab",
+            action: #selector(selectTab(_:)),
+            keyEquivalent: "9"
+        )
+        lastTabItem.tag = 9
+        lastTabItem.target = self
+        windowMenu.addItem(.separator())
         windowMenu.addItem(
             withTitle: "Move Tab to New Window",
             action: #selector(NSWindow.moveTabToNewWindow(_:)),
@@ -321,5 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         NSApp.mainMenu = mainMenu
         NSApp.windowsMenu = windowMenu
+        fullScreenItem.keyEquivalent = "f"
+        fullScreenItem.keyEquivalentModifierMask = [.command, .control]
     }
 }

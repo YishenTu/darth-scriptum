@@ -3,6 +3,8 @@ import SwiftUI
 
 enum DarthTheme {
     static let background = NSColor(hex: 0x1A1614)
+    static let backgroundOverlayOpacity: CGFloat = 0.55
+    static let statusBarOverlayOpacity: CGFloat = 0.66
     static let foreground = NSColor(hex: 0xE8D5B7)
     static let accent = NSColor(hex: 0xC4956A)
     static let selectionBackground = NSColor(hex: 0x4A3A2A)

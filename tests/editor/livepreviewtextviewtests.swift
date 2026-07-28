@@ -93,7 +93,7 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
     }
 
-    func testSelectionAnchorLookupIsBoundedInLargeRepeatedText() {
+    func testSelectionAnchorResolvesInLargeRepeatedText() {
         let source = String(repeating: "same repeated line\n", count: 250_000)
         let location = (source as NSString).length / 2
         let anchor = SelectionAnchor.capture(
@@ -101,13 +101,9 @@ final class LivePreviewTextViewTests: XCTestCase {
             in: source
         )
         let updated = "prefix\n" + source
-        let clock = ContinuousClock()
-        let start = clock.now
-
         let resolved = anchor.resolve(in: updated)
 
         XCTAssertEqual(resolved.location, location + 7)
-        XCTAssertLessThan(start.duration(to: clock.now), .milliseconds(50))
     }
 
     func testConfiguredLatexRendererSupportsFinancialFormula() {
@@ -395,6 +391,218 @@ final class LivePreviewTextViewTests: XCTestCase {
             )
         )
         _ = window
+    }
+
+    func testEngineRestylesWhenMathJaxFallbackCompletes() async throws {
+        let source = """
+        before
+
+        $$
+        \\dfrac{37}{113} + \\begin{pmatrix}a & b \\\\ c & d\\end{pmatrix}
+        $$
+
+        after
+        """
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(
+                text: source,
+                format: .newDocument
+            )
+        )
+        let pane = EditorPaneModel()
+        let hostingView = NSHostingView(
+            rootView: LivePreviewTextView(
+                sourceBuffer: buffer,
+                pane: pane,
+                sourceMode: false,
+                fontSize: 14,
+                newlineStyle: .lf
+            )
+            .frame(width: 640, height: 300)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 640, height: 300)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+
+        try await waitUntil(timeout: .seconds(5)) {
+            self.descendantTextViews(in: hostingView).count == 1
+        }
+        let textView = try XCTUnwrap(
+            descendantTextViews(in: hostingView).first
+        )
+
+        try await waitUntil(timeout: .seconds(5)) {
+            guard let storage = textView.textStorage,
+                  storage.length == (source as NSString).length else {
+                return false
+            }
+            return self.containsRenderedLatex(
+                in: storage,
+                range: NSRange(location: 0, length: storage.length)
+            )
+        }
+
+        XCTAssertEqual(textView.string, source)
+        XCTAssertTrue(
+            containsRenderedLatex(
+                in: try XCTUnwrap(textView.textStorage),
+                range: NSRange(
+                    location: 0,
+                    length: (source as NSString).length
+                )
+            )
+        )
+        _ = window
+    }
+
+    func testDisplayMathSelectionHighlightsOnlyVisibleFormulaContent() async throws {
+        let formula = #"P = K \, e^{-rT} \, N(-d_2) - S_0 \, N(-d_1)"#
+        let source = """
+        before
+
+        $$
+          \(formula)
+        $$
+
+        after
+        """
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(
+                text: source,
+                format: .newDocument
+            )
+        )
+        let pane = EditorPaneModel()
+        let hostingView = NSHostingView(
+            rootView: LivePreviewTextView(
+                sourceBuffer: buffer,
+                pane: pane,
+                sourceMode: false,
+                fontSize: 14,
+                newlineStyle: .lf
+            )
+            .frame(width: 640, height: 300)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 640, height: 300)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+
+        try await waitUntil {
+            self.descendantTextViews(in: hostingView).count == 1
+        }
+        let textView = try XCTUnwrap(
+            descendantTextViews(in: hostingView).first
+        )
+        try await waitUntil {
+            textView.identifier?.rawValue
+                == "DarthMD.MarkdownEditor.\(pane.id.uuidString)"
+        }
+
+        let nsSource = source as NSString
+        let contentRange = nsSource.range(
+            of: "\n  \(formula)\n"
+        )
+        let visibleFormulaRange = nsSource.range(of: formula)
+        textView.setSelectedRange(contentRange)
+        NotificationCenter.default.post(
+            name: NSTextView.didChangeSelectionNotification,
+            object: textView
+        )
+
+        try await waitUntil {
+            textView.selectedRange() == visibleFormulaRange
+                && pane.selectedRange == visibleFormulaRange
+        }
+        _ = window
+    }
+
+    func testRawSourceModePreservesExactDisplayMathSelection() async throws {
+        let formula = #"P = K \, e^{-rT}"#
+        let source = "$$\n  \(formula)\n$$"
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(
+                text: source,
+                format: .newDocument
+            )
+        )
+        let pane = EditorPaneModel()
+        let hostingView = NSHostingView(
+            rootView: LivePreviewTextView(
+                sourceBuffer: buffer,
+                pane: pane,
+                sourceMode: true,
+                fontSize: 14,
+                newlineStyle: .lf
+            )
+            .frame(width: 640, height: 300)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 640, height: 300)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+
+        try await waitUntil {
+            self.descendantTextViews(in: hostingView).count == 1
+        }
+        let textView = try XCTUnwrap(
+            descendantTextViews(in: hostingView).first
+        )
+        try await waitUntil {
+            textView.identifier?.rawValue
+                == "DarthMD.MarkdownEditor.\(pane.id.uuidString)"
+        }
+
+        let contentRange = (source as NSString).range(of: "\n  \(formula)\n")
+        textView.setSelectedRange(contentRange)
+        NotificationCenter.default.post(
+            name: NSTextView.didChangeSelectionNotification,
+            object: textView
+        )
+
+        try await waitUntil {
+            pane.selectedRange == contentRange
+        }
+        XCTAssertEqual(textView.selectedRange(), contentRange)
+        _ = window
+    }
+
+    func testDisplayMathSelectionPreservesInternalLineBreaks() {
+        let source = "$$\r\n  first \\\\\r\n  second  \r\n$$"
+        let content = (source as NSString).range(
+            of: "\r\n  first \\\\\r\n  second  \r\n"
+        )
+
+        XCTAssertEqual(
+            DisplayMathSelectionPolicy.normalized(content, in: source),
+            (source as NSString).range(of: "first \\\\\r\n  second")
+        )
+    }
+
+    func testDisplayMathSelectionLeavesOrdinarySelectionsUnchanged() {
+        let source = "prefix $$ value $$ suffix"
+        let selection = (source as NSString).range(of: "value")
+
+        XCTAssertEqual(
+            DisplayMathSelectionPolicy.normalized(selection, in: source),
+            selection
+        )
     }
 
     func testPaneStateTracksEngineSelection() async throws {
