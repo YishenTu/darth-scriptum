@@ -742,18 +742,78 @@ final class AdaptiveLatexRenderer: LatexRenderer, @unchecked Sendable {
 
 @MainActor
 final class MathJaxFallbackRenderer: NSObject, MathJaxFallbackRendering {
+    private enum JavaScriptInvocationOutcome: @unchecked Sendable {
+        case value(Any?)
+        case failure(String)
+    }
+
+    private struct ActiveInvocation {
+        let id: UInt64
+        let continuation:
+            CheckedContinuation<JavaScriptInvocationOutcome, Never>
+    }
+
     private static let maximumSVGBytes = 2 * 1_024 * 1_024
     private static let maximumQueuedRenders =
         AdaptiveLatexRenderer.maximumPendingEntries
 
     private(set) var lastError: String?
+    private let resourcePolicy: LocalWebResourcePolicy?
     private lazy var webView = makeWebView()
     private var isReady = false
     private var loadAttempt = 0
     private var activeLoadAttempt: Int?
+    private var activeLoadNavigation: WKNavigation?
+    private var loadTimeoutTask: Task<Void, Never>?
     private var loadWaiters: [CheckedContinuation<Bool, Never>] = []
     private var isRendering = false
     private var renderWaiters: [CheckedContinuation<Void, Never>] = []
+    private var nextInvocationID: UInt64 = 0
+    private var activeInvocation: ActiveInvocation?
+
+    override init() {
+        resourcePolicy = LocalWebResourcePolicy(
+            bundle: .main,
+            entryResourceName: "mathjax-renderer",
+            resourceDirectoryName: "MathJax.bundle"
+        )
+        super.init()
+    }
+
+    deinit {
+        loadTimeoutTask?.cancel()
+    }
+
+    #if DEBUG || TESTING
+    var webViewForTesting: WKWebView {
+        webView
+    }
+
+    var loadWaiterCountForTesting: Int {
+        loadWaiters.count
+    }
+
+    var hasLoadTimeoutForTesting: Bool {
+        loadTimeoutTask != nil
+    }
+
+    var hasActiveInvocationForTesting: Bool {
+        activeInvocation != nil
+    }
+
+    func waitForLoadForTesting() async -> Bool {
+        return await waitForReadiness(loadsEntry: false)
+    }
+
+    func waitForInvocationForTesting() async -> Bool {
+        switch await waitForJavaScriptInvocation() {
+        case .value:
+            true
+        case .failure:
+            false
+        }
+    }
+    #endif
 
     func render(
         latex: String,
@@ -783,8 +843,87 @@ final class MathJaxFallbackRenderer: NSObject, MathJaxFallbackRendering {
             return .transientFailure
         }
 
-        do {
-            let value = try await webView.callAsyncJavaScript(
+        let invocation = await invokeJavaScript(
+            latex: latex,
+            fontSize: fontSize,
+            colorHex: colorHex
+        )
+        guard case let .value(value) = invocation else {
+            if case let .failure(message) = invocation {
+                lastError = message
+            }
+            return .transientFailure
+        }
+        guard let response = value as? [String: Any] else {
+            lastError = "MathJax returned an invalid response."
+            return .transientFailure
+        }
+        if let error = response["error"] as? String {
+            lastError = error
+            return Self.isPermanentRenderError(error)
+                ? .unsupported
+                : .transientFailure
+        }
+        guard let svg = response["svg"] as? String,
+              let data = svg.data(using: .utf8),
+              data.count <= Self.maximumSVGBytes,
+              let width = Self.number(response["width"]),
+              let height = Self.number(response["height"]),
+              let baseline = Self.number(response["baseline"]),
+              width.isFinite,
+              height.isFinite,
+              baseline.isFinite,
+              width > 0,
+              height > 0 else {
+            lastError = "MathJax returned invalid SVG output."
+            return .transientFailure
+        }
+        let backingScale = max(
+            1,
+            NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
+        )
+        guard let cacheCost = Self.estimatedCacheCost(
+            svgByteCount: data.count,
+            width: width,
+            height: height,
+            backingScale: backingScale
+        ) else {
+            lastError = "output-too-large"
+            return .unsupported
+        }
+        guard let image = NSImage(data: data) else {
+            lastError = "MathJax returned invalid SVG output."
+            return .transientFailure
+        }
+
+        lastError = nil
+        let size = CGSize(width: width, height: height)
+        image.size = size
+        return .rendered(
+            MathJaxFallbackRenderedOutput(
+                result: LatexRenderResult(
+                    image: image,
+                    size: size,
+                    baselineOffset: min(max(0, baseline), height)
+                ),
+                cacheCost: cacheCost
+            )
+        )
+    }
+
+    private func invokeJavaScript(
+        latex: String,
+        fontSize: CGFloat,
+        colorHex: String
+    ) async -> JavaScriptInvocationOutcome {
+        await withCheckedContinuation { continuation in
+            nextInvocationID &+= 1
+            let invocationID = nextInvocationID
+            activeInvocation = ActiveInvocation(
+                id: invocationID,
+                continuation: continuation
+            )
+            webView.callAsyncJavaScript(
                 """
                 return await window.renderLatex(
                     latex,
@@ -798,67 +937,49 @@ final class MathJaxFallbackRenderer: NSObject, MathJaxFallbackRendering {
                     "color": colorHex
                 ],
                 in: nil,
-                contentWorld: .page
+                in: .page,
+                completionHandler: { [weak self] result in
+                    guard let self else { return }
+                    switch result {
+                    case let .success(value):
+                        self.finishInvocation(
+                            id: invocationID,
+                            outcome: .value(value)
+                        )
+                    case let .failure(error):
+                        self.finishInvocation(
+                            id: invocationID,
+                            outcome: .failure(error.localizedDescription)
+                        )
+                    }
+                }
             )
-            guard let response = value as? [String: Any] else {
-                lastError = "MathJax returned an invalid response."
-                return .transientFailure
-            }
-            if let error = response["error"] as? String {
-                lastError = error
-                return Self.isPermanentRenderError(error)
-                    ? .unsupported
-                    : .transientFailure
-            }
-            guard let svg = response["svg"] as? String,
-                  let data = svg.data(using: .utf8),
-                  data.count <= Self.maximumSVGBytes,
-                  let width = Self.number(response["width"]),
-                  let height = Self.number(response["height"]),
-                  let baseline = Self.number(response["baseline"]),
-                  width.isFinite,
-                  height.isFinite,
-                  baseline.isFinite,
-                  width > 0,
-                  height > 0 else {
-                lastError = "MathJax returned invalid SVG output."
-                return .transientFailure
-            }
-            let backingScale = max(
-                1,
-                NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
-            )
-            guard let cacheCost = Self.estimatedCacheCost(
-                svgByteCount: data.count,
-                width: width,
-                height: height,
-                backingScale: backingScale
-            ) else {
-                lastError = "output-too-large"
-                return .unsupported
-            }
-            guard let image = NSImage(data: data) else {
-                lastError = "MathJax returned invalid SVG output."
-                return .transientFailure
-            }
-
-            lastError = nil
-            let size = CGSize(width: width, height: height)
-            image.size = size
-            return .rendered(
-                MathJaxFallbackRenderedOutput(
-                    result: LatexRenderResult(
-                        image: image,
-                        size: size,
-                        baselineOffset: min(max(0, baseline), height)
-                    ),
-                    cacheCost: cacheCost
-                )
-            )
-        } catch {
-            lastError = error.localizedDescription
-            return .transientFailure
         }
+    }
+
+    #if DEBUG || TESTING
+    private func waitForJavaScriptInvocation() async
+        -> JavaScriptInvocationOutcome {
+        await withCheckedContinuation { continuation in
+            nextInvocationID &+= 1
+            activeInvocation = ActiveInvocation(
+                id: nextInvocationID,
+                continuation: continuation
+            )
+        }
+    }
+    #endif
+
+    private func finishInvocation(
+        id: UInt64,
+        outcome: JavaScriptInvocationOutcome
+    ) {
+        guard let activeInvocation,
+              activeInvocation.id == id else {
+            return
+        }
+        self.activeInvocation = nil
+        activeInvocation.continuation.resume(returning: outcome)
     }
 
     private static func isPermanentRenderError(_ error: String) -> Bool {
@@ -906,41 +1027,25 @@ final class MathJaxFallbackRenderer: NSObject, MathJaxFallbackRendering {
             return true
         }
 
+        return await waitForReadiness(loadsEntry: true)
+    }
+
+    private func waitForReadiness(loadsEntry: Bool) async -> Bool {
         return await withCheckedContinuation { continuation in
             loadWaiters.append(continuation)
             guard loadWaiters.count == 1 else {
                 return
             }
 
-            loadAttempt &+= 1
-            let attempt = loadAttempt
-            activeLoadAttempt = attempt
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(5))
-                guard let self,
-                      self.activeLoadAttempt == attempt else {
-                    return
-                }
-                self.webView.stopLoading()
-                self.finishLoading(succeeded: false)
-            }
-
-            guard let rendererURL = Bundle.main.url(
-                forResource: "mathjax-renderer",
-                withExtension: "html"
-            ) else {
-                finishLoading(succeeded: false)
-                return
-            }
-            webView.loadFileURL(
-                rendererURL,
-                allowingReadAccessTo: rendererURL.deletingLastPathComponent()
-            )
+            beginLoadAttempt(loadsEntry: loadsEntry)
         }
     }
 
     private func finishLoading(succeeded: Bool) {
         activeLoadAttempt = nil
+        activeLoadNavigation = nil
+        loadTimeoutTask?.cancel()
+        loadTimeoutTask = nil
         isReady = succeeded
         let waiters = loadWaiters
         loadWaiters.removeAll(keepingCapacity: true)
@@ -982,7 +1087,64 @@ final class MathJaxFallbackRenderer: NSObject, MathJaxFallbackRendering {
             configuration: configuration
         )
         view.navigationDelegate = self
+        view.uiDelegate = resourcePolicy
         return view
+    }
+
+    private func beginLoadAttempt(loadsEntry: Bool) {
+        loadAttempt &+= 1
+        let attempt = loadAttempt
+        activeLoadAttempt = attempt
+
+        if loadsEntry {
+            guard let resourcePolicy,
+                  let navigation = resourcePolicy.loadEntry(in: webView) else {
+                finishLoading(succeeded: false)
+                return
+            }
+            activeLoadNavigation = navigation
+        }
+
+        loadTimeoutTask?.cancel()
+        loadTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard let self,
+                  self.activeLoadAttempt == attempt else {
+                return
+            }
+            self.webView.stopLoading()
+            self.finishLoading(succeeded: false)
+            self.replaceWebViewAfterFailure()
+        }
+    }
+
+    private func isActiveLoad(_ navigation: WKNavigation?) -> Bool {
+        guard activeLoadAttempt != nil else {
+            return false
+        }
+        guard let activeLoadNavigation else {
+            return navigation == nil
+        }
+        return navigation === activeLoadNavigation
+    }
+
+    private func replaceWebViewAfterFailure() {
+        let failedWebView = webView
+        if let activeInvocation {
+            finishInvocation(
+                id: activeInvocation.id,
+                outcome: .failure("MathJax web renderer was reset.")
+            )
+        }
+        discard(failedWebView)
+        webView = makeWebView()
+        isReady = false
+    }
+
+    private func discard(_ webView: WKWebView) {
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
     }
 
     private static func number(_ value: Any?) -> CGFloat? {
@@ -1002,6 +1164,11 @@ extension MathJaxFallbackRenderer: WKNavigationDelegate {
         _ webView: WKWebView,
         didFinish navigation: WKNavigation?
     ) {
+        guard webView === self.webView,
+              isActiveLoad(navigation),
+              webView.url == resourcePolicy?.entryURL else {
+            return
+        }
         finishLoading(succeeded: true)
     }
 
@@ -1010,7 +1177,12 @@ extension MathJaxFallbackRenderer: WKNavigationDelegate {
         didFail navigation: WKNavigation?,
         withError error: any Error
     ) {
+        guard webView === self.webView,
+              isActiveLoad(navigation) else {
+            return
+        }
         finishLoading(succeeded: false)
+        replaceWebViewAfterFailure()
     }
 
     func webView(
@@ -1018,14 +1190,27 @@ extension MathJaxFallbackRenderer: WKNavigationDelegate {
         didFailProvisionalNavigation navigation: WKNavigation?,
         withError error: any Error
     ) {
+        guard webView === self.webView,
+              isActiveLoad(navigation) else {
+            return
+        }
         finishLoading(succeeded: false)
+        replaceWebViewAfterFailure()
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        isReady = false
-        if !loadWaiters.isEmpty {
-            finishLoading(succeeded: false)
+        guard webView === self.webView else {
+            return
         }
+        isReady = false
+        if let activeInvocation {
+            finishInvocation(
+                id: activeInvocation.id,
+                outcome: .failure("MathJax web process terminated.")
+            )
+        }
+        finishLoading(succeeded: false)
+        replaceWebViewAfterFailure()
     }
 
     func webView(
@@ -1033,11 +1218,11 @@ extension MathJaxFallbackRenderer: WKNavigationDelegate {
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void
     ) {
-        guard let url = navigationAction.request.url else {
+        guard webView === self.webView,
+              let resourcePolicy else {
             decisionHandler(.cancel)
             return
         }
-        let allowed = url.isFileURL || url.absoluteString == "about:blank"
-        decisionHandler(allowed ? .allow : .cancel)
+        decisionHandler(resourcePolicy.navigationPolicy(for: navigationAction))
     }
 }

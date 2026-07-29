@@ -387,7 +387,8 @@ final class MermaidRendererTests: XCTestCase {
         let rendererURL = try XCTUnwrap(
             Bundle.main.url(
                 forResource: "mermaid-renderer",
-                withExtension: "html"
+                withExtension: "html",
+                subdirectory: "Mermaid.bundle"
             )
         )
         let html = try String(contentsOf: rendererURL, encoding: .utf8)
@@ -400,7 +401,8 @@ final class MermaidRendererTests: XCTestCase {
         let scriptURL = try XCTUnwrap(
             Bundle.main.url(
                 forResource: "mermaid-renderer",
-                withExtension: "js"
+                withExtension: "js",
+                subdirectory: "Mermaid.bundle"
             )
         )
         let script = try String(contentsOf: scriptURL, encoding: .utf8)

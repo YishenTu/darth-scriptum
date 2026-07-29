@@ -1,0 +1,3 @@
+struct EditorViolation {
+    let coordinator: DocumentSyncCoordinator?
+}

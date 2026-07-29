@@ -265,15 +265,51 @@ final class MermaidWebRenderer: NSObject, MermaidRenderingBackend {
     #if DEBUG || TESTING
     private(set) var lastSVGForTesting: String?
     #endif
+    private let resourcePolicy: LocalWebResourcePolicy?
     private lazy var webView = makeWebView()
     private var isReady = false
     private var loadAttempt = 0
     private var activeLoadAttempt: Int?
+    private var activeLoadNavigation: WKNavigation?
+    private var loadTimeoutTask: Task<Void, Never>?
     private var loadWaiters: [CheckedContinuation<Bool, Never>] = []
     private var isRendering = false
     private var renderWaiters: [CheckedContinuation<Void, Never>] = []
     private var nextInvocationID: UInt64 = 0
     private var activeInvocation: ActiveInvocation?
+    private var invocationTimeoutTask: Task<Void, Never>?
+
+    override init() {
+        resourcePolicy = LocalWebResourcePolicy(
+            bundle: .main,
+            entryResourceName: "mermaid-renderer",
+            resourceDirectoryName: "Mermaid.bundle"
+        )
+        super.init()
+    }
+
+    deinit {
+        loadTimeoutTask?.cancel()
+        invocationTimeoutTask?.cancel()
+    }
+
+    #if DEBUG || TESTING
+    var webViewForTesting: WKWebView {
+        webView
+    }
+
+    var loadWaiterCountForTesting: Int {
+        loadWaiters.count
+    }
+
+    var hasLoadTimeoutForTesting: Bool {
+        loadTimeoutTask != nil
+    }
+
+    func waitForLoadForTesting() async -> Bool {
+        return await waitForReadiness(loadsEntry: false)
+    }
+    #endif
 
     func render(source: String) async -> MermaidRenderOutcome {
         guard await acquireRenderSlot() else {
@@ -392,6 +428,17 @@ final class MermaidWebRenderer: NSObject, MermaidRenderingBackend {
                 continuation: continuation
             )
 
+            invocationTimeoutTask?.cancel()
+            invocationTimeoutTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(6))
+                guard let self,
+                      self.activeInvocation?.id == invocationID else {
+                    return
+                }
+                self.finishInvocation(id: invocationID, outcome: .timedOut)
+                self.replaceWebViewAfterFailure()
+            }
+
             webView.callAsyncJavaScript(
                 "return await window.renderMermaid(source);",
                 arguments: ["source": source],
@@ -413,16 +460,6 @@ final class MermaidWebRenderer: NSObject, MermaidRenderingBackend {
                     }
                 }
             )
-
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(6))
-                guard let self,
-                      self.activeInvocation?.id == invocationID else {
-                    return
-                }
-                self.finishInvocation(id: invocationID, outcome: .timedOut)
-                self.replaceWebViewAfterFailure()
-            }
         }
     }
 
@@ -435,6 +472,8 @@ final class MermaidWebRenderer: NSObject, MermaidRenderingBackend {
             return
         }
         self.activeInvocation = nil
+        invocationTimeoutTask?.cancel()
+        invocationTimeoutTask = nil
         activeInvocation.continuation.resume(returning: outcome)
     }
 
@@ -485,39 +524,23 @@ final class MermaidWebRenderer: NSObject, MermaidRenderingBackend {
             return true
         }
 
+        return await waitForReadiness(loadsEntry: true)
+    }
+
+    private func waitForReadiness(loadsEntry: Bool) async -> Bool {
         return await withCheckedContinuation { continuation in
             loadWaiters.append(continuation)
             guard loadWaiters.count == 1 else { return }
 
-            loadAttempt &+= 1
-            let attempt = loadAttempt
-            activeLoadAttempt = attempt
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(5))
-                guard let self,
-                      self.activeLoadAttempt == attempt else {
-                    return
-                }
-                self.finishLoading(succeeded: false)
-                self.replaceWebViewAfterFailure()
-            }
-
-            guard let rendererURL = Bundle.main.url(
-                forResource: "mermaid-renderer",
-                withExtension: "html"
-            ) else {
-                finishLoading(succeeded: false)
-                return
-            }
-            webView.loadFileURL(
-                rendererURL,
-                allowingReadAccessTo: rendererURL.deletingLastPathComponent()
-            )
+            beginLoadAttempt(loadsEntry: loadsEntry)
         }
     }
 
     private func finishLoading(succeeded: Bool) {
         activeLoadAttempt = nil
+        activeLoadNavigation = nil
+        loadTimeoutTask?.cancel()
+        loadTimeoutTask = nil
         isReady = succeeded
         let waiters = loadWaiters
         loadWaiters.removeAll(keepingCapacity: true)
@@ -528,8 +551,16 @@ final class MermaidWebRenderer: NSObject, MermaidRenderingBackend {
 
     private func replaceWebViewAfterFailure() {
         let failedWebView = webView
-        failedWebView.navigationDelegate = nil
-        failedWebView.stopLoading()
+        if let activeInvocation {
+            finishInvocation(
+                id: activeInvocation.id,
+                outcome: .failure("Mermaid web renderer was reset.")
+            )
+        } else {
+            invocationTimeoutTask?.cancel()
+            invocationTimeoutTask = nil
+        }
+        discard(failedWebView)
         webView = makeWebView()
         isReady = false
     }
@@ -567,7 +598,51 @@ final class MermaidWebRenderer: NSObject, MermaidRenderingBackend {
             configuration: configuration
         )
         view.navigationDelegate = self
+        view.uiDelegate = resourcePolicy
         return view
+    }
+
+    private func beginLoadAttempt(loadsEntry: Bool) {
+        loadAttempt &+= 1
+        let attempt = loadAttempt
+        activeLoadAttempt = attempt
+
+        if loadsEntry {
+            guard let resourcePolicy,
+                  let navigation = resourcePolicy.loadEntry(in: webView) else {
+                finishLoading(succeeded: false)
+                return
+            }
+            activeLoadNavigation = navigation
+        }
+
+        loadTimeoutTask?.cancel()
+        loadTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard let self,
+                  self.activeLoadAttempt == attempt else {
+                return
+            }
+            self.webView.stopLoading()
+            self.finishLoading(succeeded: false)
+            self.replaceWebViewAfterFailure()
+        }
+    }
+
+    private func isActiveLoad(_ navigation: WKNavigation?) -> Bool {
+        guard activeLoadAttempt != nil else {
+            return false
+        }
+        guard let activeLoadNavigation else {
+            return navigation == nil
+        }
+        return navigation === activeLoadNavigation
+    }
+
+    private func discard(_ webView: WKWebView) {
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
     }
 
     private static func number(_ value: Any?) -> CGFloat? {
@@ -587,7 +662,11 @@ extension MermaidWebRenderer: WKNavigationDelegate {
         _ webView: WKWebView,
         didFinish navigation: WKNavigation?
     ) {
-        guard webView === self.webView else { return }
+        guard webView === self.webView,
+              isActiveLoad(navigation),
+              webView.url == resourcePolicy?.entryURL else {
+            return
+        }
         finishLoading(succeeded: true)
     }
 
@@ -596,8 +675,12 @@ extension MermaidWebRenderer: WKNavigationDelegate {
         didFail navigation: WKNavigation?,
         withError error: any Error
     ) {
-        guard webView === self.webView else { return }
+        guard webView === self.webView,
+              isActiveLoad(navigation) else {
+            return
+        }
         finishLoading(succeeded: false)
+        replaceWebViewAfterFailure()
     }
 
     func webView(
@@ -605,8 +688,12 @@ extension MermaidWebRenderer: WKNavigationDelegate {
         didFailProvisionalNavigation navigation: WKNavigation?,
         withError error: any Error
     ) {
-        guard webView === self.webView else { return }
+        guard webView === self.webView,
+              isActiveLoad(navigation) else {
+            return
+        }
         finishLoading(succeeded: false)
+        replaceWebViewAfterFailure()
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -618,9 +705,8 @@ extension MermaidWebRenderer: WKNavigationDelegate {
                 outcome: .failure("Mermaid web process terminated.")
             )
         }
-        if !loadWaiters.isEmpty {
-            finishLoading(succeeded: false)
-        }
+        finishLoading(succeeded: false)
+        replaceWebViewAfterFailure()
     }
 
     func webView(
@@ -629,16 +715,10 @@ extension MermaidWebRenderer: WKNavigationDelegate {
         decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void
     ) {
         guard webView === self.webView,
-              let url = navigationAction.request.url else {
+              let resourcePolicy else {
             decisionHandler(.cancel)
             return
         }
-        let rendererURL = Bundle.main.url(
-            forResource: "mermaid-renderer",
-            withExtension: "html"
-        )?.standardizedFileURL
-        let allowed = url.absoluteString == "about:blank"
-            || (url.isFileURL && url.standardizedFileURL == rendererURL)
-        decisionHandler(allowed ? .allow : .cancel)
+        decisionHandler(resourcePolicy.navigationPolicy(for: navigationAction))
     }
 }

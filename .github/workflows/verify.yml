@@ -1,0 +1,98 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.4.app/Contents/Developer
+      DESTINATION: platform=macOS,arch=arm64
+      DERIVED_DATA_PATH: ${{ github.workspace }}/DerivedData/verify
+      SOURCE_PACKAGES_PATH: ${{ github.workspace }}/DerivedData/SourcePackages
+      RESULT_BUNDLE_PATH: ${{ github.workspace }}/DerivedData/verify-tests.xcresult
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify locked toolchain
+        run: |
+          set -euo pipefail
+          test -d "$DEVELOPER_DIR"
+          test "$(uname -m)" = "arm64"
+          test "$(xcrun --find xcodebuild)" = "$DEVELOPER_DIR/usr/bin/xcodebuild"
+          xcodebuild -version
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild \
+            -project DarthScriptum.xcodeproj \
+            -scheme DarthScriptum \
+            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_PATH" \
+            -resolvePackageDependencies
+
+      - name: Check architecture
+        run: ./scripts/check-architecture.sh
+
+      - name: Check whitespace
+        run: git diff --check
+
+      - name: Build Debug
+        run: |
+          xcodebuild \
+            -project DarthScriptum.xcodeproj \
+            -scheme DarthScriptum \
+            -configuration Debug \
+            -destination "$DESTINATION" \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_PATH" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build Release
+        run: |
+          xcodebuild \
+            -project DarthScriptum.xcodeproj \
+            -scheme DarthScriptum \
+            -configuration Release \
+            -destination "$DESTINATION" \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_PATH" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Test non-performance suite
+        run: |
+          xcodebuild \
+            -project DarthScriptum.xcodeproj \
+            -scheme DarthScriptum \
+            -configuration Debug \
+            -destination "$DESTINATION" \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_PATH" \
+            -resultBundlePath "$RESULT_BUNDLE_PATH" \
+            CODE_SIGNING_ALLOWED=NO \
+            -skip-testing:DarthScriptumTests/PerformanceTests \
+            test
+
+      - name: Upload test result bundle
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: verify-test-results
+          path: ${{ env.RESULT_BUNDLE_PATH }}
+          if-no-files-found: ignore

@@ -881,7 +881,8 @@ final class AdaptiveLatexRendererTests: XCTestCase {
         let rendererURL = try XCTUnwrap(
             Bundle.main.url(
                 forResource: "mathjax-renderer",
-                withExtension: "html"
+                withExtension: "html",
+                subdirectory: "MathJax.bundle"
             )
         )
         let html = try String(contentsOf: rendererURL, encoding: .utf8)

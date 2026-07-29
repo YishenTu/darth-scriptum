@@ -1,0 +1,5 @@
+import AppKit
+
+final class MarkdownDocument: NSDocument {
+    let windowController: MarkdownWindowController? = nil
+}
