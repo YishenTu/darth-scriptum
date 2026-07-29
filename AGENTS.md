@@ -19,14 +19,8 @@ xcodebuild \
 
 - Run `./scripts/verify.sh` for changes with broad impact or before committing a completed implementation.
 
-## Relaunch after code changes
-
-- After a successful build of any runtime-affecting change, gracefully quit the currently running DarthScriptum process, launch `DerivedData/Build/Products/Debug/DarthScriptum.app`, and confirm that its window is visible.
-- Leave the relaunched Debug app running so the user can test the result.
-- Do not relaunch for documentation-only, test-only, or other non-runtime changes.
-- Do not copy the app into `/Applications` during normal development. Installing is only necessary when the user explicitly asks for it or when testing packaging, signing, updates, or distribution behavior.
-
 ## Fast local feedback
 
-- For interactive development in Xcode, use **Run** (`Command-R`). Xcode builds the changed sources, stops the previous debug process, and launches the new build automatically.
-- For command-line or agent-driven work, build into the repository-local `DerivedData/` path above and relaunch that exact app bundle.
+- For interactive development in Xcode, use **Build** (`Command-B`) unless UI validation is explicitly requested.
+- For command-line or agent-driven work, build into the repository-local `DerivedData/` path above.
+- Launch or install the app only when the user explicitly requests UI, packaging, signing, update, or distribution validation.

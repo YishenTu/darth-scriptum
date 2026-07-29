@@ -32,8 +32,8 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
         fileURL
     }
 
-    var isEmptyUntitledDocument: Bool {
-        fileURL == nil && syncCoordinator.sourceBuffer.revision.text.isEmpty
+    var hasUnsavedUntitledContent: Bool {
+        fileURL == nil && !syncCoordinator.sourceBuffer.revision.text.isEmpty
     }
 
     nonisolated override class var autosavesInPlace: Bool { false }
@@ -241,10 +241,10 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
         shouldClose shouldCloseSelector: Selector?,
         contextInfo: UnsafeMutableRawPointer?
     ) {
-        if isEmptyUntitledDocument {
-            updateChangeCount(.changeCleared)
-        }
         guard fileURL != nil else {
+            if !hasUnsavedUntitledContent {
+                updateChangeCount(.changeCleared)
+            }
             super.canClose(
                 withDelegate: delegate,
                 shouldClose: shouldCloseSelector,

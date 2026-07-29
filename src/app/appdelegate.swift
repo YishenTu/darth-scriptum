@@ -36,10 +36,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func saveAs(_ sender: Any?) {
-        currentDocument?.saveAs(sender)
-    }
-
     @objc private func openRecentDocument(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         NSDocumentController.shared.openDocument(
@@ -241,13 +237,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recentItem.submenu = recentMenu
         fileMenu.addItem(recentItem)
         openRecentMenu = recentMenu
-        fileMenu.addItem(.separator())
-        let saveAsItem = fileMenu.addItem(
-            withTitle: "Save As…",
-            action: #selector(saveAs(_:)),
-            keyEquivalent: "S"
-        )
-        saveAsItem.target = self
         fileMenu.addItem(.separator())
         fileMenu.addItem(
             withTitle: "Close",

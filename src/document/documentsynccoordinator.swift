@@ -66,7 +66,6 @@ protocol DocumentSyncCoordinatorDelegate: AnyObject {
 @MainActor
 final class DocumentSyncCoordinator: ObservableObject {
     static let localWriteDelay: Duration = .milliseconds(100)
-    static let externalEventDelay: Duration = .milliseconds(75)
 
     private(set) var state: SynchronizationState = .idle {
         didSet {
@@ -753,11 +752,6 @@ final class DocumentSyncCoordinator: ObservableObject {
         nextExternalReadGeneration &+= 1
         activeExternalReadGeneration = generation
         externalReadTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: Self.externalEventDelay)
-            } catch {
-                return
-            }
             guard !Task.isCancelled else { return }
             await self?.readExternalRevision(generation: generation)
         }
@@ -768,6 +762,10 @@ final class DocumentSyncCoordinator: ObservableObject {
             finishExternalRead(generation)
             return
         }
+        // Signals delivered before this read starts are already represented by
+        // the bytes it is about to load. Only retain signals that arrive while
+        // the read is in flight.
+        externalReadPending = false
         state = .checkingExternalChange
         do {
             let data = try await Task.detached(priority: .utility) {
@@ -860,7 +858,10 @@ final class DocumentSyncCoordinator: ObservableObject {
                     finishExternalRead(generation)
                     return
                 }
-                restartMonitor()
+                if fingerprint.resourceIdentifier
+                    != capturedDurableState?.fingerprint.resourceIdentifier {
+                    restartMonitor()
+                }
                 if let capturedDurableState {
                     durableState = DurableFileState(
                         snapshot: capturedDurableState.snapshot,
@@ -886,7 +887,10 @@ final class DocumentSyncCoordinator: ObservableObject {
                     finishExternalRead(generation)
                     return
                 }
-                restartMonitor()
+                if fingerprint.resourceIdentifier
+                    != capturedDurableState?.fingerprint.resourceIdentifier {
+                    restartMonitor()
+                }
                 applyExternalReconciliation(
                     fingerprint: fingerprint,
                     external: external,

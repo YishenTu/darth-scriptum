@@ -56,4 +56,30 @@ final class DirectoryFileMonitorTests: XCTestCase {
         wait(for: [expectation], timeout: 1)
         monitor.cancel()
     }
+
+    func testReadingTargetDoesNotProduceAChangeEvent() throws {
+        let expectation = expectation(description: "No read feedback")
+        expectation.isInverted = true
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let target = directory.appendingPathComponent("fixture.md")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        try Data("fixture\n".utf8).write(to: target)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let monitor = DirectoryFileMonitor(
+            targetURL: target,
+            onChange: { expectation.fulfill() }
+        )
+        try monitor.start()
+
+        _ = try Data(contentsOf: target, options: [.mappedIfSafe])
+        _ = try FileManager.default.attributesOfItem(atPath: target.path)
+
+        wait(for: [expectation], timeout: 0.1)
+        monitor.cancel()
+    }
 }

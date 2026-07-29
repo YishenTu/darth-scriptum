@@ -1268,6 +1268,36 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         coordinator.close()
     }
 
+    func testExternalChangeStartsReadingWithoutADebounce() async throws {
+        let fixture = try TemporaryMarkdownFile(contents: "base\n")
+        defer { fixture.remove() }
+        let initialData = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(initialData)
+        let gate = SuspensionGate()
+        var readStarted = false
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: snapshot,
+            externalReadHook: { _ in
+                readStarted = true
+                await gate.wait()
+            }
+        )
+        defer { coordinator.close() }
+        coordinator.loadInitial(
+            snapshot,
+            data: initialData,
+            from: fixture.url
+        )
+
+        try Data("external\n".utf8).write(to: fixture.url)
+        coordinator.noteCoordinatedExternalChange()
+
+        try await waitUntil {
+            readStarted && coordinator.state == .checkingExternalChange
+        }
+        await gate.open()
+    }
+
     func testPendingExternalSignalRunsAfterTheActiveRead() async throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }

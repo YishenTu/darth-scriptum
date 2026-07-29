@@ -3,9 +3,21 @@ import XCTest
 
 @testable import DarthScriptum
 
+@objc private protocol AppDelegateMenuActions {
+    func undoDocument(_ sender: Any?)
+    func redoDocument(_ sender: Any?)
+    func splitRight(_ sender: Any?)
+    func focusPreviousPane(_ sender: Any?)
+    func focusNextPane(_ sender: Any?)
+    func focusLeftPane(_ sender: Any?)
+    func focusRightPane(_ sender: Any?)
+    func toggleFullScreen(_ sender: Any?)
+    func selectTab(_ sender: NSMenuItem)
+}
+
 @MainActor
 final class AppDelegateTests: XCTestCase {
-    func testFileMenuOmitsSaveAndRetainsSaveAs() {
+    func testFileMenuContainsNoManualSaveCommands() {
         let originalMenu = NSApp.mainMenu
         defer {
             NSApp.mainMenu = originalMenu
@@ -20,11 +32,11 @@ final class AppDelegateTests: XCTestCase {
 
         XCTAssertNil(fileMenu?.item(withTitle: "Save / Flush Now"))
         XCTAssertNil(fileMenu?.item(withTitle: "Revert to Saved"))
-        XCTAssertNotNil(fileMenu?.item(withTitle: "Save As…"))
+        XCTAssertNil(fileMenu?.item(withTitle: "Save As…"))
         XCTAssertFalse(
             fileMenu?.items.contains {
-                $0.keyEquivalent == "s"
-                    && $0.keyEquivalentModifierMask == .command
+                $0.keyEquivalent.lowercased() == "s"
+                    && $0.keyEquivalentModifierMask.contains(.command)
             } ?? true
         )
     }
@@ -43,9 +55,15 @@ final class AppDelegateTests: XCTestCase {
         let redoItem = editMenu?.item(withTitle: "Redo")
 
         XCTAssertTrue(undoItem?.target === delegate)
-        XCTAssertEqual(undoItem?.action, Selector(("undoDocument:")))
+        XCTAssertEqual(
+            undoItem?.action,
+            #selector(AppDelegateMenuActions.undoDocument(_:))
+        )
         XCTAssertTrue(redoItem?.target === delegate)
-        XCTAssertEqual(redoItem?.action, Selector(("redoDocument:")))
+        XCTAssertEqual(
+            redoItem?.action,
+            #selector(AppDelegateMenuActions.redoDocument(_:))
+        )
     }
 
     func testCommonMacOSKeyboardShortcutsAreInstalled() {
@@ -85,37 +103,37 @@ final class AppDelegateTests: XCTestCase {
             viewMenu?.item(withTitle: "Split Right"),
             key: "d",
             modifiers: [.command],
-            action: Selector(("splitRight:"))
+            action: #selector(AppDelegateMenuActions.splitRight(_:))
         )
         assertShortcut(
             viewMenu?.item(withTitle: "Focus Previous Pane"),
             key: "[",
             modifiers: [.command],
-            action: Selector(("focusPreviousPane:"))
+            action: #selector(AppDelegateMenuActions.focusPreviousPane(_:))
         )
         assertShortcut(
             viewMenu?.item(withTitle: "Focus Next Pane"),
             key: "]",
             modifiers: [.command],
-            action: Selector(("focusNextPane:"))
+            action: #selector(AppDelegateMenuActions.focusNextPane(_:))
         )
         assertShortcut(
             viewMenu?.item(withTitle: "Focus Left Pane"),
             key: "1",
             modifiers: [.control],
-            action: Selector(("focusLeftPane:"))
+            action: #selector(AppDelegateMenuActions.focusLeftPane(_:))
         )
         assertShortcut(
             viewMenu?.item(withTitle: "Focus Right Pane"),
             key: "2",
             modifiers: [.control],
-            action: Selector(("focusRightPane:"))
+            action: #selector(AppDelegateMenuActions.focusRightPane(_:))
         )
         assertShortcut(
             windowMenu?.item(withTitle: "Toggle Full Screen"),
             key: "f",
             modifiers: [.command, .control],
-            action: Selector(("toggleFullScreen:"))
+            action: #selector(AppDelegateMenuActions.toggleFullScreen(_:))
         )
         for number in 1...8 {
             let item = windowMenu?.item(withTitle: "Show Tab \(number)")
@@ -123,7 +141,7 @@ final class AppDelegateTests: XCTestCase {
                 item,
                 key: "\(number)",
                 modifiers: [.command],
-                action: Selector(("selectTab:"))
+                action: #selector(AppDelegateMenuActions.selectTab(_:))
             )
             XCTAssertEqual(item?.tag, number)
         }
@@ -132,26 +150,26 @@ final class AppDelegateTests: XCTestCase {
             lastTabItem,
             key: "9",
             modifiers: [.command],
-            action: Selector(("selectTab:"))
+            action: #selector(AppDelegateMenuActions.selectTab(_:))
         )
         XCTAssertEqual(lastTabItem?.tag, 9)
     }
 
-    func testOnlyEmptyUntitledDocumentsCanCloseWithoutSaving() {
+    func testOnlyNonemptyUntitledDocumentsRequireSavingOnClose() {
         let document = MarkdownDocument()
-        XCTAssertTrue(document.isEmptyUntitledDocument)
+        XCTAssertFalse(document.hasUnsavedUntitledContent)
 
         document.syncCoordinator.sourceBuffer.replace(
             with: "# Draft",
             origin: .localEditor(paneID: UUID())
         )
-        XCTAssertFalse(document.isEmptyUntitledDocument)
+        XCTAssertTrue(document.hasUnsavedUntitledContent)
 
         document.syncCoordinator.sourceBuffer.replace(
             with: "",
             origin: .localEditor(paneID: UUID())
         )
-        XCTAssertTrue(document.isEmptyUntitledDocument)
+        XCTAssertFalse(document.hasUnsavedUntitledContent)
     }
 
     private func assertShortcut(

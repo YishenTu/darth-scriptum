@@ -33,7 +33,19 @@ xcodebuild \
 xcodebuild \
   -project "$project_path" \
   -scheme "$scheme_name" \
+  -configuration Debug \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
   CODE_SIGNING_ALLOWED=NO \
+  -skip-testing:DarthScriptumTests/PerformanceTests \
+  test
+
+xcodebuild \
+  -project "$project_path" \
+  -scheme "$scheme_name" \
+  -configuration Benchmark \
+  -destination "$destination_name" \
+  -derivedDataPath "$derived_data" \
+  CODE_SIGNING_ALLOWED=NO \
+  -only-testing:DarthScriptumTests/PerformanceTests \
   test

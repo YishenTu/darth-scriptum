@@ -257,6 +257,11 @@ final class MermaidBlockPresenter {
             guard NSMaxRange(block.fullRange) <= textStorage.length,
                   NSMaxRange(block.contentRange) <= textStorage.length,
                   sourceText.substring(with: block.contentRange) == block.source,
+                  textStorage.mutableString.compare(
+                      sourceText.substring(with: block.fullRange),
+                      options: .literal,
+                      range: block.fullRange
+                  ) == .orderedSame,
                   !selection(selectedRange, intersects: block.fullRange),
                   let diagram = renderer.diagram(for: block.source),
                   let displaySize = displaySize(

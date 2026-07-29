@@ -172,6 +172,55 @@ final class MermaidRendererTests: XCTestCase {
         )
     }
 
+    func testPresenterRejectsSameLengthStaleText() async throws {
+        let backend = StubMermaidBackend(outcome: .rendered(Self.output()))
+        let renderer = MermaidRenderer(backend: backend)
+        let presenter = MermaidBlockPresenter(renderer: renderer)
+        let source = """
+        ```mermaid
+        flowchart LR
+        A --> B
+        ```
+        """
+        let blocks = MermaidFencedBlockParser.blocks(in: source)
+        let block = try XCTUnwrap(blocks.first)
+
+        XCTAssertNil(renderer.diagram(for: block.source))
+        try await waitUntil {
+            renderer.diagram(for: block.source) != nil
+        }
+
+        let staleSource = source.replacingOccurrences(
+            of: "```mermaid",
+            with: "```swift  "
+        )
+        XCTAssertEqual(
+            (staleSource as NSString).length,
+            (source as NSString).length
+        )
+        let textView = makeTextView(source: staleSource)
+        textView.setSelectedRange(
+            NSRange(location: (staleSource as NSString).length, length: 0)
+        )
+
+        presenter.apply(
+            to: textView,
+            rendersMarkdown: true,
+            source: source,
+            blocks: blocks
+        )
+
+        let anchor = (staleSource as NSString).range(of: "flowchart").location
+        XCTAssertNil(
+            textView.textStorage?.attribute(
+                NSAttributedString.Key("LatexRenderedImage"),
+                at: anchor,
+                effectiveRange: nil
+            )
+        )
+        XCTAssertEqual(textView.string, staleSource)
+    }
+
     func testPresenterDoesNotRenderActiveOrRawSourceBlocks() async {
         let backend = StubMermaidBackend(outcome: .rendered(Self.output()))
         let renderer = MermaidRenderer(backend: backend)

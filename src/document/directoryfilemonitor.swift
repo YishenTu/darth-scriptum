@@ -47,10 +47,16 @@ final class DirectoryFileMonitor: @unchecked Sendable {
 
         let directorySource = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: directoryDescriptor,
-            eventMask: [.write, .delete, .rename, .attrib, .extend],
+            eventMask: [.write, .delete, .rename, .extend],
             queue: queue
         )
-        directorySource.setEventHandler { [weak self] in self?.onChange() }
+        directorySource.setEventHandler { [weak self] in
+            guard let self, let directorySource = self.directorySource else {
+                return
+            }
+            _ = directorySource.data
+            self.onChange()
+        }
         let monitoredDirectoryDescriptor = directoryDescriptor
         let onDescriptorClosed = self.onDescriptorClosed
         directorySource.setCancelHandler {
@@ -61,10 +67,16 @@ final class DirectoryFileMonitor: @unchecked Sendable {
         if fileDescriptor >= 0 {
             let fileSource = DispatchSource.makeFileSystemObjectSource(
                 fileDescriptor: fileDescriptor,
-                eventMask: [.write, .delete, .rename, .attrib, .extend, .revoke],
+                eventMask: [.write, .delete, .rename, .extend, .revoke],
                 queue: queue
             )
-            fileSource.setEventHandler { [weak self] in self?.onChange() }
+            fileSource.setEventHandler { [weak self] in
+                guard let self, let fileSource = self.fileSource else {
+                    return
+                }
+                _ = fileSource.data
+                self.onChange()
+            }
             let monitoredFileDescriptor = fileDescriptor
             fileSource.setCancelHandler {
                 onDescriptorClosed?(close(monitoredFileDescriptor) == 0)

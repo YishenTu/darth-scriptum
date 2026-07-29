@@ -45,3 +45,9 @@ Run the complete test and build suite:
 ```sh
 ./scripts/verify.sh
 ```
+
+## License
+
+DarthScriptum is available under the [MIT License](LICENSE). Third-party
+components retain their respective terms; see
+[Third-Party Notices](THIRD_PARTY_NOTICES.md).
