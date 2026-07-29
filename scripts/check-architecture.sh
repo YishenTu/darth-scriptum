@@ -107,12 +107,17 @@ core_directory="$source_root/core"
 document_directory="$source_root/document"
 editor_directory="$source_root/editor"
 
-markdown_document_exception="$(first_existing_file \
-    "$document_directory/markdowndocument.swift" \
-    "$document_directory/markdowndocument.swiftfixture" || true)"
-markdown_source_buffer_exception="$(first_existing_file \
-    "$document_directory/markdownsourcebuffer.swift" \
-    "$document_directory/markdownsourcebuffer.swiftfixture" || true)"
+assert_legacy_ownership_paths_absent() {
+    local legacy_path
+    local candidate
+
+    for legacy_path in "$@"; do
+        for candidate in "$legacy_path" "${legacy_path}fixture"; do
+            [[ -e "$candidate" || -L "$candidate" ]] || continue
+            report_violation "legacy ownership path must not exist: $(relative_path "$candidate")"
+        done
+    done
+}
 
 swift_import_prefix='^[[:space:]]*(@[^[:space:]]+[[:space:]]+)*import[[:space:]]+((class|enum|func|let|protocol|struct|var)[[:space:]]+)?'
 forbidden_ui_or_engine_import="${swift_import_prefix}(AppKit|SwiftUI|WebKit|MarkdownEngine|MarkdownEngineLatex|MarkdownEngineCodeBlocks)([[:space:].]|$)"
@@ -121,6 +126,10 @@ appkit_import="${swift_import_prefix}AppKit([[:space:].]|$)"
 upper_layer_reference='\b(MarkdownDocument|MarkdownWindowController|WorkspaceModel|MarkdownWorkspace|LivePreviewTextView|EditorPaneStateCoordinator)\b'
 editor_persistence_reference='\b(DocumentSyncCoordinator|DocumentSyncCoordinatorDelegate|SessionRecoveryStore|SafeFileCommitter|CommitRecoveryJournalStore|SaveTransactionBridge|DirectoryFileMonitor|TextFileCodec|ThreeWayTextMerger|DurableFileIO|PendingSaveToken|DurableFileState|FileFingerprint)\b'
 internal_markdown_engine_key='\b(LatexRenderedImage|LatexImageBounds|LatexIsBlock|LatexBlockOffsetY|ThematicBreak|BlockquoteLevel|BulletListMarker|ScrollableBlockNaturalWidth|ScrollableBlockSourceID|ScrollableBlockTotalHeight|ScrollableBlockFullRange|NodeLinkID|TaskCheckbox)\b'
+
+assert_legacy_ownership_paths_absent \
+    "$document_directory/markdownsourcebuffer.swift" \
+    "$document_directory/markdowndocument.swift"
 
 scan_pattern \
     "$core_directory" \
@@ -133,8 +142,7 @@ scan_pattern \
 scan_pattern \
     "$document_directory" \
     "$appkit_import" \
-    "document must not import AppKit outside the MarkdownDocument migration exception" \
-    "$markdown_document_exception"
+    "document must not import AppKit"
 
 scan_pattern \
     "$core_directory" \
@@ -143,8 +151,7 @@ scan_pattern \
 scan_pattern \
     "$document_directory" \
     "$upper_layer_reference" \
-    "document must not reference app, workspace, or editor host types outside the MarkdownDocument migration exception" \
-    "$markdown_document_exception"
+    "document must not reference app, workspace, or editor host types"
 scan_pattern \
     "$editor_directory" \
     "$editor_persistence_reference" \
@@ -167,12 +174,6 @@ if (( violation_count > 0 )); then
 fi
 
 print "Architecture check passed."
-if [[ -n "$markdown_source_buffer_exception" ]]; then
-    print "Migration exception: $(relative_path "$markdown_source_buffer_exception") remains document-owned until M1 moves MarkdownSourceBuffer to src/core."
-fi
-if [[ -n "$markdown_document_exception" ]]; then
-    print "Migration exception: $(relative_path "$markdown_document_exception") remains the AppKit composition adapter until M1 moves MarkdownDocument to src/app/document."
-fi
 if [[ -z "$markdown_engine_compatibility_file" ]]; then
     print "Migration target: raw MarkdownEngine internal-key location enforcement activates when E1 adds src/editor/markdownenginecompatibility.swift."
 fi

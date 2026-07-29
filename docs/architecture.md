@@ -20,7 +20,7 @@ editor -> core, MarkdownEngine
 ```
 
 - `core` owns source values, revisions, edits, snapshots, formats, identities,
-  fingerprints, history, line indexing, and eventually `MarkdownSourceBuffer`.
+  fingerprints, history, line indexing, and `MarkdownSourceBuffer`.
   It never imports UI, WebKit, or MarkdownEngine frameworks.
 - `document` owns codec, merge, durability, recovery, monitoring, and
   synchronization. It never owns UI or renderer work.
@@ -35,17 +35,12 @@ editor -> core, MarkdownEngine
 guardrail, not a Swift parser or a replacement for code review. Run it from the
 repository root, or use `--repo-root <fixture-root>` for isolated fixtures.
 
-### Current ownership exceptions
+`MarkdownSourceBuffer` is core-owned at
+`src/core/markdownsourcebuffer.swift`, and the AppKit `MarkdownDocument`
+composition adapter is app-owned at `src/app/document/markdowndocument.swift`.
+The architecture check rejects reintroduction of either legacy document path.
 
-The check currently documents exactly two migration exceptions:
-
-- `src/document/markdownsourcebuffer.swift` remains document-owned until M1
-  moves `MarkdownSourceBuffer` to `src/core`.
-- `src/document/markdowndocument.swift` remains the AppKit composition adapter
-  until M1 moves `MarkdownDocument` to `src/app/document`.
-
-Both exceptions are removal gates, not permanent exemptions. The raw
-MarkdownEngine internal-key rule becomes active when E1 adds
+The raw MarkdownEngine internal-key rule becomes active when E1 adds
 `src/editor/markdownenginecompatibility.swift`; current key use is intentionally
 not moved during F1.
 

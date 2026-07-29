@@ -42,7 +42,8 @@ assert_rejects() {
 }
 
 assert_accepts permitted-current-imports
-assert_accepts planned-ownership-exceptions
+assert_rejects planned-ownership-exceptions src/document/markdownsourcebuffer.swiftfixture
+assert_rejects planned-ownership-exceptions src/document/markdowndocument.swiftfixture
 assert_rejects core-forbidden-framework src/core/core-framework-violation.swiftfixture
 assert_rejects document-forbidden-framework src/document/document-framework-violation.swiftfixture
 assert_rejects core-forbidden-upper-layer src/core/core-upper-layer-violation.swiftfixture

@@ -1,5 +1,3 @@
-import AppKit
+import Foundation
 
-final class MarkdownDocument: NSDocument {
-    let windowController: MarkdownWindowController? = nil
-}
+struct LegacyDocumentOwnershipFixture {}
