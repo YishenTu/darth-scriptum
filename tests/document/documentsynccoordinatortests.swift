@@ -242,7 +242,11 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         defer { fixture.remove() }
 
         let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: snapshot,
+            fileMonitoringEnabled: false
+        )
+        defer { coordinator.close() }
         let delegate = TestSyncDelegate(fileURL: fixture.url)
         coordinator.delegate = delegate
         coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
@@ -269,12 +273,12 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.state, .idle)
 
         try Data("external\n".utf8).write(to: fixture.url)
+        coordinator.noteCoordinatedExternalChange()
         try await waitUntil {
             coordinator.sourceBuffer.revision.text == "external\n"
         }
         XCTAssertEqual(coordinator.sourceBuffer.revision.text, "external\n")
         XCTAssertEqual(delegate.acceptedExternalChangeCount, 1)
-        coordinator.close()
     }
 
     func testSameContentAtomicReplacementRefreshesIdentityBeforeSaving()
@@ -1167,6 +1171,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
 
         let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
         let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
+        defer { coordinator.close() }
         let delegate = TestSyncDelegate(fileURL: fixture.url)
         coordinator.delegate = delegate
         coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
@@ -1192,7 +1197,6 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         try await waitUntil {
             (try? String(contentsOf: fixture.url, encoding: .utf8)) == "local\n"
         }
-        coordinator.close()
     }
 
     func testRepeatedSiblingSignalsDoNotStarveLocalWrite() async throws {

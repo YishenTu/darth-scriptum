@@ -51,11 +51,7 @@ final class DirectoryFileMonitor: @unchecked Sendable {
             queue: queue
         )
         directorySource.setEventHandler { [weak self] in
-            guard let self, let directorySource = self.directorySource else {
-                return
-            }
-            _ = directorySource.data
-            self.onChange()
+            self?.onChange()
         }
         let monitoredDirectoryDescriptor = directoryDescriptor
         let onDescriptorClosed = self.onDescriptorClosed
@@ -71,11 +67,7 @@ final class DirectoryFileMonitor: @unchecked Sendable {
                 queue: queue
             )
             fileSource.setEventHandler { [weak self] in
-                guard let self, let fileSource = self.fileSource else {
-                    return
-                }
-                _ = fileSource.data
-                self.onChange()
+                self?.onChange()
             }
             let monitoredFileDescriptor = fileDescriptor
             fileSource.setCancelHandler {

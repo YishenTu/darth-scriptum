@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import XCTest
 @testable import DarthScriptum
@@ -55,6 +56,60 @@ final class DirectoryFileMonitorTests: XCTestCase {
 
         wait(for: [expectation], timeout: 1)
         monitor.cancel()
+    }
+
+    func testCancellationWaitsForActiveDirectoryCallback() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let target = directory.appendingPathComponent("fixture.md")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let callbackStarted = expectation(description: "Directory callback started")
+        let allowCallbackToFinish = DispatchSemaphore(value: 0)
+        let descriptorCloseCount = DispatchSemaphore(value: 0)
+        let descriptorClosed = expectation(description: "Descriptor closed")
+        descriptorClosed.expectedFulfillmentCount = 1
+        let monitor = DirectoryFileMonitor(
+            targetURL: target,
+            onChange: {
+                callbackStarted.fulfill()
+                allowCallbackToFinish.wait()
+            },
+            onDescriptorClosed: { didClose in
+                XCTAssertTrue(didClose)
+                descriptorCloseCount.signal()
+                descriptorClosed.fulfill()
+            }
+        )
+        defer {
+            allowCallbackToFinish.signal()
+            monitor.cancel()
+        }
+
+        try monitor.start()
+        try Data("fixture\n".utf8).write(to: target)
+        wait(for: [callbackStarted], timeout: 1)
+
+        monitor.cancel()
+        XCTAssertEqual(
+            descriptorCloseCount.wait(timeout: .now()),
+            .timedOut
+        )
+
+        allowCallbackToFinish.signal()
+        wait(for: [descriptorClosed], timeout: 1)
+        XCTAssertEqual(
+            descriptorCloseCount.wait(timeout: .now()),
+            .success
+        )
+        XCTAssertEqual(
+            descriptorCloseCount.wait(timeout: .now()),
+            .timedOut
+        )
     }
 
     func testReadingTargetDoesNotProduceAChangeEvent() throws {
