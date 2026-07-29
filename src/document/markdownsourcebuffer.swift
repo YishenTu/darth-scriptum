@@ -813,6 +813,8 @@ final class MarkdownSourceBuffer: ObservableObject {
     private static let synchronousLineIndexLimit = 2 * 1_024 * 1_024
 
     @Published private(set) var revision: SourceRevision
+    private(set) var metrics: DocumentMetrics
+    private(set) var lastAppliedEdit: SourceEdit?
     private(set) var lastOrigin: DocumentChangeOrigin
     private var observers: [UUID: Observer] = [:]
     private var lineIndexObservers: [UUID: LineIndexObserver] = [:]
@@ -825,6 +827,8 @@ final class MarkdownSourceBuffer: ObservableObject {
 
     init(snapshot: DocumentSnapshot = DocumentSnapshot(text: "", format: .newDocument)) {
         revision = SourceRevision(number: 0, text: snapshot.text)
+        metrics = DocumentMetrics(text: snapshot.text)
+        lastAppliedEdit = nil
         lastOrigin = .initialLoad
         if (snapshot.text as NSString).length
             <= Self.synchronousLineIndexLimit {
@@ -853,6 +857,8 @@ final class MarkdownSourceBuffer: ObservableObject {
         case .initialLoad, .externalReload, .merge, .recovery:
             clearHistory()
         }
+        metrics = metrics.applying(edit, to: previous.text)
+        lastAppliedEdit = edit
         updateLineIndex(edit, previous: previous, next: next)
         publish(next, origin: edit.origin)
         if lineIndex == nil {
@@ -987,6 +993,8 @@ final class MarkdownSourceBuffer: ObservableObject {
         case .initialLoad, .externalReload, .merge, .recovery:
             clearHistory()
         }
+        metrics = DocumentMetrics(text: next.text)
+        lastAppliedEdit = nil
         lineIndexTask?.cancel()
         lineIndexTask = nil
         if (next.text as NSString).length

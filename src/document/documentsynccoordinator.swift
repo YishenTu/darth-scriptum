@@ -87,6 +87,9 @@ final class DocumentSyncCoordinator: ObservableObject {
         DocumentSynchronizationStatusSnapshot = .empty
     @Published private(set) var format: TextFileFormat
     private(set) var durableState: DurableFileState?
+    /// Source revision represented by `durableState`. Keeping this identity
+    /// avoids comparing the entire document on every autosave/status check.
+    private var durableSourceRevision: UInt64?
     @Published private(set) var fileURL: URL?
 
     let sourceBuffer: MarkdownSourceBuffer
@@ -144,6 +147,8 @@ final class DocumentSyncCoordinator: ObservableObject {
         sourceBuffer = MarkdownSourceBuffer(snapshot: snapshot)
         format = snapshot.format
         durableState = initialDurableState
+        durableSourceRevision =
+            initialDurableState?.snapshot == snapshot ? 0 : nil
         self.bridge = bridge
         self.recoveryStore = recoveryStore
         self.savePreparationHook = savePreparationHook
@@ -155,6 +160,12 @@ final class DocumentSyncCoordinator: ObservableObject {
 
     var currentSnapshot: DocumentSnapshot {
         DocumentSnapshot(text: sourceBuffer.revision.text, format: format)
+    }
+
+    var hasLocalChanges: Bool {
+        guard let durableState else { return true }
+        return durableSourceRevision != sourceBuffer.revision.number
+            || durableState.snapshot.format != format
     }
 
     var presentedState: SynchronizationState? {
@@ -192,6 +203,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                 fingerprint: .make(data: data),
                 generation: 0
             )
+            durableSourceRevision = sourceBuffer.revision.number
         }
         if url == nil {
             state = .idle
@@ -229,6 +241,10 @@ final class DocumentSyncCoordinator: ObservableObject {
                 fingerprint: fingerprint,
                 generation: durableState?.generation ?? 0
             )
+            durableSourceRevision =
+                currentSnapshot == diskSnapshot
+                    ? sourceBuffer.revision.number
+                    : nil
             resolvedIdentity = .make(
                 url: url,
                 resourceIdentifier: fingerprint.resourceIdentifier
@@ -264,7 +280,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         if monitorNeedsRestart {
             restartMonitor()
         }
-        if currentSnapshot != durableState?.snapshot {
+        if hasLocalChanges {
             scheduleLocalWrite()
         }
     }
@@ -451,6 +467,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                     fingerprint: result.committedFingerprint,
                     generation: generation
                 )
+                durableSourceRevision = token.sourceRevision.number
                 if let artifact = result.recoveryArtifact {
                     try CommitRecoveryJournalStore.acknowledge(artifact)
                 }
@@ -488,6 +505,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         synchronizationPauseIsLatched = false
         format = entry.snapshot.format
         sourceBuffer.replace(with: entry.snapshot.text, origin: .recovery)
+        durableSourceRevision = nil
         pendingRecoveryMinimumRevision = sourceBuffer.revision.number
         scheduleLocalWrite()
     }
@@ -503,7 +521,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         synchronizationPauseIsLatched = false
         rawRecoveryRemovalIdentity = nil
         settleState(default: .idle)
-        if currentSnapshot != durableState?.snapshot {
+        if hasLocalChanges {
             scheduleLocalWrite()
         } else {
             scheduleExternalRead()
@@ -516,7 +534,7 @@ final class DocumentSyncCoordinator: ObservableObject {
             return
         }
         settleState(default: .idle)
-        if currentSnapshot != durableState?.snapshot {
+        if hasLocalChanges {
             scheduleLocalWrite()
         } else {
             scheduleExternalRead()
@@ -535,7 +553,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         case .destinationRequiresSaveAs:
             break
         case nil:
-            if currentSnapshot != durableState?.snapshot {
+            if hasLocalChanges {
                 flushNow()
             } else {
                 scheduleExternalRead()
@@ -624,7 +642,7 @@ final class DocumentSyncCoordinator: ObservableObject {
             return
         }
         let revision = sourceBuffer.revision
-        if currentSnapshot == durableState?.snapshot {
+        if !hasLocalChanges {
             settleState(default: .idle)
             resolveFlushWaiters(succeeded: true)
             return
@@ -656,8 +674,8 @@ final class DocumentSyncCoordinator: ObservableObject {
                 self.finishLocalPreparation(preparationGeneration)
                 guard self.saveInFlight == nil,
                       self.fileURL == fileURL,
-                      self.durableState == expectedDurableState else {
-                    if self.currentSnapshot != self.durableState?.snapshot {
+                      self.matchesDurableState(expectedDurableState) else {
+                    if self.hasLocalChanges {
                         self.scheduleLocalWrite()
                     }
                     return
@@ -827,7 +845,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                 finishExternalRead(generation)
                 return
             }
-            guard durableState == capturedDurableState,
+            guard matchesDurableState(capturedDurableState),
                   sourceBuffer.revision.number == capturedSourceRevision else {
                 externalReadPending = true
                 finishExternalRead(generation)
@@ -852,7 +870,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                 }
                 settleState(default: .idle)
                 finishExternalRead(generation)
-                if currentSnapshot != durableState?.snapshot {
+                if hasLocalChanges {
                     ensureLocalWriteScheduled()
                 }
                 return
@@ -940,6 +958,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                 fingerprint: fingerprint,
                 generation: 0
             )
+            durableSourceRevision = sourceBuffer.revision.number
             delegate?.syncCoordinator(
                 self,
                 acceptedExternalFileAt: url,
@@ -960,6 +979,10 @@ final class DocumentSyncCoordinator: ObservableObject {
                 fingerprint: fingerprint,
                 generation: durableState.generation
             )
+            durableSourceRevision =
+                text == external.text
+                    ? sourceBuffer.revision.number
+                    : nil
             delegate?.syncCoordinator(
                 self,
                 acceptedExternalFileAt: url,
@@ -974,6 +997,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                 fingerprint: fingerprint,
                 generation: durableState.generation
             )
+            durableSourceRevision = nil
             format = external.format
             sourceBuffer.replace(with: text, origin: .merge)
             delegate?.syncCoordinator(
@@ -1008,6 +1032,7 @@ final class DocumentSyncCoordinator: ObservableObject {
             )
             format = external.format
             sourceBuffer.replace(with: external.text, origin: .externalReload)
+            durableSourceRevision = sourceBuffer.revision.number
             delegate?.syncCoordinator(
                 self,
                 acceptedExternalFileAt: url,
@@ -1095,7 +1120,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         } else if hasRecoverableLocalRevision {
             state = .recoveredConflict
         } else if failedOperation == .destinationRequiresSaveAs,
-                  currentSnapshot != durableState?.snapshot {
+                  hasLocalChanges {
             state = .failed(
                 saveAsRequiredFailureMessage
                     ?? SafeFileCommitter.CommitError
@@ -1175,7 +1200,21 @@ final class DocumentSyncCoordinator: ObservableObject {
     private var isFullySynchronized: Bool {
         saveInFlight == nil
             && localPreparationTask == nil
-            && currentSnapshot == durableState?.snapshot
+            && !hasLocalChanges
+    }
+
+    private func matchesDurableState(
+        _ expected: DurableFileState?
+    ) -> Bool {
+        switch (durableState, expected) {
+        case (nil, nil):
+            return true
+        case let (current?, expected?):
+            return current.generation == expected.generation
+                && current.fingerprint == expected.fingerprint
+        case (.some, nil), (nil, .some):
+            return false
+        }
     }
 
     private func reconcileDisplacedExternalData(
@@ -1209,6 +1248,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                 fingerprint: result.committedFingerprint,
                 generation: token.generation
             )
+            durableSourceRevision = token.sourceRevision.number
             format = external.format
 
             switch merger.merge(
@@ -1219,12 +1259,15 @@ final class DocumentSyncCoordinator: ObservableObject {
             case let .unchanged(text):
                 if text == external.text {
                     sourceBuffer.replace(with: external.text, origin: .externalReload)
+                    durableSourceRevision = nil
                 } else if text != local.text {
                     sourceBuffer.replace(with: text, origin: .merge)
+                    durableSourceRevision = nil
                 }
                 state = .merging
             case let .merged(text):
                 sourceBuffer.replace(with: text, origin: .merge)
+                durableSourceRevision = nil
                 state = .merging
             case .conflict:
                 try recoveryStore.add(
@@ -1233,11 +1276,15 @@ final class DocumentSyncCoordinator: ObservableObject {
                 )
                 hasRecoverableLocalRevision = true
                 sourceBuffer.replace(with: external.text, origin: .externalReload)
+                // The just-committed bytes are still `token.snapshot`; the
+                // displaced external text is now visible but must be written
+                // back before it becomes durable.
+                durableSourceRevision = nil
                 stateAfterNextSuccessfulSave = .recoveredConflict
                 state = .recoveredConflict
             }
 
-            if currentSnapshot != token.snapshot {
+            if hasLocalChanges {
                 scheduleLocalWrite()
             } else if let stateAfterNextSuccessfulSave {
                 if let identity = rawRecoveryRemovalIdentity {

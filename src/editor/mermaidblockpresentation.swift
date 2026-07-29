@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-struct MermaidFencedBlock: Equatable {
+struct MermaidFencedBlock: Equatable, Sendable {
     let fullRange: NSRange
     let contentRange: NSRange
     let openingFenceRange: NSRange
@@ -15,13 +15,17 @@ enum MermaidFencedBlockParser {
         let length: Int
     }
 
-    static func blocks(in source: String) -> [MermaidFencedBlock] {
+    static func blocks(
+        in source: String,
+        shouldCancel: () -> Bool = { false }
+    ) -> [MermaidFencedBlock] {
         let text = source as NSString
         guard text.length > 0 else { return [] }
 
         var result: [MermaidFencedBlock] = []
         var lineLocation = 0
         while lineLocation < text.length {
+            if shouldCancel() { return [] }
             let openingLineRange = text.lineRange(
                 for: NSRange(location: lineLocation, length: 0)
             )
@@ -40,6 +44,7 @@ enum MermaidFencedBlockParser {
             var closingLineLocation = NSMaxRange(openingLineRange)
             var foundBlock: MermaidFencedBlock?
             while closingLineLocation < text.length {
+                if shouldCancel() { return [] }
                 let closingLineRange = text.lineRange(
                     for: NSRange(location: closingLineLocation, length: 0)
                 )
@@ -218,32 +223,27 @@ final class MermaidBlockPresenter {
     private static let paragraphSpacing: CGFloat = 10
 
     private let renderer: MermaidRenderer
-    private var cachedText: String?
-    private var cachedBlocks: [MermaidFencedBlock] = []
 
     init(renderer: MermaidRenderer) {
         self.renderer = renderer
     }
 
-    func apply(to textView: NSTextView, rendersMarkdown: Bool) {
+    func apply(
+        to textView: NSTextView,
+        rendersMarkdown: Bool,
+        source: String,
+        blocks: [MermaidFencedBlock]
+    ) {
         guard rendersMarkdown,
               let textStorage = textView.textStorage,
-              textStorage.length > 0 else {
+              textStorage.length > 0,
+              textStorage.length == (source as NSString).length,
+              !blocks.isEmpty else {
             return
         }
 
-        let source = textView.string
-        let blocks: [MermaidFencedBlock]
-        if source == cachedText {
-            blocks = cachedBlocks
-        } else {
-            blocks = MermaidFencedBlockParser.blocks(in: source)
-            cachedText = source
-            cachedBlocks = blocks
-        }
-        guard !blocks.isEmpty else { return }
-
         let selectedRange = textView.selectedRange()
+        let sourceText = source as NSString
         let maximumWidth = availableWidth(in: textView)
         guard maximumWidth > 0 else { return }
 
@@ -254,7 +254,10 @@ final class MermaidBlockPresenter {
         }
 
         for block in blocks {
-            guard !selection(selectedRange, intersects: block.fullRange),
+            guard NSMaxRange(block.fullRange) <= textStorage.length,
+                  NSMaxRange(block.contentRange) <= textStorage.length,
+                  sourceText.substring(with: block.contentRange) == block.source,
+                  !selection(selectedRange, intersects: block.fullRange),
                   let diagram = renderer.diagram(for: block.source),
                   let displaySize = displaySize(
                       for: diagram.naturalSize,
@@ -262,7 +265,7 @@ final class MermaidBlockPresenter {
                   ),
                   let anchorLocation = anchorLocation(
                       in: block.contentRange,
-                      text: source as NSString
+                      text: sourceText
                   ) else {
                 continue
             }

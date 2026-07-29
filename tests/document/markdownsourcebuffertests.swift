@@ -4,6 +4,67 @@ import XCTest
 
 @MainActor
 final class MarkdownSourceBufferTests: XCTestCase {
+    func testDocumentMetricsStayExactAcrossCRLFAndMermaidBoundaryEdits() throws {
+        let source = "Mermaid\r\nx😀\ny"
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(text: source, format: .newDocument)
+        )
+        XCTAssertEqual(buffer.metrics, DocumentMetrics(text: source))
+
+        try buffer.apply(
+            SourceEdit(
+                range: NSRange(location: 3, length: 5),
+                replacement: "",
+                expectedRevision: buffer.revision.number,
+                origin: .localEditor(paneID: UUID())
+            )
+        )
+        XCTAssertEqual(
+            buffer.metrics,
+            DocumentMetrics(text: buffer.revision.text)
+        )
+        XCTAssertFalse(buffer.metrics.containsMermaidCandidate)
+
+        try buffer.apply(
+            SourceEdit(
+                range: NSRange(location: 3, length: 0),
+                replacement: "maid\r",
+                expectedRevision: buffer.revision.number,
+                origin: .localEditor(paneID: UUID())
+            )
+        )
+        XCTAssertEqual(
+            buffer.metrics,
+            DocumentMetrics(text: buffer.revision.text)
+        )
+        XCTAssertTrue(buffer.metrics.containsMermaidCandidate)
+        XCTAssertEqual(buffer.metrics.lineCount, 3)
+    }
+
+    func testSourceBufferExposesThePublishedIncrementalEdit() throws {
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(text: "alpha", format: .newDocument)
+        )
+        let edit = SourceEdit(
+            range: NSRange(location: 2, length: 1),
+            replacement: "X",
+            expectedRevision: buffer.revision.number,
+            origin: .localEditor(paneID: UUID())
+        )
+
+        try buffer.apply(edit)
+
+        XCTAssertEqual(buffer.lastAppliedEdit, edit)
+        buffer.replace(with: "external", origin: .externalReload)
+        XCTAssertEqual(buffer.lastAppliedEdit?.origin, .externalReload)
+        XCTAssertEqual(
+            try XCTUnwrap(buffer.lastAppliedEdit).applying(
+                to: SourceRevision(number: 1, text: "alXha")
+            ).text,
+            "external"
+        )
+    }
+
     func testPublishesMonotonicRevisionsToMultipleObservers() throws {
         let buffer = MarkdownSourceBuffer(
             snapshot: DocumentSnapshot(text: "a", format: .newDocument)

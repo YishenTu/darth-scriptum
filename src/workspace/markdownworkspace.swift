@@ -17,9 +17,23 @@ final class WorkspaceModel: ObservableObject {
                 "DarthScriptum.LatexRendererDidUpdate.\(UUID().uuidString)"
             )
         )
-        let primaryPane = EditorPaneModel(latexRenderer: latexRenderer)
+        let mermaidRenderer = MermaidRenderer(
+            updateNotification: Notification.Name(
+                "DarthScriptum.MermaidRendererDidUpdate.\(UUID().uuidString)"
+            )
+        )
+        let imageProvider = MarkdownImageProvider(documentURL: nil)
+        let primaryPane = EditorPaneModel(
+            latexRenderer: latexRenderer,
+            mermaidRenderer: mermaidRenderer,
+            imageProvider: imageProvider
+        )
         self.primaryPane = primaryPane
-        secondaryPane = EditorPaneModel(latexRenderer: latexRenderer)
+        secondaryPane = EditorPaneModel(
+            latexRenderer: latexRenderer,
+            mermaidRenderer: mermaidRenderer,
+            imageProvider: imageProvider
+        )
         activePaneID = primaryPane.id
     }
 

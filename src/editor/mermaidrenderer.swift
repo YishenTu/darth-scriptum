@@ -61,7 +61,7 @@ final class MermaidRenderer {
         self.updateNotification = updateNotification
     }
 
-    #if DEBUG
+    #if DEBUG || TESTING
     var pendingEntryCountForTesting: Int {
         pendingKeys.count
     }
@@ -262,7 +262,7 @@ final class MermaidWebRenderer: NSObject, MermaidRenderingBackend {
         MermaidRenderer.maximumPendingEntries
 
     private(set) var lastError: String?
-    #if DEBUG
+    #if DEBUG || TESTING
     private(set) var lastSVGForTesting: String?
     #endif
     private lazy var webView = makeWebView()
@@ -286,7 +286,7 @@ final class MermaidWebRenderer: NSObject, MermaidRenderingBackend {
     }
 
     private func renderSerially(source: String) async -> MermaidRenderOutcome {
-        #if DEBUG
+        #if DEBUG || TESTING
         lastSVGForTesting = nil
         #endif
         guard await ensureReady() else {
@@ -347,7 +347,7 @@ final class MermaidWebRenderer: NSObject, MermaidRenderingBackend {
             lastError = "Mermaid returned invalid rendered output."
             return .transientFailure
         }
-        #if DEBUG
+        #if DEBUG || TESTING
         lastSVGForTesting = svg
         #endif
 

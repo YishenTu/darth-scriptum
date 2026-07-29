@@ -4,6 +4,23 @@ import XCTest
 
 @MainActor
 final class WorkspaceModelTests: XCTestCase {
+    func testSplitPanesShareExpensiveRendererAndImageCaches() {
+        let model = WorkspaceModel()
+
+        XCTAssertTrue(
+            model.primaryPane.latexRenderer
+                === model.secondaryPane.latexRenderer
+        )
+        XCTAssertTrue(
+            model.primaryPane.mermaidRenderer
+                === model.secondaryPane.mermaidRenderer
+        )
+        XCTAssertTrue(
+            model.primaryPane.imageProvider
+                === model.secondaryPane.imageProvider
+        )
+    }
+
     func testSplitAndSourceModeDoNotOwnDocumentContents() {
         let model = WorkspaceModel()
         model.toggleSplit()

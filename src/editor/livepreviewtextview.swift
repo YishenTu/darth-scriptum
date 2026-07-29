@@ -4,9 +4,18 @@ import SwiftUI
 
 @MainActor
 final class EditorPaneModel: ObservableObject, Identifiable {
+    private struct ConfigurationKey: Equatable {
+        let rawSourceMode: Bool
+        let fontSize: CGFloat
+        let documentPath: String?
+    }
+
     let id = UUID()
     let latexRenderer: AdaptiveLatexRenderer
     let mermaidRenderer: MermaidRenderer
+    let imageProvider: MarkdownImageProvider
+    private var cachedConfigurationKey: ConfigurationKey?
+    private var cachedConfiguration: MarkdownEditorConfiguration?
     @Published var selectedRange = NSRange(location: 0, length: 0)
     @Published var visibleOrigin = NSPoint.zero
     @Published var line = 1
@@ -15,7 +24,8 @@ final class EditorPaneModel: ObservableObject, Identifiable {
 
     init(
         latexRenderer: AdaptiveLatexRenderer? = nil,
-        mermaidRenderer: MermaidRenderer? = nil
+        mermaidRenderer: MermaidRenderer? = nil,
+        imageProvider: MarkdownImageProvider? = nil
     ) {
         self.latexRenderer = latexRenderer ?? AdaptiveLatexRenderer(
             updateNotification: Notification.Name(
@@ -27,6 +37,36 @@ final class EditorPaneModel: ObservableObject, Identifiable {
                 "DarthScriptum.MermaidRendererDidUpdate.\(UUID().uuidString)"
             )
         )
+        self.imageProvider = imageProvider
+            ?? MarkdownImageProvider(documentURL: nil)
+    }
+
+    func configuration(
+        rawSourceMode: Bool,
+        fontSize: CGFloat,
+        documentURL: URL?
+    ) -> MarkdownEditorConfiguration {
+        let standardizedURL = documentURL?.standardizedFileURL
+        imageProvider.update(documentURL: standardizedURL)
+        let key = ConfigurationKey(
+            rawSourceMode: rawSourceMode,
+            fontSize: fontSize,
+            documentPath: standardizedURL?.path
+        )
+        if key == cachedConfigurationKey,
+           let cachedConfiguration {
+            return cachedConfiguration
+        }
+        let configuration = MarkdownConfigurationFactory.make(
+            rawSourceMode: rawSourceMode,
+            fontSize: fontSize,
+            documentURL: standardizedURL,
+            latexRenderer: latexRenderer,
+            imageProvider: imageProvider
+        )
+        cachedConfigurationKey = key
+        cachedConfiguration = configuration
+        return configuration
     }
 }
 
@@ -87,11 +127,10 @@ struct LivePreviewTextView: NSViewRepresentable {
         )
         return NativeTextViewWrapper(
             text: editorText,
-            configuration: MarkdownConfigurationFactory.make(
+            configuration: pane.configuration(
                 rawSourceMode: rawSourceMode,
                 fontSize: fontSize,
-                documentURL: documentURL,
-                latexRenderer: pane.latexRenderer
+                documentURL: documentURL
             ),
             fontName: AppTheme.editorFont(size: fontSize).fontName,
             fontSize: fontSize,
@@ -104,14 +143,15 @@ struct LivePreviewTextView: NSViewRepresentable {
     private var usesRawSource: Bool {
         MarkdownPresentationPolicy.usesRawSource(
             requestedSourceMode: sourceMode,
-            text: sourceBuffer.revision.text
+            metrics: sourceBuffer.metrics
         )
     }
 
     private var presentation: MarkdownSourcePresentation {
         MarkdownPresentationPolicy.presentation(
             requestedSourceMode: sourceMode,
-            text: sourceBuffer.revision.text
+            text: sourceBuffer.revision.text,
+            metrics: sourceBuffer.metrics
         )
     }
 
@@ -124,7 +164,8 @@ struct LivePreviewTextView: NSViewRepresentable {
                 let revision = sourceBuffer.revision
                 let currentPresentation = MarkdownPresentationPolicy.presentation(
                     requestedSourceMode: sourceMode,
-                    text: revision.text
+                    text: revision.text,
+                    metrics: sourceBuffer.metrics
                 )
                 guard let edit = MarkdownEditorTextAdapter.sourceEdit(
                     editorText: updatedText,
@@ -158,24 +199,38 @@ struct LivePreviewTextView: NSViewRepresentable {
 }
 
 enum MarkdownPresentationPolicy {
-    static let maximumLivePreviewBytes = 2 * 1_024 * 1_024
+    static let maximumLivePreviewBytes = 512 * 1_024
+    static let maximumLivePreviewLines = 20_000
+
+    static func usesRawSource(
+        requestedSourceMode: Bool,
+        metrics: DocumentMetrics
+    ) -> Bool {
+        requestedSourceMode
+            || metrics.utf8ByteCount > maximumLivePreviewBytes
+            || metrics.lineCount > maximumLivePreviewLines
+    }
 
     static func usesRawSource(
         requestedSourceMode: Bool,
         text: String
     ) -> Bool {
-        requestedSourceMode || text.utf8.count > maximumLivePreviewBytes
+        usesRawSource(
+            requestedSourceMode: requestedSourceMode,
+            metrics: DocumentMetrics(text: text)
+        )
     }
 
     static func presentation(
         requestedSourceMode: Bool,
-        text: String
+        text: String,
+        metrics: DocumentMetrics? = nil
     ) -> MarkdownSourcePresentation {
         MarkdownSourcePresentation.make(
             source: text,
             rendersMarkdown: !usesRawSource(
                 requestedSourceMode: requestedSourceMode,
-                text: text
+                metrics: metrics ?? DocumentMetrics(text: text)
             )
         )
     }

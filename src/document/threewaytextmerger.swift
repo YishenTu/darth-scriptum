@@ -14,7 +14,7 @@ struct ThreeWayTextMerger: Sendable {
 
     private struct LineChange: Sendable, Equatable {
         var range: Range<Int>
-        var replacement: [String]
+        var replacement: [Substring]
     }
 
     func merge(base: String, local: String, external: String) -> ThreeWayMergeResult {
@@ -162,10 +162,30 @@ struct ThreeWayTextMerger: Sendable {
     }
 
     private func lineChanges(
-        from base: [String],
-        to updated: [String]
+        from base: [Substring],
+        to updated: [Substring]
     ) -> [LineChange] {
-        let difference = updated.difference(from: base)
+        var sharedPrefix = 0
+        while sharedPrefix < min(base.count, updated.count),
+              base[sharedPrefix] == updated[sharedPrefix] {
+            sharedPrefix += 1
+        }
+        var sharedSuffix = 0
+        while sharedSuffix < base.count - sharedPrefix,
+              sharedSuffix < updated.count - sharedPrefix,
+              base[base.count - sharedSuffix - 1]
+                == updated[updated.count - sharedSuffix - 1] {
+            sharedSuffix += 1
+        }
+        let baseCore = Array(
+            base[sharedPrefix..<(base.count - sharedSuffix)]
+        )
+        let updatedCore = Array(
+            updated[sharedPrefix..<(updated.count - sharedSuffix)]
+        )
+        guard !baseCore.isEmpty || !updatedCore.isEmpty else { return [] }
+
+        let difference = updatedCore.difference(from: baseCore)
         var removals = Set<Int>()
         var insertions = Set<Int>()
         for change in difference {
@@ -180,19 +200,20 @@ struct ThreeWayTextMerger: Sendable {
         var changes: [LineChange] = []
         var baseIndex = 0
         var updatedIndex = 0
-        while baseIndex < base.count || updatedIndex < updated.count {
+        while baseIndex < baseCore.count || updatedIndex < updatedCore.count {
             if removals.contains(baseIndex) || insertions.contains(updatedIndex) {
-                let start = baseIndex
-                var replacement: [String] = []
+                let start = sharedPrefix + baseIndex
+                var replacement: [Substring] = []
                 repeat {
                     var advanced = false
-                    while updatedIndex < updated.count,
+                    while updatedIndex < updatedCore.count,
                           insertions.contains(updatedIndex) {
-                        replacement.append(updated[updatedIndex])
+                        replacement.append(updatedCore[updatedIndex])
                         updatedIndex += 1
                         advanced = true
                     }
-                    while baseIndex < base.count, removals.contains(baseIndex) {
+                    while baseIndex < baseCore.count,
+                          removals.contains(baseIndex) {
                         baseIndex += 1
                         advanced = true
                     }
@@ -201,16 +222,19 @@ struct ThreeWayTextMerger: Sendable {
                     || insertions.contains(updatedIndex)
                 changes.append(
                     LineChange(
-                        range: start..<baseIndex,
+                        range: start..<(sharedPrefix + baseIndex),
                         replacement: replacement
                     )
                 )
-            } else if baseIndex < base.count, updatedIndex < updated.count {
-                guard base[baseIndex] == updated[updatedIndex] else {
+            } else if baseIndex < baseCore.count,
+                      updatedIndex < updatedCore.count {
+                guard baseCore[baseIndex] == updatedCore[updatedIndex] else {
                     changes.append(
                         LineChange(
-                            range: baseIndex..<base.count,
-                            replacement: Array(updated[updatedIndex...])
+                            range: (sharedPrefix + baseIndex)..<(base.count - sharedSuffix),
+                            replacement: Array(
+                                updatedCore[updatedIndex...]
+                            )
                         )
                     )
                     break
@@ -220,9 +244,9 @@ struct ThreeWayTextMerger: Sendable {
             } else {
                 changes.append(
                     LineChange(
-                        range: baseIndex..<base.count,
-                        replacement: updatedIndex < updated.count
-                            ? Array(updated[updatedIndex...])
+                        range: (sharedPrefix + baseIndex)..<(base.count - sharedSuffix),
+                        replacement: updatedIndex < updatedCore.count
+                            ? Array(updatedCore[updatedIndex...])
                             : []
                     )
                 )
@@ -232,32 +256,29 @@ struct ThreeWayTextMerger: Sendable {
         return changes
     }
 
-    private func lineTokens(in text: String) -> [String] {
-        let source = text as NSString
-        var result: [String] = []
-        var start = 0
-        while start < source.length {
-            var end = start
-            while end < source.length {
-                let unit = source.character(at: end)
-                if unit == 0x000A || unit == 0x000D { break }
-                end += 1
-            }
-            if end < source.length {
-                if source.character(at: end) == 0x000D,
-                   end + 1 < source.length,
-                   source.character(at: end + 1) == 0x000A {
-                    end += 2
-                } else {
-                    end += 1
+    private func lineTokens(in text: String) -> [Substring] {
+        let scalars = text.unicodeScalars
+        var result: [Substring] = []
+        var lineStart = scalars.startIndex
+        var cursor = scalars.startIndex
+        while cursor < scalars.endIndex {
+            let scalar = scalars[cursor]
+            var tokenEnd = scalars.index(after: cursor)
+            if scalar.value == 0x000D {
+                if tokenEnd < scalars.endIndex,
+                   scalars[tokenEnd].value == 0x000A {
+                    tokenEnd = scalars.index(after: tokenEnd)
                 }
+                result.append(text[lineStart..<tokenEnd])
+                lineStart = tokenEnd
+            } else if scalar.value == 0x000A {
+                result.append(text[lineStart..<tokenEnd])
+                lineStart = tokenEnd
             }
-            result.append(
-                source.substring(
-                    with: NSRange(location: start, length: end - start)
-                )
-            )
-            start = end
+            cursor = tokenEnd
+        }
+        if lineStart < scalars.endIndex {
+            result.append(text[lineStart..<scalars.endIndex])
         }
         return result
     }

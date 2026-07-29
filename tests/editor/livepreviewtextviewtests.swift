@@ -157,6 +157,55 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
     }
 
+    func testLineDenseDocumentsUseRawSourceBeforeTheByteLimit() {
+        let source = String(
+            repeating: "\n",
+            count: MarkdownPresentationPolicy.maximumLivePreviewLines
+        )
+        let metrics = DocumentMetrics(text: source)
+
+        XCTAssertLessThan(
+            metrics.utf8ByteCount,
+            MarkdownPresentationPolicy.maximumLivePreviewBytes
+        )
+        XCTAssertTrue(
+            MarkdownPresentationPolicy.usesRawSource(
+                requestedSourceMode: false,
+                metrics: metrics
+            )
+        )
+    }
+
+    func testSelectionTransformTracksIncrementalEditsWithoutTextSearch() {
+        let insertion = SourceEdit(
+            range: NSRange(location: 3, length: 0),
+            replacement: "wide",
+            expectedRevision: 0,
+            origin: .undoRedo
+        )
+        XCTAssertEqual(
+            SourceSelectionTransformer.transform(
+                NSRange(location: 8, length: 2),
+                by: insertion
+            ),
+            NSRange(location: 12, length: 2)
+        )
+
+        let replacement = SourceEdit(
+            range: NSRange(location: 5, length: 4),
+            replacement: "x",
+            expectedRevision: 1,
+            origin: .undoRedo
+        )
+        XCTAssertEqual(
+            SourceSelectionTransformer.transform(
+                NSRange(location: 6, length: 2),
+                by: replacement
+            ),
+            NSRange(location: 5, length: 1)
+        )
+    }
+
     func testOtherPaneSelectionReanchorsAfterLocalEdit() async throws {
         let source = "alpha\nomega"
         let buffer = MarkdownSourceBuffer(

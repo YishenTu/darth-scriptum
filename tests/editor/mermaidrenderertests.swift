@@ -135,12 +135,23 @@ final class MermaidRendererTests: XCTestCase {
         textView.setSelectedRange(
             NSRange(location: (source as NSString).length, length: 0)
         )
+        let blocks = MermaidFencedBlockParser.blocks(in: source)
 
-        presenter.apply(to: textView, rendersMarkdown: true)
+        presenter.apply(
+            to: textView,
+            rendersMarkdown: true,
+            source: source,
+            blocks: blocks
+        )
         try await waitUntil {
             renderer.diagram(for: "flowchart LR\n  A --> B\n") != nil
         }
-        presenter.apply(to: textView, rendersMarkdown: true)
+        presenter.apply(
+            to: textView,
+            rendersMarkdown: true,
+            source: source,
+            blocks: blocks
+        )
 
         let anchor = (source as NSString).range(of: "flowchart").location
         XCTAssertNotNil(
@@ -179,10 +190,18 @@ final class MermaidRendererTests: XCTestCase {
             )
         )
 
-        presenter.apply(to: activeTextView, rendersMarkdown: true)
+        let blocks = MermaidFencedBlockParser.blocks(in: source)
+        presenter.apply(
+            to: activeTextView,
+            rendersMarkdown: true,
+            source: source,
+            blocks: blocks
+        )
         presenter.apply(
             to: makeTextView(source: source),
-            rendersMarkdown: false
+            rendersMarkdown: false,
+            source: source,
+            blocks: blocks
         )
         await Task.yield()
 

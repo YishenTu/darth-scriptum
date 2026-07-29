@@ -135,7 +135,7 @@ final class AdaptiveLatexRenderer: LatexRenderer, @unchecked Sendable {
         self.updateNotification = updateNotification
     }
 
-    #if DEBUG
+    #if DEBUG || TESTING
     var transientFailureEntryCountForTesting: Int {
         transientFailures.count
     }

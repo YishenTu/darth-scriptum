@@ -15,6 +15,13 @@ final class EditorPaneStateCoordinator: NSObject {
     private var lastSourceText: String
     private var hasRestoredState = false
     private var pendingSelectionRestore: NSRange?
+    private var mermaidParseTask: Task<Void, Never>?
+    private var mermaidBlocks: [MermaidFencedBlock] = []
+    private var mermaidBlocksRevision: UInt64?
+    private var mermaidBlocksSourceRange: NSRange?
+    private var mermaidParseRevision: UInt64?
+    private var mermaidParseSourceRange: NSRange?
+    private var mermaidApplyScheduled = false
 
     init(
         sourceBuffer: MarkdownSourceBuffer,
@@ -56,6 +63,10 @@ final class EditorPaneStateCoordinator: NSObject {
     }
 
     func stop() {
+        mermaidParseTask?.cancel()
+        mermaidParseTask = nil
+        mermaidParseRevision = nil
+        mermaidParseSourceRange = nil
         NotificationCenter.default.removeObserver(self)
         if let sourceObservation {
             sourceBuffer.removeObserver(sourceObservation)
@@ -91,7 +102,7 @@ final class EditorPaneStateCoordinator: NSObject {
             pendingSelectionRestore = pane.selectedRange
             hasRestoredState = false
         }
-        scheduleMermaidPresentation()
+        scheduleMermaidParse()
     }
 
     private func attach(in rootView: NSView) {
@@ -137,7 +148,7 @@ final class EditorPaneStateCoordinator: NSObject {
         restoreStateIfNeeded()
         restorePendingSelectionIfNeeded()
         updatePaneState()
-        scheduleMermaidPresentation()
+        scheduleMermaidParse()
     }
 
     @objc private func selectionDidChange(_ notification: Notification) {
@@ -155,7 +166,7 @@ final class EditorPaneStateCoordinator: NSObject {
                 self.onBecameActive()
             }
             self.updatePaneState()
-            self.scheduleMermaidPresentation()
+            self.scheduleMermaidApply()
         }
     }
 
@@ -174,12 +185,12 @@ final class EditorPaneStateCoordinator: NSObject {
             if self.pane.visibleOrigin != origin {
                 self.pane.visibleOrigin = origin
             }
-            self.scheduleMermaidPresentation()
+            self.scheduleMermaidApply()
         }
     }
 
     @objc private func renderedContentDidUpdate(_ notification: Notification) {
-        scheduleMermaidPresentation()
+        scheduleMermaidApply()
     }
 
     private func sourceDidChange(
@@ -196,11 +207,22 @@ final class EditorPaneStateCoordinator: NSObject {
             isOwnEdit = false
         }
         if !isOwnEdit {
-            let anchor = SelectionAnchor.capture(
-                selectedRange: pendingSelectionRestore ?? pane.selectedRange,
-                in: lastSourceText
-            )
-            let resolved = anchor.resolve(in: revision.text)
+            let currentSelection =
+                pendingSelectionRestore ?? pane.selectedRange
+            let resolved: NSRange
+            if let edit = sourceBuffer.lastAppliedEdit,
+               edit.expectedRevision &+ 1 == revision.number {
+                resolved = SourceSelectionTransformer.transform(
+                    currentSelection,
+                    by: edit
+                )
+            } else {
+                let anchor = SelectionAnchor.capture(
+                    selectedRange: currentSelection,
+                    in: lastSourceText
+                )
+                resolved = anchor.resolve(in: revision.text)
+            }
             pendingSelectionRestore = resolved
             DispatchQueue.main.async { [weak self] in
                 self?.restorePendingSelectionIfNeeded()
@@ -218,7 +240,7 @@ final class EditorPaneStateCoordinator: NSObject {
         }
         presentation = newPresentation
         lastSourceText = revision.text
-        scheduleMermaidPresentation()
+        scheduleMermaidParse()
     }
 
     private func restoreStateIfNeeded() {
@@ -304,17 +326,77 @@ final class EditorPaneStateCoordinator: NSObject {
         }
     }
 
-    private func scheduleMermaidPresentation() {
+    private func scheduleMermaidParse() {
+        let revisionNumber = sourceBuffer.revision.number
+        let expectedSourceRange = presentation.sourceRange
+        if mermaidBlocksRevision == revisionNumber,
+           mermaidBlocksSourceRange == expectedSourceRange,
+           presentation.rendersMarkdown {
+            scheduleMermaidApply()
+            return
+        }
+        if mermaidParseRevision == revisionNumber,
+           mermaidParseSourceRange == expectedSourceRange,
+           presentation.rendersMarkdown {
+            return
+        }
+
+        mermaidParseTask?.cancel()
+        guard presentation.rendersMarkdown,
+              sourceBuffer.metrics.containsMermaidCandidate else {
+            mermaidParseTask = nil
+            mermaidBlocks = []
+            mermaidBlocksRevision = revisionNumber
+            mermaidBlocksSourceRange = expectedSourceRange
+            mermaidParseRevision = nil
+            mermaidParseSourceRange = nil
+            return
+        }
+
+        let source = presentation.text
+        mermaidParseRevision = revisionNumber
+        mermaidParseSourceRange = expectedSourceRange
+        mermaidParseTask = Task.detached(priority: .utility) { [weak self] in
+            let blocks = MermaidFencedBlockParser.blocks(in: source) {
+                Task.isCancelled
+            }
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self,
+                      self.sourceBuffer.revision.number == revisionNumber,
+                      self.presentation.sourceRange == expectedSourceRange,
+                      self.presentation.rendersMarkdown else {
+                    return
+                }
+                self.mermaidBlocks = blocks
+                self.mermaidBlocksRevision = revisionNumber
+                self.mermaidBlocksSourceRange = expectedSourceRange
+                self.mermaidParseTask = nil
+                self.mermaidParseRevision = nil
+                self.mermaidParseSourceRange = nil
+                self.scheduleMermaidApply()
+            }
+        }
+    }
+
+    private func scheduleMermaidApply() {
+        guard !mermaidApplyScheduled else { return }
+        mermaidApplyScheduled = true
         DispatchQueue.main.async { [weak self, weak textView] in
-            guard let self,
+            guard let self else { return }
+            self.mermaidApplyScheduled = false
+            guard
                   let textView,
                   textView === self.textView,
-                  textView.string == self.presentation.text else {
+                  self.mermaidBlocksRevision
+                    == self.sourceBuffer.revision.number else {
                 return
             }
             self.mermaidPresenter.apply(
                 to: textView,
-                rendersMarkdown: self.presentation.rendersMarkdown
+                rendersMarkdown: self.presentation.rendersMarkdown,
+                source: self.presentation.text,
+                blocks: self.mermaidBlocks
             )
         }
     }

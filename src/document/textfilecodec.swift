@@ -68,7 +68,11 @@ enum TextFileCodec {
         ) else {
             throw CocoaError(.fileWriteInapplicableStringEncoding)
         }
-        return Data(bom) + body
+        var encoded = Data()
+        encoded.reserveCapacity(bom.count + body.count)
+        encoded.append(contentsOf: bom)
+        encoded.append(body)
+        return encoded
     }
 
     private nonisolated static func countNewlines(

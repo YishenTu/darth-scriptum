@@ -24,7 +24,8 @@ enum MarkdownConfigurationFactory {
         rawSourceMode: Bool,
         fontSize: CGFloat,
         documentURL: URL?,
-        latexRenderer: AdaptiveLatexRenderer? = nil
+        latexRenderer: AdaptiveLatexRenderer? = nil,
+        imageProvider: MarkdownImageProvider? = nil
     ) -> MarkdownEditorConfiguration {
         let activeLatexRenderer = latexRenderer ?? self.latexRenderer
         let theme = MarkdownEditorTheme(
@@ -44,7 +45,8 @@ enum MarkdownConfigurationFactory {
         var configuration = MarkdownEditorConfiguration.default
         configuration.theme = theme
         configuration.services = MarkdownEditorServices(
-            images: MarkdownImageProvider(documentURL: documentURL),
+            images: imageProvider
+                ?? MarkdownImageProvider(documentURL: documentURL),
             syntaxHighlighter: CodeSyntaxHighlighter(
                 highlighter: syntaxHighlighter,
                 appearanceDidChangeNotification:
@@ -194,7 +196,8 @@ final class MarkdownImageProvider: EmbeddedImageProvider, @unchecked Sendable {
     private static let maximumImageFileBytes = 8 * 1_024 * 1_024
     private static let maximumDecodedImageCost = 32 * 1_024 * 1_024
 
-    private let documentURL: URL?
+    private let stateLock = NSLock()
+    private var documentURL: URL?
     private let cache = NSCache<NSURL, NSImage>()
 
     init(documentURL: URL?) {
@@ -202,10 +205,22 @@ final class MarkdownImageProvider: EmbeddedImageProvider, @unchecked Sendable {
         cache.totalCostLimit = Self.maximumDecodedImageCost
     }
 
+    func update(documentURL: URL?) {
+        let standardizedURL = documentURL?.standardizedFileURL
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard self.documentURL != standardizedURL else { return }
+        self.documentURL = standardizedURL
+        cache.removeAllObjects()
+    }
+
     func image(for reference: EmbeddedImageRequest) -> NSImage? {
+        stateLock.lock()
+        let currentDocumentURL = documentURL
+        stateLock.unlock()
         guard let url = MarkdownLinkResolver.resolveLocalFile(
             reference.name,
-            relativeTo: documentURL
+            relativeTo: currentDocumentURL
         ) else {
             return nil
         }
@@ -243,7 +258,9 @@ final class MarkdownImageProvider: EmbeddedImageProvider, @unchecked Sendable {
     }
 
     func fingerprint() -> AnyHashable {
-        documentURL?.path ?? "untitled"
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return documentURL?.path ?? "untitled"
     }
 
     private func decodedCost(of source: CGImageSource) -> Int? {
