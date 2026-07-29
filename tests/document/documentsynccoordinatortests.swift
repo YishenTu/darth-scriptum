@@ -452,17 +452,19 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
     func testRetryAfterExternalDecodeFailureRereadsTheFile() async throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
-        let gate = SuspensionGate()
-        var readCount = 0
+        let retryReadGate = SuspensionGate()
+        var retryReadGateIsArmed = false
+        var retryReadStarted = false
         let originalData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(originalData)
+        try Data([0xFF, 0x00, 0xC0]).write(to: fixture.url)
         let coordinator = DocumentSyncCoordinator(
             snapshot: snapshot,
             externalReadHook: { _ in
-                readCount += 1
-                if readCount == 2 {
-                    await gate.wait()
-                }
+                guard retryReadGateIsArmed else { return }
+                retryReadGateIsArmed = false
+                retryReadStarted = true
+                await retryReadGate.wait()
             }
         )
         let delegate = TestSyncDelegate(fileURL: fixture.url)
@@ -472,7 +474,6 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             data: originalData,
             from: fixture.url
         )
-        try Data([0xFF, 0x00, 0xC0]).write(to: fixture.url)
         coordinator.noteCoordinatedExternalChange()
         try await waitUntil {
             if case .failed = coordinator.state {
@@ -484,17 +485,18 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             return XCTFail("The reload failure should remain visible.")
         }
 
+        retryReadGateIsArmed = true
         try Data("repaired\n".utf8).write(to: fixture.url)
         coordinator.retrySynchronization()
         try await waitUntil {
-            readCount == 2 && coordinator.state == .checkingExternalChange
+            retryReadStarted && coordinator.state == .checkingExternalChange
         }
         guard case .failed = coordinator.presentedState else {
             return XCTFail(
                 "The unresolved failure should remain visible during retry."
             )
         }
-        await gate.open()
+        await retryReadGate.open()
 
         try await waitUntil {
             coordinator.sourceBuffer.revision.text == "repaired\n"
