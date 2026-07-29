@@ -45,6 +45,13 @@ jobs:
             -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_PATH" \
             -resolvePackageDependencies
 
+      - name: Install ripgrep for architecture check
+        run: |
+          if ! command -v rg >/dev/null 2>&1; then
+            brew install ripgrep
+          fi
+          command -v rg
+
       - name: Check architecture
         run: ./scripts/check-architecture.sh
 
