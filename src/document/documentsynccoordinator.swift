@@ -97,6 +97,7 @@ final class DocumentSyncCoordinator: ObservableObject {
 
     private let merger = ThreeWayTextMerger()
     private let recoveryStore: SessionRecoveryStore
+    private let fileMonitoringEnabled: Bool
     private let savePreparationHook: (@MainActor () async -> Void)?
     private let externalReadHook: (@MainActor (UInt64) async -> Void)?
     private var documentIdentity: DocumentIdentity? {
@@ -140,6 +141,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         initialDurableState: DurableFileState? = nil,
         bridge: SaveTransactionBridge = SaveTransactionBridge(),
         recoveryStore: SessionRecoveryStore = .shared,
+        fileMonitoringEnabled: Bool = true,
         savePreparationHook: (@MainActor () async -> Void)? = nil,
         externalReadHook: (@MainActor (UInt64) async -> Void)? = nil
     ) {
@@ -150,6 +152,7 @@ final class DocumentSyncCoordinator: ObservableObject {
             initialDurableState?.snapshot == snapshot ? 0 : nil
         self.bridge = bridge
         self.recoveryStore = recoveryStore
+        self.fileMonitoringEnabled = fileMonitoringEnabled
         self.savePreparationHook = savePreparationHook
         self.externalReadHook = externalReadHook
         sourceObservation = sourceBuffer.observe { [weak self] revision, origin in
@@ -713,7 +716,7 @@ final class DocumentSyncCoordinator: ObservableObject {
     private func restartMonitor() {
         monitor?.cancel()
         monitor = nil
-        guard let fileURL else {
+        guard fileMonitoringEnabled, let fileURL else {
             monitorFailureMessage = nil
             return
         }

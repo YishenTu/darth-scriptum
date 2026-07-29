@@ -457,9 +457,9 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         var retryReadStarted = false
         let originalData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(originalData)
-        try Data([0xFF, 0x00, 0xC0]).write(to: fixture.url)
         let coordinator = DocumentSyncCoordinator(
             snapshot: snapshot,
+            fileMonitoringEnabled: false,
             externalReadHook: { _ in
                 guard retryReadGateIsArmed else { return }
                 retryReadGateIsArmed = false
@@ -467,6 +467,10 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
                 await retryReadGate.wait()
             }
         )
+        defer {
+            retryReadGate.open()
+            coordinator.close()
+        }
         let delegate = TestSyncDelegate(fileURL: fixture.url)
         coordinator.delegate = delegate
         coordinator.loadInitial(
@@ -474,6 +478,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             data: originalData,
             from: fixture.url
         )
+        try Data([0xFF, 0x00, 0xC0]).write(to: fixture.url)
         coordinator.noteCoordinatedExternalChange()
         try await waitUntil {
             if case .failed = coordinator.state {
@@ -496,14 +501,13 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
                 "The unresolved failure should remain visible during retry."
             )
         }
-        await retryReadGate.open()
+        retryReadGate.open()
 
         try await waitUntil {
             coordinator.sourceBuffer.revision.text == "repaired\n"
         }
         XCTAssertEqual(coordinator.state, .idle)
         XCTAssertNil(coordinator.presentedState)
-        coordinator.close()
     }
 
     func testUnsupportedAtomicSwapStopsAutomaticRetriesAndRequiresSaveAs()
@@ -960,7 +964,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             coordinator.durableState?.snapshot.format.encoding
                 == .utf8WithBOM
         }
-        await gate.open()
+        gate.open()
         try await waitUntil { requestedToken != nil }
 
         XCTAssertEqual(requestedToken?.snapshot.text, "local\n")
@@ -1259,7 +1263,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         try await waitUntil {
             coordinator.sourceBuffer.revision.text == "external\n"
         }
-        await gate.open()
+        gate.open()
         try await Task.sleep(for: .milliseconds(150))
 
         XCTAssertEqual(requestedSaveCount, 0)
@@ -1297,7 +1301,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         try await waitUntil {
             readStarted && coordinator.state == .checkingExternalChange
         }
-        await gate.open()
+        gate.open()
     }
 
     func testPendingExternalSignalRunsAfterTheActiveRead() async throws {
@@ -1324,7 +1328,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
 
         try Data("newer\n".utf8).write(to: fixture.url)
         coordinator.noteCoordinatedExternalChange()
-        await gate.open()
+        gate.open()
         try await waitUntil {
             coordinator.sourceBuffer.revision.text == "newer\n"
         }
@@ -1421,7 +1425,8 @@ private enum InjectedCoordinatorMigrationError: Error {
     case interrupted
 }
 
-private actor SuspensionGate {
+@MainActor
+private final class SuspensionGate {
     private var isOpen = false
     private var continuation: CheckedContinuation<Void, Never>?
 
