@@ -291,7 +291,10 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         defer { fixture.remove() }
         let originalData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(originalData)
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: snapshot,
+            fileMonitoringEnabled: false
+        )
         let delegate = TestSyncDelegate(fileURL: fixture.url)
         delegate.onSave = { token in
             do {
