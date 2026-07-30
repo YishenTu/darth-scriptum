@@ -5,6 +5,52 @@ import XCTest
 
 @MainActor
 final class DocumentSyncCoordinatorTests: XCTestCase {
+    func testInitialLoadPreservesBOMFormatForTheNextSave() throws {
+        let fixture = try TemporaryMarkdownFile(contents: "placeholder\n")
+        defer { fixture.remove() }
+        let loadedData = Data([0xEF, 0xBB, 0xBF])
+            + Data("loaded\r\n".utf8)
+        try loadedData.write(to: fixture.url)
+        let loadedSnapshot = try TextFileCodec.decode(loadedData)
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: DocumentSnapshot(text: "", format: .newDocument),
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
+        )
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: fixture.url)
+        coordinator.delegate = host
+
+        coordinator.loadInitial(
+            loadedSnapshot,
+            data: loadedData,
+            from: fixture.url
+        )
+
+        XCTAssertEqual(coordinator.currentSnapshot, loadedSnapshot)
+        XCTAssertEqual(coordinator.format, loadedSnapshot.format)
+        XCTAssertEqual(
+            coordinator.durableState?.snapshot.format,
+            loadedSnapshot.format
+        )
+
+        coordinator.sourceBuffer.replace(
+            with: "edited\r\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        let preparation = try XCTUnwrap(executor.savePreparationRequests.last)
+
+        XCTAssertEqual(preparation.snapshot.format, loadedSnapshot.format)
+        XCTAssertEqual(
+            try TextFileCodec.encode(preparation.snapshot),
+            Data([0xEF, 0xBB, 0xBF]) + Data("edited\r\n".utf8)
+        )
+    }
+
     func testSaveAsAttachmentUsesTheCurrentBytesOnDisk() async throws {
         let fixture = try TemporaryMarkdownFile(contents: "external\n")
         defer { fixture.remove() }
@@ -36,35 +82,47 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         }
         let originalData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(originalData)
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
-        coordinator.loadInitial(
-            snapshot,
+        let fixture = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
             data: originalData,
-            from: original.url
+            url: original.url
         )
-        defer { coordinator.close() }
+        defer { fixture.coordinator.close() }
 
-        try FileManager.default.removeItem(at: original.url)
-        coordinator.noteCoordinatedExternalChange()
-        try await waitUntil {
-            coordinator.state == .missing
-        }
-        XCTAssertEqual(coordinator.presentedState, .missing)
+        fixture.coordinator.noteCoordinatedExternalChange()
+        fixture.fireExternalRead()
+        let read = try XCTUnwrap(fixture.executor.externalReadRequests.last)
+        XCTAssertTrue(
+            fixture.executor.finishExternalRead(
+                read.token,
+                with: .finished(.missing)
+            )
+        )
+        XCTAssertEqual(fixture.coordinator.presentedState, .missing)
 
         let savedData = Data("saved\n".utf8)
         let savedSnapshot = try TextFileCodec.decode(savedData)
-        try await coordinator.attachAfterSaveAs(
+        fixture.coordinator.sourceBuffer.replace(
+            with: savedSnapshot.text,
+            origin: .localEditor(paneID: UUID())
+        )
+        let savedRevision = fixture.coordinator.sourceBuffer.revision
+        try await fixture.coordinator.attachAfterSaveAs(
             to: destination.url,
             expectedData: savedData,
-            expectedSnapshot: savedSnapshot
+            expectedSnapshot: savedSnapshot,
+            expectedSourceRevision: savedRevision
         )
 
-        XCTAssertEqual(coordinator.state, .idle)
-        XCTAssertNil(coordinator.presentedState)
-        XCTAssertEqual(coordinator.fileURL, destination.url.standardizedFileURL)
+        XCTAssertEqual(fixture.coordinator.state, .idle)
+        XCTAssertNil(fixture.coordinator.presentedState)
+        XCTAssertEqual(
+            fixture.coordinator.fileURL,
+            destination.url.standardizedFileURL
+        )
     }
 
-    func testRoutineSynchronizationDoesNotInvalidateCoordinatorUI() async throws {
+    func testRoutineSynchronizationDoesNotInvalidateCoordinatorUI() throws {
         let fixture = try TemporaryMarkdownFile(contents: "base")
         defer { fixture.remove() }
         let snapshot = try TextFileCodec.decode(Data("base".utf8))
@@ -84,7 +142,6 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             with: "local",
             origin: .localEditor(paneID: UUID())
         )
-        try await Task.sleep(for: .milliseconds(150))
 
         XCTAssertEqual(publicationCount, 0)
         XCTAssertNil(coordinator.presentedState)
@@ -169,40 +226,41 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         defer { fixture.remove() }
         let initialData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(initialData)
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        coordinator.loadInitial(
-            snapshot,
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
             data: initialData,
-            from: fixture.url
+            url: fixture.url
         )
-        var token: PendingSaveToken?
+        defer { harness.coordinator.close() }
         var flushResult: Bool?
-        delegate.onSave = { token = $0 }
 
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "flushed\n",
             origin: .localEditor(paneID: UUID())
         )
-        coordinator.flushNow { flushResult = $0 }
-        try await waitUntil { token != nil }
+        harness.coordinator.flushNow { flushResult = $0 }
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
         XCTAssertNil(flushResult)
 
-        let pendingToken = try XCTUnwrap(token)
-        let result = try SafeFileCommitter().commit(pendingToken)
-        try coordinator.bridge.store(result)
-        coordinator.handleSaveCompletion(
-            generation: pendingToken.generation,
-            error: nil
-        )
+        let commit = try XCTUnwrap(harness.host.saveRequests.last)
+        let result = try SafeFileCommitter().commit(commit.pendingSave)
+        try harness.coordinator.bridge.store(result, for: commit.token)
+        _ = harness.coordinator.handleSaveCompletion(token: commit.token, error: nil)
 
         XCTAssertEqual(flushResult, true)
         XCTAssertEqual(
             try String(contentsOf: fixture.url, encoding: .utf8),
             "flushed\n"
         )
-        coordinator.close()
     }
 
     func testAttachAssociatesFingerprintWithTheSnapshotActuallyOnDisk() async throws {
@@ -212,77 +270,126 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             text: "new-edit-during-save-as\n",
             format: .newDocument
         )
-        let coordinator = DocumentSyncCoordinator(snapshot: current)
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        delegate.onSave = { token in
-            do {
-                let result = try SafeFileCommitter().commit(token)
-                try coordinator.bridge.store(result)
-                coordinator.handleSaveCompletion(generation: token.generation, error: nil)
-            } catch {
-                coordinator.handleSaveCompletion(
-                    generation: token.generation,
-                    error: error
-                )
-            }
-        }
+        let data = Data("saved-before-new-edit\n".utf8)
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: current,
+            recoveryStore: SessionRecoveryStore(),
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
+        )
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: fixture.url)
+        coordinator.delegate = host
 
-        coordinator.attach(to: fixture.url)
+        let didAttach = await coordinator.attachAndWait(
+            to: fixture.url,
+            knownData: data
+        )
 
+        XCTAssertTrue(didAttach)
         XCTAssertEqual(
             coordinator.durableState?.snapshot.text,
             "saved-before-new-edit\n"
         )
-        try await waitUntil {
-            (try? String(contentsOf: fixture.url, encoding: .utf8))
-                == "new-edit-during-save-as\n"
-        }
-        coordinator.close()
+        XCTAssertTrue(coordinator.hasLocalChanges)
+        coordinator.advanceScheduledWork(by: .zero)
+        let externalRead = try XCTUnwrap(executor.externalReadRequests.last)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: data
+        )
+        let observation = try TextFileCodec.externalReadObservation(
+            data: data,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: fingerprint
+        )
+        XCTAssertTrue(
+            executor.finishExternalRead(
+                externalRead.token,
+                with: .finished(.unchanged(observation))
+            )
+        )
+        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        let preparation = try XCTUnwrap(executor.savePreparationRequests.last)
+        XCTAssertTrue(
+            executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let commit = try XCTUnwrap(host.saveRequests.last)
+        XCTAssertEqual(commit.pendingSave.snapshot.text, current.text)
+        let result = try SafeFileCommitter().commit(commit.pendingSave)
+        try coordinator.bridge.store(result, for: commit.token)
+        XCTAssertTrue(coordinator.handleSaveCompletion(token: commit.token, error: nil))
+        XCTAssertEqual(
+            try String(contentsOf: fixture.url, encoding: .utf8),
+            "new-edit-during-save-as\n"
+        )
     }
 
     func testLocalEditWritesThroughAndExternalEditReloads() async throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
 
-        let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
-        let coordinator = DocumentSyncCoordinator(
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let harness = DeterministicCoordinatorFixture(
             snapshot: snapshot,
-            fileMonitoringEnabled: false
+            data: data,
+            url: fixture.url
         )
-        defer { coordinator.close() }
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
-        delegate.onSave = { token in
-            do {
-                let result = try SafeFileCommitter().commit(token)
-                try coordinator.bridge.store(result)
-                coordinator.handleSaveCompletion(generation: token.generation, error: nil)
-            } catch {
-                coordinator.handleSaveCompletion(
-                    generation: token.generation,
-                    error: error
-                )
-            }
-        }
+        defer { harness.coordinator.close() }
 
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "local\n",
             origin: .localEditor(paneID: UUID())
         )
-        try await waitUntil {
-            (try? String(contentsOf: fixture.url, encoding: .utf8)) == "local\n"
-        }
-        XCTAssertEqual(coordinator.state, .idle)
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let commit = try XCTUnwrap(harness.host.saveRequests.last)
+        let result = try SafeFileCommitter().commit(commit.pendingSave)
+        try harness.coordinator.bridge.store(result, for: commit.token)
+        XCTAssertTrue(
+            harness.coordinator.handleSaveCompletion(token: commit.token, error: nil)
+        )
+        XCTAssertEqual(harness.coordinator.state, .idle)
 
-        try Data("external\n".utf8).write(to: fixture.url)
-        coordinator.noteCoordinatedExternalChange()
-        try await waitUntil {
-            coordinator.sourceBuffer.revision.text == "external\n"
-        }
-        XCTAssertEqual(coordinator.sourceBuffer.revision.text, "external\n")
-        XCTAssertEqual(delegate.acceptedExternalChangeCount, 1)
+        let externalData = Data("external\n".utf8)
+        try externalData.write(to: fixture.url)
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let read = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: externalData
+        )
+        let change = try TextFileCodec.decodeExternalChange(
+            data: externalData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: fingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                read.token,
+                with: .finished(.changed(change))
+            )
+        )
+        XCTAssertEqual(harness.coordinator.sourceBuffer.revision.text, "external\n")
+        XCTAssertEqual(harness.host.acceptedExternalChangeCount, 1)
     }
 
     func testSameContentAtomicReplacementRefreshesIdentityBeforeSaving()
@@ -291,55 +398,68 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         defer { fixture.remove() }
         let originalData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(originalData)
-        let coordinator = DocumentSyncCoordinator(
+        let harness = DeterministicCoordinatorFixture(
             snapshot: snapshot,
-            fileMonitoringEnabled: false
-        )
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        delegate.onSave = { token in
-            do {
-                let result = try SafeFileCommitter().commit(token)
-                try coordinator.bridge.store(result)
-                coordinator.handleSaveCompletion(
-                    generation: token.generation,
-                    error: nil
-                )
-            } catch {
-                coordinator.handleSaveCompletion(
-                    generation: token.generation,
-                    error: error
-                )
-            }
-        }
-        coordinator.delegate = delegate
-        coordinator.loadInitial(
-            snapshot,
             data: originalData,
-            from: fixture.url
+            url: fixture.url
         )
-        let originalIdentifier = coordinator.durableState?
+        defer { harness.coordinator.close() }
+        let originalIdentifier = harness.coordinator.durableState?
             .fingerprint.resourceIdentifier
 
         try originalData.write(to: fixture.url, options: [.atomic])
-        coordinator.noteCoordinatedExternalChange()
-        try await waitUntil {
-            coordinator.durableState?.fingerprint.resourceIdentifier
-                != originalIdentifier
-        }
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let read = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let replacementFingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: originalData
+        )
+        let replacement = try TextFileCodec.decodeExternalChange(
+            data: originalData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: replacementFingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                read.token,
+                with: .finished(.changed(replacement))
+            )
+        )
+        XCTAssertNotEqual(
+            harness.coordinator.durableState?.fingerprint.resourceIdentifier,
+            originalIdentifier
+        )
 
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "local\n",
             origin: .localEditor(paneID: UUID())
         )
-        try await waitUntil {
-            (try? String(contentsOf: fixture.url, encoding: .utf8))
-                == "local\n"
-        }
-        XCTAssertEqual(coordinator.state, .idle)
-        coordinator.close()
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertEqual(
+            preparation.expectedBaseline?.fingerprint,
+            harness.coordinator.reducerState.durableBaseline?.fingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let commit = try XCTUnwrap(harness.host.saveRequests.last)
+        let result = try SafeFileCommitter().commit(commit.pendingSave)
+        try harness.coordinator.bridge.store(result, for: commit.token)
+        XCTAssertTrue(
+            harness.coordinator.handleSaveCompletion(token: commit.token, error: nil)
+        )
+        XCTAssertEqual(harness.coordinator.state, .idle)
     }
 
-    func testSameContentSymlinkRetargetMigratesRecoveryAndRemainsWritable()
+    func testSameContentSymlinkRetargetPreservesLegacyRecoveryAndBlocksWrites()
         async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -358,38 +478,20 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             at: link,
             withDestinationURL: firstReferent
         )
-        let recoveryDirectory = directory.appendingPathComponent(
-            "recovery",
-            isDirectory: true
-        )
-        let recoveryStore = SessionRecoveryStore(
-            persistenceDirectory: recoveryDirectory
-        )
+        let recoveryStore = SessionRecoveryStore()
         let snapshot = try TextFileCodec.decode(originalData)
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
         let coordinator = DocumentSyncCoordinator(
             snapshot: snapshot,
-            recoveryStore: recoveryStore
+            recoveryStore: recoveryStore,
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
         )
-        let delegate = TestSyncDelegate(fileURL: link)
-        delegate.onSave = { token in
-            do {
-                let result = try SafeFileCommitter(
-                    recoveryDirectory: recoveryDirectory
-                ).commit(token)
-                try coordinator.bridge.store(result)
-                coordinator.handleSaveCompletion(
-                    generation: token.generation,
-                    error: nil
-                )
-            } catch {
-                coordinator.handleSaveCompletion(
-                    generation: token.generation,
-                    error: error
-                )
-            }
-        }
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: originalData, from: link)
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: link)
+        coordinator.delegate = host
         let oldIdentity = DocumentIdentity.make(url: link)
         try recoveryStore.add(
             snapshot: DocumentSnapshot(
@@ -398,6 +500,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             ),
             for: oldIdentity
         )
+        coordinator.loadInitial(snapshot, data: originalData, from: link)
 
         try FileManager.default.removeItem(at: link)
         try FileManager.default.createSymbolicLink(
@@ -405,120 +508,137 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             withDestinationURL: secondReferent
         )
         let newIdentity = DocumentIdentity.make(url: link)
-        coordinator.noteCoordinatedExternalChange()
-        try await waitUntil {
-            recoveryStore.latest(for: newIdentity) != nil
-                && recoveryStore.latest(for: oldIdentity) == nil
-        }
+        let didMove = await coordinator.noteFileMovedAndWait(
+            to: link,
+            knownData: originalData
+        )
 
+        XCTAssertTrue(didMove)
+        XCTAssertEqual(coordinator.state, .synchronizationPaused)
+        XCTAssertNotNil(recoveryStore.latest(for: oldIdentity))
+        XCTAssertNil(recoveryStore.latest(for: newIdentity))
         coordinator.sourceBuffer.replace(
             with: "local\n",
             origin: .localEditor(paneID: UUID())
         )
-        try await waitUntil {
-            (try? String(contentsOf: secondReferent, encoding: .utf8))
-                == "local\n"
-        }
+        coordinator.advanceScheduledWork(by: .seconds(1))
+        XCTAssertTrue(executor.savePreparationRequests.isEmpty)
+        XCTAssertTrue(host.saveRequests.isEmpty)
         XCTAssertEqual(
             try String(contentsOf: firstReferent, encoding: .utf8),
             "base\n"
         )
-        coordinator.close()
     }
 
-    func testMonitorRearmsAfterAtomicExternalReplacement() async throws {
+    func testCoordinatorProcessesExplicitRepeatedExternalReplacements()
+        async throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
         let originalData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(originalData)
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        coordinator.loadInitial(
-            snapshot,
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
             data: originalData,
-            from: fixture.url
+            url: fixture.url
+        )
+        defer { harness.coordinator.close() }
+
+        let replacementData = Data("replacement\n".utf8)
+        try replacementData.write(to: fixture.url, options: .atomic)
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let firstRead = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let firstFingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: replacementData
+        )
+        let firstChange = try TextFileCodec.decodeExternalChange(
+            data: replacementData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: firstFingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                firstRead.token,
+                with: .finished(.changed(firstChange))
+            )
         )
 
-        try Data("replacement\n".utf8).write(
-            to: fixture.url,
-            options: .atomic
+        let directData = Data("direct\n".utf8)
+        try directData.write(to: fixture.url)
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let secondRead = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let secondFingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: directData
         )
-        try await waitUntil {
-            coordinator.sourceBuffer.revision.text == "replacement\n"
-        }
+        let secondChange = try TextFileCodec.decodeExternalChange(
+            data: directData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: secondFingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                secondRead.token,
+                with: .finished(.changed(secondChange))
+            )
+        )
 
-        let handle = try FileHandle(forWritingTo: fixture.url)
-        try handle.truncate(atOffset: 0)
-        try handle.write(contentsOf: Data("direct\n".utf8))
-        try handle.close()
-        try await waitUntil {
-            coordinator.sourceBuffer.revision.text == "direct\n"
-        }
-
-        XCTAssertGreaterThanOrEqual(delegate.acceptedExternalChangeCount, 2)
-        coordinator.close()
+        XCTAssertEqual(harness.coordinator.sourceBuffer.revision.text, "direct\n")
+        XCTAssertEqual(harness.host.acceptedExternalChangeCount, 2)
     }
 
     func testRetryAfterExternalDecodeFailureRereadsTheFile() async throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
-        let retryReadGate = SuspensionGate()
-        var retryReadGateIsArmed = false
-        var retryReadStarted = false
         let originalData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(originalData)
-        let coordinator = DocumentSyncCoordinator(
+        let harness = DeterministicCoordinatorFixture(
             snapshot: snapshot,
-            fileMonitoringEnabled: false,
-            externalReadHook: { _ in
-                guard retryReadGateIsArmed else { return }
-                retryReadGateIsArmed = false
-                retryReadStarted = true
-                await retryReadGate.wait()
-            }
-        )
-        defer {
-            retryReadGate.open()
-            coordinator.close()
-        }
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        coordinator.loadInitial(
-            snapshot,
             data: originalData,
-            from: fixture.url
+            url: fixture.url
         )
-        try Data([0xFF, 0x00, 0xC0]).write(to: fixture.url)
-        coordinator.noteCoordinatedExternalChange()
-        try await waitUntil {
-            if case .failed = coordinator.state {
-                return true
-            }
-            return false
-        }
-        guard case .failed = coordinator.presentedState else {
+        defer { harness.coordinator.close() }
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let failedRead = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                failedRead.token,
+                with: .failed(.externalRead)
+            )
+        )
+        guard case .failed = harness.coordinator.presentedState else {
             return XCTFail("The reload failure should remain visible.")
         }
 
-        retryReadGateIsArmed = true
-        try Data("repaired\n".utf8).write(to: fixture.url)
-        coordinator.retrySynchronization()
-        try await waitUntil {
-            retryReadStarted && coordinator.state == .checkingExternalChange
-        }
-        guard case .failed = coordinator.presentedState else {
-            return XCTFail(
-                "The unresolved failure should remain visible during retry."
+        let repairedData = Data("repaired\n".utf8)
+        try repairedData.write(to: fixture.url)
+        harness.coordinator.retrySynchronization()
+        harness.fireExternalRead()
+        let retryRead = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let repairedFingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: repairedData
+        )
+        let repairedChange = try TextFileCodec.decodeExternalChange(
+            data: repairedData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: repairedFingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                retryRead.token,
+                with: .finished(.changed(repairedChange))
             )
-        }
-        retryReadGate.open()
-
-        try await waitUntil {
-            coordinator.sourceBuffer.revision.text == "repaired\n"
-        }
-        XCTAssertEqual(coordinator.state, .idle)
-        XCTAssertNil(coordinator.presentedState)
+        )
+        XCTAssertEqual(harness.coordinator.sourceBuffer.revision.text, "repaired\n")
+        XCTAssertEqual(harness.coordinator.state, .idle)
+        XCTAssertNil(harness.coordinator.presentedState)
     }
 
     func testUnsupportedAtomicSwapStopsAutomaticRetriesAndRequiresSaveAs()
@@ -527,119 +647,200 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         defer { fixture.remove() }
         let originalData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(originalData)
-        var externalReadObserved = false
-        let coordinator = DocumentSyncCoordinator(
+        let harness = DeterministicCoordinatorFixture(
             snapshot: snapshot,
-            externalReadHook: { _ in
-                externalReadObserved = true
-            }
-        )
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        var saveAttempts = 0
-        delegate.onSave = { token in
-            saveAttempts += 1
-            coordinator.handleSaveCompletion(
-                generation: token.generation,
-                error: SafeFileCommitter.CommitError.atomicSwapUnavailable
-            )
-        }
-        coordinator.delegate = delegate
-        coordinator.loadInitial(
-            snapshot,
             data: originalData,
-            from: fixture.url
+            url: fixture.url
         )
+        defer { harness.coordinator.close() }
 
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "local\n",
             origin: .localEditor(paneID: UUID())
         )
-        try await waitUntil {
-            coordinator.failureRequiresSaveAs
-        }
-        coordinator.noteCoordinatedExternalChange()
-        try await waitUntil {
-            guard externalReadObserved else { return false }
-            if case .failed = coordinator.state {
-                return true
-            }
-            return false
-        }
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let request = try XCTUnwrap(harness.host.saveRequests.last)
+        _ = harness.coordinator.handleSaveCompletion(
+            token: request.token,
+            error: SafeFileCommitter.CommitError.atomicSwapUnavailable
+        )
 
-        XCTAssertEqual(saveAttempts, 1)
-        XCTAssertTrue(coordinator.failureRequiresSaveAs)
+        XCTAssertEqual(harness.host.saveRequests.count, 1)
+        XCTAssertTrue(harness.coordinator.failureRequiresSaveAs)
         var flushResult: Bool?
-        coordinator.flushNow { flushResult = $0 }
+        harness.coordinator.flushNow { flushResult = $0 }
         XCTAssertEqual(flushResult, false)
-        XCTAssertEqual(saveAttempts, 1)
-        if case .failed = coordinator.state {
+        XCTAssertEqual(harness.host.saveRequests.count, 1)
+        if case .failed = harness.coordinator.state {
             // Expected.
         } else {
             XCTFail("The unsupported destination should remain failed.")
         }
-        coordinator.close()
     }
 
-    func testOverlappingExternalEditShowsDiskAndKeepsRecovery() async throws {
+    func testOverlappingExternalEditPersistsAndRestoresLegacyRecovery()
+        async throws {
         let fixture = try TemporaryMarkdownFile(contents: "hello\n")
         defer { fixture.remove() }
 
-        let snapshot = try TextFileCodec.decode(Data("hello\n".utf8))
-        let recoveryDirectory = fixture.directory.appendingPathComponent(
-            "recovery",
-            isDirectory: true
-        )
-        let recoveryStore = SessionRecoveryStore(
-            persistenceDirectory: recoveryDirectory
-        )
-        let coordinator = DocumentSyncCoordinator(
+        let data = Data("hello\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let recoveryStore = SessionRecoveryStore()
+        let harness = DeterministicCoordinatorFixture(
             snapshot: snapshot,
+            data: data,
+            url: fixture.url,
             recoveryStore: recoveryStore
         )
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        var restoredToken: PendingSaveToken?
-        delegate.onSave = { restoredToken = $0 }
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: Data("hello\n".utf8), from: fixture.url)
+        defer { harness.coordinator.close() }
 
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "hallo\n",
             origin: .localEditor(paneID: UUID())
         )
-        try Data("hullo\n".utf8).write(to: fixture.url)
-        coordinator.noteCoordinatedExternalChange()
-
-        try await waitUntil {
-            coordinator.state == .recoveredConflict
-        }
-        XCTAssertEqual(coordinator.sourceBuffer.revision.text, "hullo\n")
-        coordinator.noteCoordinatedExternalChange()
-        try await waitUntil {
-            coordinator.state == .recoveredConflict
-        }
-        XCTAssertEqual(coordinator.state, .recoveredConflict)
-
-        coordinator.restoreLatestRecovery()
-        XCTAssertEqual(coordinator.sourceBuffer.revision.text, "hallo\n")
-        try await waitUntil { restoredToken != nil }
-        let token = try XCTUnwrap(restoredToken)
-        XCTAssertNotNil(
-            SessionRecoveryStore(
-                persistenceDirectory: recoveryDirectory
-            ).latest(for: DocumentIdentity.make(url: fixture.url))
+        let externalData = Data("hullo\n".utf8)
+        try externalData.write(to: fixture.url)
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let read = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: externalData
         )
-        let result = try SafeFileCommitter().commit(token)
-        try coordinator.bridge.store(result)
-        coordinator.handleSaveCompletion(generation: token.generation, error: nil)
+        let change = try TextFileCodec.decodeExternalChange(
+            data: externalData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: fingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                read.token,
+                with: .finished(.changed(change))
+            )
+        )
+        let merge = try XCTUnwrap(harness.executor.mergeRequests.last)
+        XCTAssertTrue(
+            harness.executor.finishMerge(
+                merge.token,
+                with: .finished(ThreeWayTextMerger().result(for: merge))
+            )
+        )
+
+        XCTAssertEqual(harness.coordinator.state, .recoveredConflict)
+        XCTAssertEqual(harness.coordinator.sourceBuffer.revision.text, "hullo\n")
+        XCTAssertEqual(
+            recoveryStore.latest(
+                for: DocumentIdentity.make(url: fixture.url)
+            )?.snapshot.text,
+            "hallo\n"
+        )
+        XCTAssertTrue(harness.coordinator.hasLocalRecovery)
+
+        harness.coordinator.restoreLatestRecovery()
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let save = try XCTUnwrap(harness.host.saveRequests.last)
+        let result = try SafeFileCommitter().commit(save.pendingSave)
+        try harness.coordinator.bridge.store(result, for: save.token)
+        XCTAssertTrue(
+            harness.coordinator.handleSaveCompletion(
+                token: save.token,
+                error: nil
+            )
+        )
+
+        XCTAssertEqual(
+            try String(contentsOf: fixture.url, encoding: .utf8),
+            "hallo\n"
+        )
         XCTAssertNil(
-            SessionRecoveryStore(
-                persistenceDirectory: recoveryDirectory
-            ).latest(for: DocumentIdentity.make(url: fixture.url))
+            recoveryStore.latest(for: DocumentIdentity.make(url: fixture.url))
         )
-        coordinator.close()
+        XCTAssertFalse(harness.coordinator.hasLocalRecovery)
     }
 
-    func testAttachMigratesDecodedAndRawRecoveryToTheNewIdentity() throws {
+    func testFreshConflictUsesTheDestinationGenerationAfterEmptyMigration()
+        throws {
+        let fixture = try TemporaryMarkdownFile(contents: "base\n")
+        defer { fixture.remove() }
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let recoveryStore = SessionRecoveryStore()
+        let destinationIdentity = DocumentIdentity.make(url: fixture.url)
+        _ = try recoveryStore.advanceEmptyRecoveryMigration(
+            from: DocumentIdentity(stableKey: "path:/tmp/moved-away.md"),
+            to: destinationIdentity,
+            expectedGeneration: 0
+        )
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
+            data: data,
+            url: fixture.url,
+            recoveryStore: recoveryStore
+        )
+        defer { harness.coordinator.close() }
+
+        XCTAssertEqual(harness.coordinator.reducerState.recoveryAccess, .ready(generation: 1))
+        harness.coordinator.sourceBuffer.replace(
+            with: "local\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        let externalData = Data("external\n".utf8)
+        try externalData.write(to: fixture.url)
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let read = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: externalData
+        )
+        let change = try TextFileCodec.decodeExternalChange(
+            data: externalData,
+            targetURL: fixture.url,
+            identity: destinationIdentity,
+            fingerprint: fingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                read.token,
+                with: .finished(.changed(change))
+            )
+        )
+        let merge = try XCTUnwrap(harness.executor.mergeRequests.last)
+        XCTAssertTrue(
+            harness.executor.finishMerge(
+                merge.token,
+                with: .finished(ThreeWayTextMerger().result(for: merge))
+            )
+        )
+
+        XCTAssertEqual(harness.coordinator.state, .recoveredConflict)
+        XCTAssertEqual(
+            recoveryStore.latest(for: destinationIdentity)?.snapshot.text,
+            "local\n"
+        )
+    }
+
+    func testAttachPreservesDecodedAndRawRecoveryWithoutLegacyReceipts()
+        async throws {
         let fixture = try TemporaryMarkdownFile(contents: "old\n")
         defer { fixture.remove() }
         let newURL = fixture.directory.appendingPathComponent("renamed.md")
@@ -653,28 +854,49 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             format: .newDocument
         )
         try store.add(snapshot: recovery, for: oldIdentity)
-        try store.addRawData(Data([0xFF]), for: oldIdentity)
+        let rawData = Data([0xFF])
+        let rawEntry = try store.addRawData(rawData, for: oldIdentity)
         let snapshot = try TextFileCodec.decode(Data("old\n".utf8))
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
         let coordinator = DocumentSyncCoordinator(
             snapshot: snapshot,
-            recoveryStore: store
+            recoveryStore: store,
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
         )
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: newURL)
+        coordinator.delegate = host
         coordinator.loadInitial(
             snapshot,
             data: Data("old\n".utf8),
             from: fixture.url
         )
 
-        coordinator.attach(to: newURL, knownData: newData)
-
-        XCTAssertNil(store.latest(for: oldIdentity))
-        XCTAssertTrue(store.rawRecoveryEntries(for: oldIdentity).isEmpty)
-        XCTAssertEqual(store.latest(for: newIdentity)?.snapshot, recovery)
-        XCTAssertEqual(
-            store.rawRecoveryEntries(for: newIdentity).first?.data,
-            Data([0xFF])
+        let didAttach = await coordinator.attachAndWait(
+            to: newURL,
+            knownData: newData
         )
-        coordinator.close()
+
+        XCTAssertTrue(didAttach)
+        XCTAssertEqual(coordinator.state, .synchronizationPaused)
+        XCTAssertEqual(store.latest(for: oldIdentity)?.snapshot, recovery)
+        XCTAssertEqual(
+            store.rawRecoveryEntries(for: oldIdentity),
+            [rawEntry]
+        )
+        XCTAssertEqual(store.rawRecoveryEntries(for: oldIdentity).first?.data, rawData)
+        XCTAssertNil(store.latest(for: newIdentity))
+        XCTAssertTrue(store.rawRecoveryEntries(for: newIdentity).isEmpty)
+        coordinator.sourceBuffer.replace(
+            with: "must-not-write\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        coordinator.advanceScheduledWork(by: .seconds(1))
+        XCTAssertTrue(executor.savePreparationRequests.isEmpty)
+        XCTAssertTrue(host.saveRequests.isEmpty)
     }
 
     func testFailedRecoveryMigrationCannotResumeWritesToTheNewPath() async throws {
@@ -683,17 +905,8 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         let newURL = fixture.directory.appendingPathComponent("renamed.md")
         let newData = Data("new\n".utf8)
         try newData.write(to: newURL)
-        let recoveryDirectory = fixture.directory.appendingPathComponent(
-            "recovery",
-            isDirectory: true
-        )
         let oldIdentity = DocumentIdentity.make(url: fixture.url)
-        let store = SessionRecoveryStore(
-            persistenceDirectory: recoveryDirectory,
-            migrationWriteHook: { _ in
-                throw InjectedCoordinatorMigrationError.interrupted
-            }
-        )
+        let store = SessionRecoveryStore()
         try store.add(
             snapshot: DocumentSnapshot(
                 text: "recover\n",
@@ -702,58 +915,49 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             for: oldIdentity
         )
         let snapshot = try TextFileCodec.decode(Data("old\n".utf8))
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
         let coordinator = DocumentSyncCoordinator(
             snapshot: snapshot,
-            recoveryStore: store
+            recoveryStore: store,
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
         )
-        let delegate = TestSyncDelegate(fileURL: newURL)
-        var saveRequestCount = 0
-        delegate.onSave = { _ in saveRequestCount += 1 }
-        coordinator.delegate = delegate
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: newURL)
+        coordinator.delegate = host
         coordinator.loadInitial(
             snapshot,
             data: Data("old\n".utf8),
             from: fixture.url
         )
 
-        coordinator.attach(to: newURL, knownData: newData)
+        _ = await coordinator.attachAndWait(to: newURL, knownData: newData)
         XCTAssertEqual(coordinator.state, .synchronizationPaused)
-        XCTAssertTrue(coordinator.hasLocalRecovery)
-        XCTAssertTrue(coordinator.recoveryMigrationIsPending)
 
         coordinator.resumeSynchronization()
         coordinator.sourceBuffer.replace(
             with: "must remain paused\n",
             origin: .localEditor(paneID: UUID())
         )
-        try await Task.sleep(for: .milliseconds(175))
+        coordinator.advanceScheduledWork(by: .seconds(1))
 
         XCTAssertEqual(coordinator.state, .synchronizationPaused)
-        XCTAssertTrue(coordinator.recoveryMigrationIsPending)
-        XCTAssertEqual(saveRequestCount, 0)
+        XCTAssertTrue(host.saveRequests.isEmpty)
+        XCTAssertTrue(executor.savePreparationRequests.isEmpty)
         XCTAssertNotNil(store.latest(for: oldIdentity))
-        coordinator.close()
     }
 
-    func testSuccessfulRecoveryMigrationRetryRestartsTheSuppressedSave() async throws {
+    func testLegacyRecoveryMigrationRetryCannotRestartTheSuppressedSave()
+        async throws {
         let fixture = try TemporaryMarkdownFile(contents: "old\n")
         defer { fixture.remove() }
         let newURL = fixture.directory.appendingPathComponent("renamed.md")
         let newData = Data("new\n".utf8)
         try newData.write(to: newURL)
         let oldIdentity = DocumentIdentity.make(url: fixture.url)
-        var shouldInterrupt = true
-        let store = SessionRecoveryStore(
-            persistenceDirectory: fixture.directory.appendingPathComponent(
-                "recovery",
-                isDirectory: true
-            ),
-            migrationWriteHook: { _ in
-                guard shouldInterrupt else { return }
-                shouldInterrupt = false
-                throw InjectedCoordinatorMigrationError.interrupted
-            }
-        )
+        let store = SessionRecoveryStore()
         try store.add(
             snapshot: DocumentSnapshot(
                 text: "recover\n",
@@ -762,54 +966,44 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             for: oldIdentity
         )
         let snapshot = try TextFileCodec.decode(Data("old\n".utf8))
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
         let coordinator = DocumentSyncCoordinator(
             snapshot: snapshot,
-            recoveryStore: store
+            recoveryStore: store,
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
         )
-        let delegate = TestSyncDelegate(fileURL: newURL)
-        var requestedToken: PendingSaveToken?
-        delegate.onSave = { requestedToken = $0 }
-        coordinator.delegate = delegate
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: newURL)
+        coordinator.delegate = host
         coordinator.loadInitial(
             snapshot,
             data: Data("old\n".utf8),
             from: fixture.url
         )
-        coordinator.attach(to: newURL, knownData: newData)
-        XCTAssertTrue(coordinator.recoveryMigrationIsPending)
+        _ = await coordinator.attachAndWait(to: newURL, knownData: newData)
 
         coordinator.retryRecoveryMigration()
-        try await waitUntil { requestedToken != nil }
-
-        XCTAssertFalse(coordinator.recoveryMigrationIsPending)
-        XCTAssertEqual(
-            requestedToken?.targetURL.standardizedFileURL,
-            newURL.standardizedFileURL
+        coordinator.sourceBuffer.replace(
+            with: "still-paused\n",
+            origin: .localEditor(paneID: UUID())
         )
-        XCTAssertEqual(requestedToken?.snapshot.text, "old\n")
-        coordinator.close()
+        coordinator.advanceScheduledWork(by: .seconds(1))
+
+        XCTAssertEqual(coordinator.state, .synchronizationPaused)
+        XCTAssertTrue(host.saveRequests.isEmpty)
+        XCTAssertTrue(executor.savePreparationRequests.isEmpty)
+        XCTAssertNotNil(store.latest(for: oldIdentity))
     }
 
-    func testRecoveryMigrationPublishesActionsWhileStateRemainsPaused()
+    func testLegacyRecoveryPauseExposesOnlyNonDestructiveActions()
         throws {
         let fixture = try TemporaryMarkdownFile(contents: "old\n")
         defer { fixture.remove() }
-        let newURL = fixture.directory.appendingPathComponent("renamed.md")
-        let newData = Data("new\n".utf8)
-        try newData.write(to: newURL)
         let oldIdentity = DocumentIdentity.make(url: fixture.url)
-        var shouldInterrupt = true
-        let store = SessionRecoveryStore(
-            persistenceDirectory: fixture.directory.appendingPathComponent(
-                "recovery",
-                isDirectory: true
-            ),
-            migrationWriteHook: { _ in
-                guard shouldInterrupt else { return }
-                shouldInterrupt = false
-                throw InjectedCoordinatorMigrationError.interrupted
-            }
-        )
+        let store = SessionRecoveryStore()
         try store.addRawData(
             Data([0xFF, 0x00, 0xC0]),
             for: oldIdentity
@@ -818,55 +1012,38 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         let snapshot = try TextFileCodec.decode(oldData)
         let coordinator = DocumentSyncCoordinator(
             snapshot: snapshot,
-            recoveryStore: store
+            recoveryStore: store,
+            fileMonitoringEnabled: false,
+            effectExecutor: ControllableCoordinatorEffectExecutor(),
+            manualScheduler: ManualSyncScheduler()
         )
         defer { coordinator.close() }
-        let delegate = TestSyncDelegate(fileURL: newURL)
-        coordinator.delegate = delegate
         coordinator.loadInitial(
             snapshot,
             data: oldData,
             from: fixture.url
         )
-        coordinator.attach(to: newURL, knownData: newData)
-
-        XCTAssertEqual(coordinator.presentedState, .synchronizationPaused)
-        XCTAssertTrue(coordinator.statusSnapshot.recoveryMigrationIsPending)
-        XCTAssertNotNil(coordinator.statusSnapshot.rawRecoveryURL)
-        var snapshots: [DocumentSynchronizationStatusSnapshot] = []
-        let observation = coordinator.$statusSnapshot.dropFirst().sink {
-            snapshots.append($0)
-        }
-
-        coordinator.retryRecoveryMigration()
 
         XCTAssertEqual(coordinator.presentedState, .synchronizationPaused)
         XCTAssertFalse(coordinator.statusSnapshot.recoveryMigrationIsPending)
-        let rawRecoveryURL = try XCTUnwrap(
-            coordinator.statusSnapshot.rawRecoveryURL
-        )
-        XCTAssertTrue(
-            snapshots.contains(coordinator.statusSnapshot),
-            "Action-driving metadata should publish even when state is unchanged."
-        )
+        XCTAssertNil(coordinator.statusSnapshot.rawRecoveryURL)
+        XCTAssertFalse(coordinator.statusSnapshot.hasLocalRecovery)
         let presentation = SynchronizationStatusPresentation.make(
             for: .synchronizationPaused,
             failureRequiresSaveAs:
                 coordinator.statusSnapshot.failureRequiresSaveAs,
             recoveryMigrationIsPending:
                 coordinator.statusSnapshot.recoveryMigrationIsPending,
-            rawRecoveryURL: rawRecoveryURL,
+            rawRecoveryURL: coordinator.statusSnapshot.rawRecoveryURL,
             hasLocalRecovery: coordinator.statusSnapshot.hasLocalRecovery
         )
-        XCTAssertEqual(
-            presentation?.primaryAction,
-            .showRecoveryFile(rawRecoveryURL)
-        )
-        XCTAssertTrue(presentation?.offersRawRecoveryDiscard == true)
-        withExtendedLifetime(observation) {}
+        XCTAssertEqual(presentation?.primaryAction, .saveAs)
+        XCTAssertFalse(presentation?.offersRawRecoveryDiscard == true)
+        XCTAssertFalse(presentation?.offersLocalRevisionRestore == true)
     }
 
-    func testReopenedRawAndDecodedRecoveryPausesUntilRestoreCommits() async throws {
+    func testReopenedRawAndDecodedRecoveryPausesWithoutMutatingEvidence()
+        throws {
         let fixture = try TemporaryMarkdownFile(contents: "disk\n")
         defer { fixture.remove() }
         let recoveryDirectory = fixture.directory.appendingPathComponent(
@@ -895,12 +1072,12 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         )
         let coordinator = DocumentSyncCoordinator(
             snapshot: diskSnapshot,
-            recoveryStore: reopenedStore
+            recoveryStore: reopenedStore,
+            fileMonitoringEnabled: false,
+            effectExecutor: ControllableCoordinatorEffectExecutor(),
+            manualScheduler: ManualSyncScheduler()
         )
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        var restoreToken: PendingSaveToken?
-        delegate.onSave = { restoreToken = $0 }
-        coordinator.delegate = delegate
+        defer { coordinator.close() }
 
         coordinator.loadInitial(
             diskSnapshot,
@@ -909,197 +1086,204 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         )
 
         XCTAssertEqual(coordinator.state, .synchronizationPaused)
-        XCTAssertTrue(coordinator.hasLocalRecovery)
-        XCTAssertNotNil(coordinator.latestRawRecoveryURL)
+        XCTAssertFalse(coordinator.hasLocalRecovery)
+        XCTAssertNil(coordinator.latestRawRecoveryURL)
 
         coordinator.restoreLatestRecovery()
         XCTAssertEqual(
             coordinator.sourceBuffer.revision.text,
-            recoveredSnapshot.text
+            diskSnapshot.text
         )
-        try await waitUntil { restoreToken != nil }
-        XCTAssertNotNil(reopenedStore.latest(for: identity))
-        XCTAssertFalse(
-            reopenedStore.rawRecoveryEntries(for: identity).isEmpty
-        )
-
-        let token = try XCTUnwrap(restoreToken)
-        let result = try SafeFileCommitter().commit(token)
-        try coordinator.bridge.store(result)
-        coordinator.handleSaveCompletion(
-            generation: token.generation,
-            error: nil
-        )
-
-        XCTAssertNil(reopenedStore.latest(for: identity))
-        XCTAssertTrue(
-            reopenedStore.rawRecoveryEntries(for: identity).isEmpty
-        )
-        XCTAssertEqual(coordinator.state, .idle)
-        coordinator.close()
+        XCTAssertEqual(reopenedStore.latest(for: identity)?.snapshot, recoveredSnapshot)
+        XCTAssertEqual(reopenedStore.rawRecoveryEntries(for: identity).first?.data, rawData)
+        XCTAssertEqual(coordinator.state, .synchronizationPaused)
     }
 
     func testExternalBOMChangeIsUsedByThePendingLocalSave() async throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
-        let gate = SuspensionGate()
-        var preparationStarted = false
         let originalData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(originalData)
-        let coordinator = DocumentSyncCoordinator(
+        let harness = DeterministicCoordinatorFixture(
             snapshot: snapshot,
-            savePreparationHook: {
-                preparationStarted = true
-                await gate.wait()
-            }
-        )
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        var requestedToken: PendingSaveToken?
-        delegate.onSave = { requestedToken = $0 }
-        coordinator.delegate = delegate
-        coordinator.loadInitial(
-            snapshot,
             data: originalData,
-            from: fixture.url
+            url: fixture.url
         )
+        defer { harness.coordinator.close() }
 
-        coordinator.sourceBuffer.replace(
-            with: "local\n",
-            origin: .localEditor(paneID: UUID())
-        )
-        try await waitUntil { preparationStarted }
         let bomData = Data([0xEF, 0xBB, 0xBF]) + originalData
         try bomData.write(to: fixture.url)
-        coordinator.noteCoordinatedExternalChange()
-        try await waitUntil {
-            coordinator.durableState?.snapshot.format.encoding
-                == .utf8WithBOM
-        }
-        gate.open()
-        try await waitUntil { requestedToken != nil }
-
-        XCTAssertEqual(requestedToken?.snapshot.text, "local\n")
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let read = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: bomData
+        )
+        let change = try TextFileCodec.decodeExternalChange(
+            data: bomData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: fingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                read.token,
+                with: .finished(.changed(change))
+            )
+        )
         XCTAssertEqual(
-            requestedToken?.snapshot.format.encoding,
+            harness.coordinator.durableState?.snapshot.format.encoding,
             .utf8WithBOM
         )
-        coordinator.close()
+
+        harness.coordinator.sourceBuffer.replace(
+            with: "local\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let requestedToken = try XCTUnwrap(harness.host.saveRequests.last)
+
+        XCTAssertEqual(requestedToken.pendingSave.snapshot.text, "local\n")
+        XCTAssertEqual(
+            requestedToken.pendingSave.snapshot.format.encoding,
+            .utf8WithBOM
+        )
     }
 
-    func testDisplacedBOMChangeIsUsedByTheReconciliationSave() async throws {
+    func testDisplacedBOMChangeFailsClosedWithoutALegacyRecoveryReceipt()
+        async throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
         let originalData = Data("base\n".utf8)
         let snapshot = try TextFileCodec.decode(originalData)
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        var requestedTokens: [PendingSaveToken] = []
-        delegate.onSave = { requestedTokens.append($0) }
-        coordinator.delegate = delegate
-        coordinator.loadInitial(
-            snapshot,
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
             data: originalData,
-            from: fixture.url
+            url: fixture.url,
+            recoveryStore: SessionRecoveryStore(
+                persistenceDirectory: fixture.directory.appendingPathComponent(
+                    "recovery",
+                    isDirectory: true
+                )
+            )
         )
+        defer { harness.coordinator.close() }
 
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "local\n",
             origin: .localEditor(paneID: UUID())
         )
-        try await waitUntil { requestedTokens.count == 1 }
-        let firstToken = requestedTokens[0]
-        try firstToken.encodedData.write(to: fixture.url)
-        let bomData = Data([0xEF, 0xBB, 0xBF]) + originalData
-        try coordinator.bridge.store(
-            FileCommitResult(
-                generation: firstToken.generation,
-                committedFingerprint: try SafeFileCommitter.fingerprint(
-                    for: fixture.url,
-                    data: firstToken.encodedData
-                ),
-                displacedPreimage: bomData,
-                safety: .atomicSwap
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
             )
         )
-
-        coordinator.handleSaveCompletion(
-            generation: firstToken.generation,
-            error: nil
+        let request = try XCTUnwrap(harness.host.saveRequests.last)
+        let bomData = Data([0xEF, 0xBB, 0xBF]) + originalData
+        let committer = SafeFileCommitter(
+            recoveryDirectory: fixture.directory.appendingPathComponent(
+                "recovery",
+                isDirectory: true
+            ),
+            beforeAtomicSwap: {
+                try bomData.write(to: fixture.url)
+            }
         )
-        try await waitUntil { requestedTokens.count == 2 }
-        let reconciliationToken = try XCTUnwrap(
-            requestedTokens.dropFirst().first
-        )
+        let result = try committer.commit(request.pendingSave)
+        XCTAssertEqual(result.displacedPreimage?.data, bomData)
+        XCTAssertNotNil(result.recoveryArtifact)
+        try harness.coordinator.bridge.store(result, for: request.token)
+        _ = harness.coordinator.handleSaveCompletion(token: request.token, error: nil)
 
-        XCTAssertEqual(reconciliationToken.snapshot.text, "local\n")
+        XCTAssertEqual(harness.coordinator.state, .synchronizationPaused)
         XCTAssertEqual(
-            reconciliationToken.snapshot.format.encoding,
-            .utf8WithBOM
+            harness.coordinator.reducerState.pendingDisplacedPreimage?
+                .rawPayload.data,
+            bomData
         )
-        coordinator.close()
+        XCTAssertTrue(harness.host.saveRequests.count == 1)
     }
 
-    func testUnexpectedAtomicPreimageIsReconciledBackToDisk() async throws {
+    func testUnexpectedAtomicPreimageFailsClosedWithAnArtifactBackedPayload()
+        async throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
 
-        let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
-
-        var firstToken: PendingSaveToken?
-        delegate.onSave = { token in
-            if firstToken == nil {
-                firstToken = token
-                return
-            }
-            do {
-                let result = try SafeFileCommitter().commit(token)
-                try coordinator.bridge.store(result)
-                coordinator.handleSaveCompletion(generation: token.generation, error: nil)
-            } catch {
-                coordinator.handleSaveCompletion(
-                    generation: token.generation,
-                    error: error
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
+            data: data,
+            url: fixture.url,
+            recoveryStore: SessionRecoveryStore(
+                persistenceDirectory: fixture.directory.appendingPathComponent(
+                    "recovery",
+                    isDirectory: true
                 )
-            }
-        }
+            )
+        )
+        defer { harness.coordinator.close() }
 
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "local\n",
             origin: .localEditor(paneID: UUID())
         )
-        try await waitUntil { firstToken != nil }
-        let token = try XCTUnwrap(firstToken)
-        try token.encodedData.write(to: fixture.url)
-        let external = Data("external\n".utf8)
-        let result = FileCommitResult(
-            generation: token.generation,
-            committedFingerprint: try SafeFileCommitter.fingerprint(
-                for: fixture.url,
-                data: token.encodedData
-            ),
-            displacedPreimage: external,
-            safety: .atomicSwap
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
         )
-        try coordinator.bridge.store(result)
-        coordinator.handleSaveCompletion(generation: token.generation, error: nil)
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let request = try XCTUnwrap(harness.host.saveRequests.last)
+        let external = Data("external\n".utf8)
+        let committer = SafeFileCommitter(
+            recoveryDirectory: fixture.directory.appendingPathComponent(
+                "recovery",
+                isDirectory: true
+            ),
+            beforeAtomicSwap: {
+                try external.write(to: fixture.url)
+            }
+        )
+        let result = try committer.commit(request.pendingSave)
+        XCTAssertEqual(result.displacedPreimage?.data, external)
+        XCTAssertNotNil(result.recoveryArtifact)
+        try harness.coordinator.bridge.store(result, for: request.token)
+        _ = harness.coordinator.handleSaveCompletion(token: request.token, error: nil)
 
-        try await waitUntil {
-            coordinator.state == .recoveredConflict
-                && (try? String(contentsOf: fixture.url, encoding: .utf8))
-                    == "external\n"
-        }
-        XCTAssertEqual(coordinator.sourceBuffer.revision.text, "external\n")
-
-        coordinator.restoreLatestRecovery()
-        XCTAssertEqual(coordinator.sourceBuffer.revision.text, "local\n")
-        coordinator.close()
+        XCTAssertEqual(harness.coordinator.state, .synchronizationPaused)
+        XCTAssertEqual(
+            harness.coordinator.reducerState.pendingDisplacedPreimage?
+                .rawPayload.data,
+            external
+        )
+        XCTAssertEqual(
+            try String(contentsOf: fixture.url, encoding: .utf8),
+            "local\n"
+        )
     }
 
-    func testUndecodableUnexpectedPreimageIsDurablyPreserved() async throws {
+    func testUndecodableUnexpectedPreimageIsKeptInThePausedReducerPayload()
+        async throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
         let recoveryDirectory = FileManager.default.temporaryDirectory
@@ -1108,306 +1292,492 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         let recoveryStore = SessionRecoveryStore(
             persistenceDirectory: recoveryDirectory
         )
-        let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
-        let coordinator = DocumentSyncCoordinator(
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let harness = DeterministicCoordinatorFixture(
             snapshot: snapshot,
+            data: data,
+            url: fixture.url,
             recoveryStore: recoveryStore
         )
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
+        defer { harness.coordinator.close() }
 
-        var pendingToken: PendingSaveToken?
         var flushResult: Bool?
-        delegate.onSave = { pendingToken = $0 }
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "local\n",
             origin: .localEditor(paneID: UUID())
         )
-        coordinator.flushNow { flushResult = $0 }
-        try await waitUntil { pendingToken != nil }
-        let token = try XCTUnwrap(pendingToken)
-        try token.encodedData.write(to: fixture.url)
-        let invalidExternal = Data([0xFF, 0x00, 0xC0])
-        try coordinator.bridge.store(
-            FileCommitResult(
-                generation: token.generation,
-                committedFingerprint: try SafeFileCommitter.fingerprint(
-                    for: fixture.url,
-                    data: token.encodedData
-                ),
-                displacedPreimage: invalidExternal,
-                safety: .atomicSwap
+        harness.coordinator.flushNow { flushResult = $0 }
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
             )
         )
+        let request = try XCTUnwrap(harness.host.saveRequests.last)
+        let invalidExternal = Data([0xFF, 0x00, 0xC0])
+        let committer = SafeFileCommitter(
+            recoveryDirectory: recoveryDirectory,
+            beforeAtomicSwap: {
+                try invalidExternal.write(to: fixture.url)
+            }
+        )
+        let result = try committer.commit(request.pendingSave)
+        XCTAssertEqual(result.displacedPreimage?.data, invalidExternal)
+        XCTAssertNotNil(result.recoveryArtifact)
+        try harness.coordinator.bridge.store(result, for: request.token)
+        _ = harness.coordinator.handleSaveCompletion(token: request.token, error: nil)
 
-        coordinator.handleSaveCompletion(generation: token.generation, error: nil)
-        try await Task.sleep(for: .milliseconds(150))
-
-        XCTAssertEqual(coordinator.state, .synchronizationPaused)
+        XCTAssertEqual(harness.coordinator.state, .synchronizationPaused)
         XCTAssertEqual(flushResult, false)
         var repeatedFlushResult: Bool?
-        coordinator.flushNow { repeatedFlushResult = $0 }
+        harness.coordinator.flushNow { repeatedFlushResult = $0 }
         XCTAssertEqual(repeatedFlushResult, false)
         let identity = DocumentIdentity.make(url: fixture.url)
+        XCTAssertTrue(recoveryStore.rawRecoveryEntries(for: identity).isEmpty)
         XCTAssertEqual(
-            recoveryStore.rawRecoveryEntries(for: identity).first?.data,
+            harness.coordinator.reducerState.pendingDisplacedPreimage?
+                .rawPayload.data,
             invalidExternal
         )
-        XCTAssertEqual(
-            SessionRecoveryStore(
-                persistenceDirectory: recoveryDirectory
-            ).rawRecoveryEntries(for: identity).first?.data,
-            invalidExternal
-        )
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "edit while paused\n",
             origin: .localEditor(paneID: UUID())
         )
-        try await Task.sleep(for: .milliseconds(150))
+        harness.coordinator.advanceScheduledWork(by: .seconds(1))
         XCTAssertEqual(
             try String(contentsOf: fixture.url, encoding: .utf8),
             "local\n"
         )
-        coordinator.close()
     }
 
     func testUnchangedExternalSignalReschedulesCancelledLocalWrite() async throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
 
-        let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
-        defer { coordinator.close() }
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
-        delegate.onSave = { token in
-            do {
-                let result = try SafeFileCommitter().commit(token)
-                try coordinator.bridge.store(result)
-                coordinator.handleSaveCompletion(generation: token.generation, error: nil)
-            } catch {
-                coordinator.handleSaveCompletion(
-                    generation: token.generation,
-                    error: error
-                )
-            }
-        }
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
+            data: data,
+            url: fixture.url
+        )
+        defer { harness.coordinator.close() }
 
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "local\n",
             origin: .localEditor(paneID: UUID())
         )
-        coordinator.noteCoordinatedExternalChange()
-
-        try await waitUntil {
-            (try? String(contentsOf: fixture.url, encoding: .utf8)) == "local\n"
-        }
-    }
-
-    func testRepeatedSiblingSignalsDoNotStarveLocalWrite() async throws {
-        let fixture = try TemporaryMarkdownFile(contents: "base\n")
-        defer { fixture.remove() }
-
-        let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
-        delegate.onSave = { token in
-            do {
-                let result = try SafeFileCommitter().commit(token)
-                try coordinator.bridge.store(result)
-                coordinator.handleSaveCompletion(generation: token.generation, error: nil)
-            } catch {
-                coordinator.handleSaveCompletion(
-                    generation: token.generation,
-                    error: error
-                )
-            }
-        }
-
-        coordinator.sourceBuffer.replace(
-            with: "local\n",
-            origin: .localEditor(paneID: UUID())
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let read = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: data
         )
-        for _ in 0..<8 {
-            coordinator.noteCoordinatedExternalChange()
-            try await Task.sleep(for: .milliseconds(40))
-        }
+        let observation = try TextFileCodec.externalReadObservation(
+            data: data,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: fingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                read.token,
+                with: .finished(.unchanged(observation))
+            )
+        )
 
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let request = try XCTUnwrap(harness.host.saveRequests.last)
+        let result = try SafeFileCommitter().commit(request.pendingSave)
+        try harness.coordinator.bridge.store(result, for: request.token)
+        XCTAssertTrue(
+            harness.coordinator.handleSaveCompletion(token: request.token, error: nil)
+        )
         XCTAssertEqual(
             try String(contentsOf: fixture.url, encoding: .utf8),
             "local\n"
         )
-        coordinator.close()
     }
 
-    func testExternalReloadCancelsAStalePreparedSave() async throws {
+    func testRepeatedSiblingSignalsDoNotStarveLocalWrite() throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
-        let gate = SuspensionGate()
-        var preparationStarted = false
-        let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
-        let coordinator = DocumentSyncCoordinator(
-            snapshot: snapshot,
-            savePreparationHook: {
-                preparationStarted = true
-                await gate.wait()
-            }
-        )
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        var requestedSaveCount = 0
-        delegate.onSave = { _ in requestedSaveCount += 1 }
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
 
-        coordinator.sourceBuffer.replace(
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
+            data: data,
+            url: fixture.url
+        )
+        defer { harness.coordinator.close() }
+
+        harness.coordinator.sourceBuffer.replace(
             with: "local\n",
             origin: .localEditor(paneID: UUID())
         )
-        try await waitUntil { preparationStarted }
-
-        try Data("external\n".utf8).write(to: fixture.url)
-        coordinator.noteCoordinatedExternalChange()
-        try await waitUntil {
-            coordinator.sourceBuffer.revision.text == "external\n"
+        for _ in 0..<8 {
+            harness.coordinator.noteCoordinatedExternalChange()
         }
-        gate.open()
-        try await Task.sleep(for: .milliseconds(150))
 
-        XCTAssertEqual(requestedSaveCount, 0)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: data
+        )
+        let observation = try TextFileCodec.externalReadObservation(
+            data: data,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: fingerprint
+        )
+        harness.fireExternalRead()
+        let firstRead = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                firstRead.token,
+                with: .finished(.unchanged(observation))
+            )
+        )
+        harness.fireExternalRead()
+        let secondRead = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        XCTAssertNotEqual(secondRead.token, firstRead.token)
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                secondRead.token,
+                with: .finished(.unchanged(observation))
+            )
+        )
+
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let request = try XCTUnwrap(harness.host.saveRequests.last)
+        let result = try SafeFileCommitter().commit(request.pendingSave)
+        try harness.coordinator.bridge.store(result, for: request.token)
+        XCTAssertTrue(
+            harness.coordinator.handleSaveCompletion(token: request.token, error: nil)
+        )
+        XCTAssertEqual(
+            try String(contentsOf: fixture.url, encoding: .utf8),
+            "local\n"
+        )
+    }
+
+    func testExternalReloadCancelsAStalePreparedSave() throws {
+        let fixture = try TemporaryMarkdownFile(contents: "base\n")
+        defer { fixture.remove() }
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let recoveryStore = SessionRecoveryStore()
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
+            data: data,
+            url: fixture.url,
+            recoveryStore: recoveryStore
+        )
+        defer { harness.coordinator.close() }
+
+        harness.coordinator.sourceBuffer.replace(
+            with: "local\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        harness.fireLocalSave()
+        let stalePreparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+
+        let externalData = Data("external\n".utf8)
+        try externalData.write(to: fixture.url)
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let read = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: externalData
+        )
+        let change = try TextFileCodec.decodeExternalChange(
+            data: externalData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: fingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                read.token,
+                with: .finished(.changed(change))
+            )
+        )
+        let merge = try XCTUnwrap(harness.executor.mergeRequests.last)
+        XCTAssertTrue(
+            harness.executor.finishMerge(
+                merge.token,
+                with: .finished(ThreeWayTextMerger().result(for: merge))
+            )
+        )
+        XCTAssertEqual(harness.coordinator.sourceBuffer.revision.text, "external\n")
+
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                stalePreparation.token,
+                with: .prepared(try makePendingSave(from: stalePreparation))
+            )
+        )
+        XCTAssertTrue(harness.host.saveRequests.isEmpty)
+        XCTAssertEqual(harness.coordinator.state, .recoveredConflict)
+        XCTAssertTrue(harness.coordinator.hasLocalRecovery)
+        XCTAssertEqual(
+            recoveryStore.latest(
+                for: DocumentIdentity.make(url: fixture.url)
+            )?.snapshot.text,
+            "local\n"
+        )
         XCTAssertEqual(
             try String(contentsOf: fixture.url, encoding: .utf8),
             "external\n"
         )
-        coordinator.close()
     }
 
-    func testExternalChangeStartsReadingWithoutADebounce() async throws {
+    func testExternalChangeStartsReadingWithoutADebounce() throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
-        let initialData = Data("base\n".utf8)
-        let snapshot = try TextFileCodec.decode(initialData)
-        let gate = SuspensionGate()
-        var readStarted = false
-        let coordinator = DocumentSyncCoordinator(
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let harness = DeterministicCoordinatorFixture(
             snapshot: snapshot,
-            externalReadHook: { _ in
-                readStarted = true
-                await gate.wait()
-            }
+            data: data,
+            url: fixture.url
         )
-        defer { coordinator.close() }
-        coordinator.loadInitial(
-            snapshot,
-            data: initialData,
-            from: fixture.url
-        )
+        defer { harness.coordinator.close() }
 
-        try Data("external\n".utf8).write(to: fixture.url)
-        coordinator.noteCoordinatedExternalChange()
-
-        try await waitUntil {
-            readStarted && coordinator.state == .checkingExternalChange
-        }
-        gate.open()
-    }
-
-    func testPendingExternalSignalRunsAfterTheActiveRead() async throws {
-        let fixture = try TemporaryMarkdownFile(contents: "base\n")
-        defer { fixture.remove() }
-        let gate = SuspensionGate()
-        var firstReadStarted = false
-        let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
-        let coordinator = DocumentSyncCoordinator(
-            snapshot: snapshot,
-            externalReadHook: { _ in
-                guard !firstReadStarted else { return }
-                firstReadStarted = true
-                await gate.wait()
-            }
-        )
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
-
-        try Data("older\n".utf8).write(to: fixture.url)
-        coordinator.noteCoordinatedExternalChange()
-        try await waitUntil { firstReadStarted }
-
-        try Data("newer\n".utf8).write(to: fixture.url)
-        coordinator.noteCoordinatedExternalChange()
-        gate.open()
-        try await waitUntil {
-            coordinator.sourceBuffer.revision.text == "newer\n"
+        harness.coordinator.noteCoordinatedExternalChange()
+        XCTAssertTrue(harness.executor.externalReadRequests.isEmpty)
+        guard case .debouncing = harness.coordinator.reducerState.external else {
+            return XCTFail("An external signal must schedule a zero-delay read.")
         }
 
-        XCTAssertEqual(coordinator.sourceBuffer.revision.text, "newer\n")
-        coordinator.close()
+        harness.fireExternalRead()
+        let read = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        XCTAssertEqual(harness.coordinator.state, .checkingExternalChange)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: data
+        )
+        let observation = try TextFileCodec.externalReadObservation(
+            data: data,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: fingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                read.token,
+                with: .finished(.unchanged(observation))
+            )
+        )
     }
 
-    func testRepeatedSiblingSignalsCannotStarveAnExternalReload() async throws {
+    func testPendingExternalSignalRunsAfterTheActiveRead() throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
-        let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
-        try Data("external\n".utf8).write(to: fixture.url)
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
+            data: data,
+            url: fixture.url
+        )
+        defer { harness.coordinator.close() }
 
-        var observedDuringChurn = false
+        let olderData = Data("older\n".utf8)
+        try olderData.write(to: fixture.url)
+        harness.coordinator.noteCoordinatedExternalChange()
+        harness.fireExternalRead()
+        let firstRead = try XCTUnwrap(harness.executor.externalReadRequests.last)
+
+        let newerData = Data("newer\n".utf8)
+        try newerData.write(to: fixture.url)
+        harness.coordinator.noteCoordinatedExternalChange()
+
+        let olderFingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: olderData
+        )
+        let olderChange = try TextFileCodec.decodeExternalChange(
+            data: olderData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: olderFingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                firstRead.token,
+                with: .finished(.changed(olderChange))
+            )
+        )
+        XCTAssertEqual(harness.coordinator.sourceBuffer.revision.text, "older\n")
+
+        harness.fireExternalRead()
+        let secondRead = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        XCTAssertNotEqual(secondRead.token, firstRead.token)
+        let newerFingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: newerData
+        )
+        let newerChange = try TextFileCodec.decodeExternalChange(
+            data: newerData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: newerFingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                secondRead.token,
+                with: .finished(.changed(newerChange))
+            )
+        )
+        XCTAssertEqual(harness.coordinator.sourceBuffer.revision.text, "newer\n")
+    }
+
+    func testRepeatedSiblingSignalsCannotStarveAnExternalReload() throws {
+        let fixture = try TemporaryMarkdownFile(contents: "base\n")
+        defer { fixture.remove() }
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
+            data: data,
+            url: fixture.url
+        )
+        defer { harness.coordinator.close() }
+        let externalData = Data("external\n".utf8)
+        try externalData.write(to: fixture.url)
+
         for _ in 0..<8 {
-            coordinator.noteCoordinatedExternalChange()
-            try await Task.sleep(for: .milliseconds(40))
-            observedDuringChurn = observedDuringChurn
-                || coordinator.sourceBuffer.revision.text == "external\n"
+            harness.coordinator.noteCoordinatedExternalChange()
         }
+        harness.fireExternalRead()
+        let firstRead = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        let externalFingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: externalData
+        )
+        let externalChange = try TextFileCodec.decodeExternalChange(
+            data: externalData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: externalFingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                firstRead.token,
+                with: .finished(.changed(externalChange))
+            )
+        )
+        XCTAssertEqual(harness.coordinator.sourceBuffer.revision.text, "external\n")
 
-        XCTAssertTrue(observedDuringChurn)
-        XCTAssertEqual(coordinator.sourceBuffer.revision.text, "external\n")
-        coordinator.close()
+        harness.fireExternalRead()
+        let secondRead = try XCTUnwrap(harness.executor.externalReadRequests.last)
+        XCTAssertNotEqual(secondRead.token, firstRead.token)
+        let observation = try TextFileCodec.externalReadObservation(
+            data: externalData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: externalFingerprint
+        )
+        XCTAssertTrue(
+            harness.executor.finishExternalRead(
+                secondRead.token,
+                with: .finished(.unchanged(observation))
+            )
+        )
+        XCTAssertEqual(harness.coordinator.sourceBuffer.revision.text, "external\n")
     }
 
-    func testSaveCompletionReportsNewerVisibleEditAsUnsynchronized() async throws {
+    func testSaveCompletionReportsNewerVisibleEditAsUnsynchronized() throws {
         let fixture = try TemporaryMarkdownFile(contents: "base\n")
         defer { fixture.remove() }
-        let snapshot = try TextFileCodec.decode(Data("base\n".utf8))
-        let coordinator = DocumentSyncCoordinator(snapshot: snapshot)
-        let delegate = TestSyncDelegate(fileURL: fixture.url)
-        var tokens: [PendingSaveToken] = []
-        delegate.onSave = { tokens.append($0) }
-        coordinator.delegate = delegate
-        coordinator.loadInitial(snapshot, data: Data("base\n".utf8), from: fixture.url)
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
+            data: data,
+            url: fixture.url
+        )
+        defer { harness.coordinator.close() }
 
-        coordinator.sourceBuffer.replace(
+        harness.coordinator.sourceBuffer.replace(
             with: "first\n",
             origin: .localEditor(paneID: UUID())
         )
-        try await waitUntil { tokens.count == 1 }
-        let firstToken = tokens[0]
-        coordinator.sourceBuffer.replace(
+        harness.fireLocalSave()
+        let firstPreparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                firstPreparation.token,
+                with: .prepared(try makePendingSave(from: firstPreparation))
+            )
+        )
+        let firstRequest = try XCTUnwrap(harness.host.saveRequests.last)
+
+        harness.coordinator.sourceBuffer.replace(
             with: "second\n",
             origin: .localEditor(paneID: UUID())
         )
-        let firstResult = try SafeFileCommitter().commit(firstToken)
-        try coordinator.bridge.store(firstResult)
-
+        let firstResult = try SafeFileCommitter().commit(
+            firstRequest.pendingSave
+        )
+        try harness.coordinator.bridge.store(firstResult, for: firstRequest.token)
         XCTAssertFalse(
-            coordinator.handleSaveCompletion(
-                generation: firstToken.generation,
+            harness.coordinator.handleSaveCompletion(
+                token: firstRequest.token,
                 error: nil
             )
         )
-        try await waitUntil { tokens.count >= 2 }
-        let secondToken = tokens.last!
-        let secondResult = try SafeFileCommitter().commit(secondToken)
-        try coordinator.bridge.store(secondResult)
+
+        harness.fireLocalSave()
+        let secondPreparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertNotEqual(secondPreparation.token, firstPreparation.token)
         XCTAssertTrue(
-            coordinator.handleSaveCompletion(
-                generation: secondToken.generation,
+            harness.executor.finishSavePreparation(
+                secondPreparation.token,
+                with: .prepared(try makePendingSave(from: secondPreparation))
+            )
+        )
+        let secondRequest = try XCTUnwrap(harness.host.saveRequests.last)
+        XCTAssertNotEqual(secondRequest.token, firstRequest.token)
+        let secondResult = try SafeFileCommitter().commit(
+            secondRequest.pendingSave
+        )
+        try harness.coordinator.bridge.store(secondResult, for: secondRequest.token)
+        XCTAssertTrue(
+            harness.coordinator.handleSaveCompletion(
+                token: secondRequest.token,
                 error: nil
             )
         )
@@ -1415,62 +1785,391 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             try String(contentsOf: fixture.url, encoding: .utf8),
             "second\n"
         )
-        coordinator.close()
     }
 
-    private func waitUntil(
-        timeout: Duration = .seconds(2),
-        condition: @escaping @MainActor () -> Bool
-    ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            if condition() { return }
-            try await Task.sleep(for: .milliseconds(20))
+    func testTypedHostReceivesOnlyTheCurrentFullCommitRequest() throws {
+        let fixture = try TemporaryMarkdownFile(contents: "base\n")
+        defer { fixture.remove() }
+        let initialData = Data("base\n".utf8)
+        let initialSnapshot = try TextFileCodec.decode(initialData)
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: initialSnapshot,
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
+        )
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: fixture.url)
+        coordinator.delegate = host
+        coordinator.loadInitial(initialSnapshot, data: initialData, from: fixture.url)
+
+        coordinator.sourceBuffer.replace(
+            with: "first\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        let stalePreparation = try XCTUnwrap(executor.savePreparationRequests.last)
+
+        coordinator.sourceBuffer.replace(
+            with: "second\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        XCTAssertTrue(
+            executor.finishSavePreparation(
+                stalePreparation.token,
+                with: .prepared(try makePendingSave(from: stalePreparation))
+            )
+        )
+        XCTAssertTrue(host.saveRequests.isEmpty)
+
+        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        let currentPreparation = try XCTUnwrap(executor.savePreparationRequests.last)
+        XCTAssertNotEqual(currentPreparation.token, stalePreparation.token)
+        XCTAssertTrue(
+            executor.finishSavePreparation(
+                currentPreparation.token,
+                with: .prepared(try makePendingSave(from: currentPreparation))
+            )
+        )
+
+        let commit = try XCTUnwrap(host.saveRequests.last)
+        XCTAssertEqual(commit.token.operation, .saveCommit)
+        XCTAssertEqual(commit.pendingSave.snapshot.text, "second\n")
+        XCTAssertEqual(try coordinator.bridge.currentCommitRequest(), commit)
+
+        let result = try SafeFileCommitter().commit(commit.pendingSave)
+        try coordinator.bridge.store(result, for: commit.token)
+        XCTAssertTrue(coordinator.handleSaveCompletion(token: commit.token, error: nil))
+        XCTAssertEqual(try String(contentsOf: fixture.url, encoding: .utf8), "second\n")
+    }
+
+    func testTypedHostCloseWaitsForTheNativeCommitBoundary() throws {
+        let fixture = try TemporaryMarkdownFile(contents: "base\n")
+        defer { fixture.remove() }
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: snapshot,
+            fileMonitoringEnabled: false,
+            effectExecutor: ControllableCoordinatorEffectExecutor(),
+            manualScheduler: ManualSyncScheduler()
+        )
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: fixture.url)
+        coordinator.delegate = host
+        coordinator.loadInitial(snapshot, data: data, from: fixture.url)
+
+        coordinator.requestClose()
+
+        let resolution = try XCTUnwrap(host.closeResolutions.last)
+        XCTAssertEqual(resolution.disposition, .allowManagedClose)
+        XCTAssertEqual(
+            coordinator.reducerState.lifecycle,
+            .closing(
+                DocumentSyncCloseAttempt(
+                    token: resolution.token,
+                    sourceRevision: coordinator.reducerState.source,
+                    kind: .managedFile,
+                    resolution: .allowManagedClose
+                )
+            )
+        )
+
+        coordinator.completeClose(token: resolution.token, didCommit: false)
+        XCTAssertEqual(coordinator.reducerState.lifecycle, .active)
+
+        coordinator.requestClose()
+        let committedResolution = try XCTUnwrap(host.closeResolutions.last)
+        coordinator.completeClose(token: committedResolution.token, didCommit: true)
+        XCTAssertEqual(coordinator.reducerState.lifecycle, .closed)
+    }
+
+    func testUntitledCloseUsesTheTypedNativeReviewBoundary() throws {
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: DocumentSnapshot(text: "draft", format: .newDocument),
+            fileMonitoringEnabled: false,
+            effectExecutor: ControllableCoordinatorEffectExecutor(),
+            manualScheduler: ManualSyncScheduler()
+        )
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: nil)
+        coordinator.delegate = host
+
+        coordinator.requestClose()
+
+        let resolution = try XCTUnwrap(host.closeResolutions.last)
+        XCTAssertEqual(resolution.disposition, .deferToNativeUntitledReview)
+        guard case .closing(let attempt) = coordinator.reducerState.lifecycle else {
+            return XCTFail("The reducer must wait for the native close result.")
         }
-        XCTFail("Timed out waiting for synchronization condition.")
+        XCTAssertEqual(attempt.token, resolution.token)
+        coordinator.completeClose(token: resolution.token, didCommit: true)
+        XCTAssertEqual(coordinator.reducerState.lifecycle, .closed)
     }
-}
 
-private enum InjectedCoordinatorMigrationError: Error {
-    case interrupted
+    func testPersistedLegacyRecoveryEvidencePausesWithoutMutation() throws {
+        let fixture = try TemporaryMarkdownFile(contents: "base\n")
+        defer { fixture.remove() }
+        let recoveryDirectory = fixture.directory.appendingPathComponent(
+            "recovery",
+            isDirectory: true
+        )
+        let store = SessionRecoveryStore(
+            persistenceDirectory: recoveryDirectory
+        )
+        let identity = DocumentIdentity.make(url: fixture.url)
+        let recoveredSnapshot = DocumentSnapshot(
+            text: "recoverable\n",
+            format: .newDocument
+        )
+        try store.add(snapshot: recoveredSnapshot, for: identity)
+        let rawData = Data([0xFF, 0xFE, 0x00])
+        let rawEntry = try store.addRawData(rawData, for: identity)
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: snapshot,
+            recoveryStore: store,
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
+        )
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: fixture.url)
+        coordinator.delegate = host
+
+        coordinator.loadInitial(snapshot, data: data, from: fixture.url)
+
+        XCTAssertEqual(coordinator.state, .synchronizationPaused)
+        XCTAssertEqual(coordinator.presentedState, .synchronizationPaused)
+        XCTAssertFalse(coordinator.hasLocalRecovery)
+        XCTAssertNil(coordinator.latestRawRecoveryURL)
+        XCTAssertTrue(executor.savePreparationRequests.isEmpty)
+
+        coordinator.sourceBuffer.replace(
+            with: "must-not-write\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        coordinator.advanceScheduledWork(by: .seconds(1))
+        XCTAssertTrue(executor.savePreparationRequests.isEmpty)
+
+        coordinator.requestClose()
+        XCTAssertEqual(
+            host.closeResolutions.last?.disposition,
+            .refuseManagedClose
+        )
+        XCTAssertEqual(store.latest(for: identity)?.snapshot, recoveredSnapshot)
+        XCTAssertEqual(store.rawRecoveryEntries(for: identity), [rawEntry])
+        XCTAssertEqual(store.rawRecoveryEntries(for: identity).first?.data, rawData)
+    }
+
+    func testEmptyRecoveryMoveIsAFaithfulNoOp() async throws {
+        let source = try TemporaryMarkdownFile(contents: "base\n")
+        let destination = try TemporaryMarkdownFile(contents: "base\n")
+        defer {
+            source.remove()
+            destination.remove()
+        }
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: snapshot,
+            recoveryStore: SessionRecoveryStore(),
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
+        )
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: destination.url)
+        coordinator.delegate = host
+        coordinator.loadInitial(snapshot, data: data, from: source.url)
+        coordinator.sourceBuffer.replace(
+            with: "local\n",
+            origin: .localEditor(paneID: UUID())
+        )
+
+        let didMove = await coordinator.noteFileMovedAndWait(
+            to: destination.url,
+            knownData: data
+        )
+
+        XCTAssertTrue(didMove)
+        XCTAssertEqual(coordinator.fileURL, destination.url.standardizedFileURL)
+        XCTAssertNotEqual(coordinator.state, .synchronizationPaused)
+        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        let preparation = try XCTUnwrap(executor.savePreparationRequests.last)
+        XCTAssertEqual(preparation.targetURL, destination.url.standardizedFileURL)
+        XCTAssertTrue(
+            executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        XCTAssertEqual(host.saveRequests.last?.targetURL, destination.url.standardizedFileURL)
+    }
+
+    func testFirstAttachmentPausesForPersistedLegacyRecoveryEvidence()
+        async throws {
+        let fixture = try TemporaryMarkdownFile(contents: "base\n")
+        defer { fixture.remove() }
+        let store = SessionRecoveryStore()
+        let identity = DocumentIdentity.make(url: fixture.url)
+        try store.add(
+            snapshot: DocumentSnapshot(
+                text: "recoverable\n",
+                format: .newDocument
+            ),
+            for: identity
+        )
+        let data = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(data)
+        let executor = ControllableCoordinatorEffectExecutor()
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: snapshot,
+            recoveryStore: store,
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: ManualSyncScheduler()
+        )
+        defer { coordinator.close() }
+
+        let didAttach = await coordinator.attachAndWait(
+            to: fixture.url,
+            knownData: data
+        )
+        XCTAssertTrue(didAttach)
+
+        XCTAssertEqual(coordinator.fileURL, fixture.url.standardizedFileURL)
+        XCTAssertEqual(coordinator.presentedState, .synchronizationPaused)
+        XCTAssertTrue(executor.savePreparationRequests.isEmpty)
+        XCTAssertEqual(store.latest(for: identity)?.snapshot.text, "recoverable\n")
+    }
+
+    func testSaveAsKeepsANewerLocalRevisionDirty() async throws {
+        let destination = try TemporaryMarkdownFile(contents: "captured\n")
+        defer { destination.remove() }
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
+        let initial = DocumentSnapshot(text: "before\n", format: .newDocument)
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: initial,
+            recoveryStore: SessionRecoveryStore(),
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
+        )
+        defer { coordinator.close() }
+        let host = TypedCoordinatorTestHost(fileURL: destination.url)
+        coordinator.delegate = host
+        coordinator.loadInitial(initial, data: Data("before\n".utf8), from: nil)
+        coordinator.sourceBuffer.replace(
+            with: "captured\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        let capturedRevision = coordinator.sourceBuffer.revision
+        let capturedSnapshot = coordinator.currentSnapshot
+        let capturedData = try TextFileCodec.encode(capturedSnapshot)
+        coordinator.sourceBuffer.replace(
+            with: "newer local\n",
+            origin: .localEditor(paneID: UUID())
+        )
+
+        try await coordinator.attachAfterSaveAs(
+            to: destination.url,
+            expectedData: capturedData,
+            expectedSnapshot: capturedSnapshot,
+            expectedSourceRevision: capturedRevision
+        )
+
+        XCTAssertEqual(coordinator.durableState?.snapshot, capturedSnapshot)
+        XCTAssertEqual(
+            coordinator.reducerState.durableBaseline?.sourceRevision,
+            capturedRevision
+        )
+        XCTAssertEqual(coordinator.sourceBuffer.revision.text, "newer local\n")
+        XCTAssertTrue(coordinator.hasLocalChanges)
+
+        guard case .debouncing = coordinator.reducerState.external else {
+            return XCTFail("Save As must verify the destination before writing newer local text.")
+        }
+        coordinator.advanceScheduledWork(by: .zero)
+        let externalRead = try XCTUnwrap(executor.externalReadRequests.last)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: destination.url,
+            data: capturedData
+        )
+        let observation = try TextFileCodec.externalReadObservation(
+            data: capturedData,
+            targetURL: destination.url,
+            identity: DocumentIdentity.make(url: destination.url),
+            fingerprint: fingerprint
+        )
+        XCTAssertTrue(
+            executor.finishExternalRead(
+                externalRead.token,
+                with: .finished(.unchanged(observation))
+            )
+        )
+        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        let preparation = try XCTUnwrap(executor.savePreparationRequests.last)
+        XCTAssertEqual(preparation.snapshot.text, "newer local\n")
+    }
+
+    func testInitialDurableStateSurvivesUntilAnExplicitAttachmentDecision()
+        throws {
+        let snapshot = DocumentSnapshot(text: "seed\n", format: .newDocument)
+        let data = Data("seed\n".utf8)
+        let initialDurableState = DurableFileState(
+            snapshot: snapshot,
+            fingerprint: FileFingerprint.make(data: data),
+            generation: 7
+        )
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: snapshot,
+            initialDurableState: initialDurableState,
+            recoveryStore: SessionRecoveryStore(),
+            fileMonitoringEnabled: false,
+            effectExecutor: ControllableCoordinatorEffectExecutor(),
+            manualScheduler: ManualSyncScheduler()
+        )
+        defer { coordinator.close() }
+
+        XCTAssertEqual(coordinator.durableState, initialDurableState)
+        coordinator.loadInitial(snapshot, data: data, from: nil)
+        XCTAssertNil(coordinator.durableState)
+    }
+
 }
 
 @MainActor
-private final class SuspensionGate {
-    private var isOpen = false
-    private var continuation: CheckedContinuation<Void, Never>?
-
-    func wait() async {
-        guard !isOpen else { return }
-        await withCheckedContinuation { continuation in
-            self.continuation = continuation
-        }
-    }
-
-    func open() {
-        guard !isOpen else { return }
-        isOpen = true
-        continuation?.resume()
-        continuation = nil
-    }
-}
-
-@MainActor
-private final class TestSyncDelegate: DocumentSyncCoordinatorDelegate {
+private final class TypedCoordinatorTestHost: DocumentSyncCoordinatorHost {
     let synchronizationFileURL: URL?
-    var onSave: ((PendingSaveToken) -> Void)?
+    private(set) var saveRequests: [DocumentSyncSaveCommitRequest] = []
+    private(set) var closeResolutions: [DocumentSyncCloseResolution] = []
     private(set) var acceptedExternalChangeCount = 0
 
-    init(fileURL: URL) {
+    init(fileURL: URL?) {
         synchronizationFileURL = fileURL
     }
 
     func syncCoordinator(
         _ coordinator: DocumentSyncCoordinator,
-        requestSave token: PendingSaveToken
+        requestSave request: DocumentSyncSaveCommitRequest
     ) {
-        onSave?(token)
+        saveRequests.append(request)
+    }
+
+    func syncCoordinator(
+        _ coordinator: DocumentSyncCoordinator,
+        resolveClose resolution: DocumentSyncCloseResolution
+    ) {
+        closeResolutions.append(resolution)
     }
 
     func syncCoordinator(
@@ -1479,6 +2178,164 @@ private final class TestSyncDelegate: DocumentSyncCoordinatorDelegate {
         hasLocalChanges: Bool
     ) {
         acceptedExternalChangeCount += 1
+    }
+}
+
+@MainActor
+private final class ControllableCoordinatorEffectExecutor:
+    DocumentSyncCoordinatorEffectExecuting {
+    private(set) var savePreparationRequests:
+        [DocumentSyncSavePreparationRequest] = []
+    private(set) var externalReadRequests: [DocumentSyncExternalReadRequest] = []
+    private(set) var mergeRequests: [DocumentSyncMergeRequest] = []
+    private(set) var reconciliationRequests:
+        [DocumentSyncCommitReconciliationRequest] = []
+
+    private var savePreparationCompletions: [
+        SyncEffectToken: @MainActor (DocumentSyncSavePreparationExecution) -> Void
+    ] = [:]
+    private var externalReadCompletions: [
+        SyncEffectToken: @MainActor (DocumentSyncExternalReadExecution) -> Void
+    ] = [:]
+    private var mergeCompletions: [
+        SyncEffectToken: @MainActor (DocumentSyncMergeExecution) -> Void
+    ] = [:]
+    private var reconciliationCompletions: [
+        SyncEffectToken: @MainActor (DocumentSyncCommitReconciliationResult) -> Void
+    ] = [:]
+
+    func prepareSave(
+        _ request: DocumentSyncSavePreparationRequest,
+        completion: @escaping @MainActor (DocumentSyncSavePreparationExecution) -> Void
+    ) {
+        savePreparationRequests.append(request)
+        savePreparationCompletions[request.token] = completion
+    }
+
+    func readExternal(
+        _ request: DocumentSyncExternalReadRequest,
+        completion: @escaping @MainActor (DocumentSyncExternalReadExecution) -> Void
+    ) {
+        externalReadRequests.append(request)
+        externalReadCompletions[request.token] = completion
+    }
+
+    func merge(
+        _ request: DocumentSyncMergeRequest,
+        completion: @escaping @MainActor (DocumentSyncMergeExecution) -> Void
+    ) {
+        mergeRequests.append(request)
+        mergeCompletions[request.token] = completion
+    }
+
+    func reconcileCommit(
+        _ request: DocumentSyncCommitReconciliationRequest,
+        completion: @escaping @MainActor (DocumentSyncCommitReconciliationResult) -> Void
+    ) {
+        reconciliationRequests.append(request)
+        reconciliationCompletions[request.token] = completion
+    }
+
+    @discardableResult
+    func finishSavePreparation(
+        _ token: SyncEffectToken,
+        with result: DocumentSyncSavePreparationExecution
+    ) -> Bool {
+        guard let completion = savePreparationCompletions.removeValue(forKey: token) else {
+            return false
+        }
+        completion(result)
+        return true
+    }
+
+    @discardableResult
+    func finishExternalRead(
+        _ token: SyncEffectToken,
+        with result: DocumentSyncExternalReadExecution
+    ) -> Bool {
+        guard let completion = externalReadCompletions.removeValue(forKey: token) else {
+            return false
+        }
+        completion(result)
+        return true
+    }
+
+    @discardableResult
+    func finishMerge(
+        _ token: SyncEffectToken,
+        with result: DocumentSyncMergeExecution
+    ) -> Bool {
+        guard let completion = mergeCompletions.removeValue(forKey: token) else {
+            return false
+        }
+        completion(result)
+        return true
+    }
+
+    @discardableResult
+    func finishReconciliation(
+        _ token: SyncEffectToken,
+        with result: DocumentSyncCommitReconciliationResult
+    ) -> Bool {
+        guard let completion = reconciliationCompletions.removeValue(forKey: token) else {
+            return false
+        }
+        completion(result)
+        return true
+    }
+}
+
+private func makePendingSave(
+    from request: DocumentSyncSavePreparationRequest
+) throws -> PendingSaveToken {
+    PendingSaveToken(
+        generation: request.commitGeneration,
+        sourceRevision: request.sourceRevision,
+        preparedPayload: try TextFileCodec.prepareSavePayload(
+            for: request.snapshot
+        ),
+        expectedDurableState: request.expectedBaseline?.asDurableFileState,
+        targetURL: request.targetURL
+    )
+}
+
+@MainActor
+private final class DeterministicCoordinatorFixture {
+    let scheduler: ManualSyncScheduler
+    let executor: ControllableCoordinatorEffectExecutor
+    let host: TypedCoordinatorTestHost
+    let coordinator: DocumentSyncCoordinator
+
+    init(
+        snapshot: DocumentSnapshot,
+        data: Data,
+        url: URL,
+        recoveryStore: SessionRecoveryStore = SessionRecoveryStore()
+    ) {
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
+        let host = TypedCoordinatorTestHost(fileURL: url)
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: snapshot,
+            recoveryStore: recoveryStore,
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
+        )
+        coordinator.delegate = host
+        coordinator.loadInitial(snapshot, data: data, from: url)
+        self.scheduler = scheduler
+        self.executor = executor
+        self.host = host
+        self.coordinator = coordinator
+    }
+
+    func fireLocalSave() {
+        coordinator.advanceScheduledWork(by: .milliseconds(100))
+    }
+
+    func fireExternalRead() {
+        coordinator.advanceScheduledWork(by: .zero)
     }
 }
 

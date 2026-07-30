@@ -220,8 +220,9 @@ final class MarkdownPresentationTests: XCTestCase {
         window.layoutIfNeeded()
 
         try await waitUntil {
-            guard let textView = self.descendantTextViews(in: hostingView).first
-            else {
+            guard let textView = MarkdownEngineCompatibility.nativeTextView(
+                in: hostingView
+            ) else {
                 return false
             }
             return textView.string == "# Heading\n"
@@ -264,8 +265,9 @@ final class MarkdownPresentationTests: XCTestCase {
         window.layoutIfNeeded()
 
         try await waitUntil {
-            guard let textView = self.descendantTextViews(in: hostingView).first
-            else {
+            guard let textView = MarkdownEngineCompatibility.nativeTextView(
+                in: hostingView
+            ) else {
                 return false
             }
             return textView.string == source
@@ -283,8 +285,9 @@ final class MarkdownPresentationTests: XCTestCase {
         hostingView.layoutSubtreeIfNeeded()
 
         try await waitUntil {
-            guard let textView = self.descendantTextViews(in: hostingView).first
-            else {
+            guard let textView = MarkdownEngineCompatibility.nativeTextView(
+                in: hostingView
+            ) else {
                 return false
             }
             return textView.string == "# Heading\n"
@@ -306,12 +309,5 @@ final class MarkdownPresentationTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTFail("Timed out waiting for frontmatter presentation.")
-    }
-
-    private func descendantTextViews(in view: NSView) -> [NSTextView] {
-        if let textView = view as? NSTextView {
-            return [textView]
-        }
-        return view.subviews.flatMap(descendantTextViews)
     }
 }

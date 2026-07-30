@@ -1,36 +1,6 @@
 import Combine
 import Foundation
 
-private enum ExternalReconciliation: Sendable {
-    case unchanged(
-        fingerprint: FileFingerprint,
-        documentIdentity: DocumentIdentity
-    )
-    case changed(
-        fingerprint: FileFingerprint,
-        documentIdentity: DocumentIdentity,
-        snapshot: DocumentSnapshot,
-        mergeResult: ThreeWayMergeResult?
-    )
-}
-
-private struct PendingRecoveryMigration: Equatable {
-    let source: DocumentIdentity
-    let destination: DocumentIdentity
-}
-
-private struct VerifiedAttachment: Sendable {
-    let data: Data
-    let matchesExpectedData: Bool
-}
-
-private enum FailedSynchronizationOperation {
-    case localWrite
-    case externalRead
-    case monitoring
-    case destinationRequiresSaveAs
-}
-
 struct DocumentSynchronizationStatusSnapshot: Equatable {
     let presentedState: SynchronizationState?
     let failureRequiresSaveAs: Bool
@@ -47,93 +17,57 @@ struct DocumentSynchronizationStatusSnapshot: Equatable {
     )
 }
 
-@MainActor
-protocol DocumentSyncCoordinatorDelegate: AnyObject {
-    var synchronizationFileURL: URL? { get }
+private struct VerifiedCoordinatorAttachment: Sendable {
+    let targetURL: URL
+    let identity: DocumentIdentity
+    let data: Data
+    let sourceRevision: SourceRevision
+}
 
-    func syncCoordinator(
-        _ coordinator: DocumentSyncCoordinator,
-        requestSave token: PendingSaveToken
-    )
-
-    func syncCoordinator(
-        _ coordinator: DocumentSyncCoordinator,
-        acceptedExternalFileAt url: URL,
-        hasLocalChanges: Bool
-    )
+private enum DocumentSyncCoordinatorAttachmentError: Error {
+    case invalidSaveAsEvidence
 }
 
 @MainActor
 final class DocumentSyncCoordinator: ObservableObject {
-    static let localWriteDelay: Duration = .milliseconds(100)
+    static let localWriteDelay = DocumentSyncReducer.localSaveDelay
 
-    private(set) var state: SynchronizationState = .idle {
-        didSet {
-            if let persistentState = Self.persistentPresentedState(
-                for: state
-            ) {
-                if presentedStateValue != persistentState {
-                    presentedStateValue = persistentState
-                }
-            } else if state == .idle, presentedStateValue != nil {
-                presentedStateValue = nil
-            }
-            refreshStatusSnapshot()
-        }
-    }
-    private var presentedStateValue: SynchronizationState?
+    private(set) var state: SynchronizationState = .idle
     @Published private(set) var statusSnapshot:
         DocumentSynchronizationStatusSnapshot = .empty
     @Published private(set) var format: TextFileFormat
     private(set) var durableState: DurableFileState?
-    /// Source revision represented by `durableState`. Keeping this identity
-    /// avoids comparing the entire document on every autosave/status check.
-    private var durableSourceRevision: UInt64?
     @Published private(set) var fileURL: URL?
 
     let sourceBuffer: MarkdownSourceBuffer
     let bridge: SaveTransactionBridge
     weak var delegate: DocumentSyncCoordinatorDelegate?
 
-    private let merger = ThreeWayTextMerger()
+    /// The reducer value is the sole owner of synchronization decisions.
+    private(set) var reducerState: DocumentSyncState
+
     private let recoveryStore: SessionRecoveryStore
+    /// `DurableFileState` has no attachment identity, so it can only remain a
+    /// compatibility projection until a verified file attachment replaces it.
+    private var unattachedDurableState: DurableFileState?
     private let fileMonitoringEnabled: Bool
+    private let effectExecutor: DocumentSyncCoordinatorEffectExecuting
+    private let manualScheduler: ManualSyncScheduler?
     private let savePreparationHook: (@MainActor () async -> Void)?
     private let externalReadHook: (@MainActor (UInt64) async -> Void)?
-    private var documentIdentity: DocumentIdentity? {
-        didSet { refreshStatusSnapshot() }
+    private lazy var scheduler = SyncScheduler { [weak self] deadline in
+        self?.dispatch(.deadlineFired(deadline))
     }
-    private var nextGeneration: UInt64 = 1
-    private var nextPreparationGeneration: UInt64 = 1
-    private var activePreparationGeneration: UInt64?
-    private var nextExternalReadGeneration: UInt64 = 1
-    private var activeExternalReadGeneration: UInt64?
+
     private var sourceObservation: UUID?
-    private var localWriteTask: Task<Void, Never>?
-    private var localPreparationTask: Task<Void, Never>?
-    private var externalReadTask: Task<Void, Never>?
-    private var externalReadPending = false
-    private var attachmentVerificationInProgress = false
-    private var monitor: DirectoryFileMonitor?
-    private var saveInFlight: PendingSaveToken?
-    private var externalCheckPending = false
-    private var hasRecoverableLocalRevision = false {
-        didSet { refreshStatusSnapshot() }
-    }
-    private var synchronizationPauseIsLatched = false
-    private var pendingRecoveryMigration: PendingRecoveryMigration? {
-        didSet { refreshStatusSnapshot() }
-    }
-    private var pendingRecoveryRemoval: RecoveryEntry?
-    private var pendingRecoveryMinimumRevision: UInt64?
-    private var rawRecoveryRemovalIdentity: DocumentIdentity?
-    private var isClosed = false
-    private var stateAfterNextSuccessfulSave: SynchronizationState?
-    private var failedOperation: FailedSynchronizationOperation? {
-        didSet { refreshStatusSnapshot() }
-    }
-    private var saveAsRequiredFailureMessage: String?
-    private var monitorFailureMessage: String?
+    private var attachmentTask: Task<Void, Never>?
+    private var attachmentRequestID: UUID?
+    private var attachmentCompletions: [UUID: (@MainActor (Bool) -> Void)] = [:]
+    private var monitors: [SyncEffectToken: DirectoryFileMonitor] = [:]
+    private var queuedEvents: [DocumentSyncEvent] = []
+    private var isDispatching = false
+    private var isApplyingReducerSource = false
+    private var isTornDown = false
     private var flushWaiters: [(@MainActor (Bool) -> Void)] = []
 
     init(
@@ -143,31 +77,42 @@ final class DocumentSyncCoordinator: ObservableObject {
         recoveryStore: SessionRecoveryStore = .shared,
         fileMonitoringEnabled: Bool = true,
         savePreparationHook: (@MainActor () async -> Void)? = nil,
-        externalReadHook: (@MainActor (UInt64) async -> Void)? = nil
+        externalReadHook: (@MainActor (UInt64) async -> Void)? = nil,
+        effectExecutor: DocumentSyncCoordinatorEffectExecuting =
+            DocumentSyncDefaultEffectExecutor(),
+        manualScheduler: ManualSyncScheduler? = nil
     ) {
         sourceBuffer = MarkdownSourceBuffer(snapshot: snapshot)
         format = snapshot.format
         durableState = initialDurableState
-        durableSourceRevision =
-            initialDurableState?.snapshot == snapshot ? 0 : nil
+        unattachedDurableState = initialDurableState
         self.bridge = bridge
         self.recoveryStore = recoveryStore
         self.fileMonitoringEnabled = fileMonitoringEnabled
+        self.effectExecutor = effectExecutor
+        self.manualScheduler = manualScheduler
         self.savePreparationHook = savePreparationHook
         self.externalReadHook = externalReadHook
+        reducerState = DocumentSyncState(
+            source: sourceBuffer.revision,
+            format: snapshot.format,
+            // The legacy store cannot mint frozen recovery receipts. Normal
+            // synchronization therefore starts ready, while every recovery
+            // mutation remains fail-closed until P1 supplies the actor API.
+            recoveryAccess: .ready(generation: 0)
+        )
         sourceObservation = sourceBuffer.observe { [weak self] revision, origin in
             self?.sourceDidChange(revision, origin: origin)
         }
+        publishCompatibility(from: reducerState, event: nil)
     }
 
     var currentSnapshot: DocumentSnapshot {
-        DocumentSnapshot(text: sourceBuffer.revision.text, format: format)
+        reducerState.snapshot
     }
 
     var hasLocalChanges: Bool {
-        guard let durableState else { return true }
-        return durableSourceRevision != sourceBuffer.revision.number
-            || durableState.snapshot.format != format
+        reducerState.local.isDirty
     }
 
     var presentedState: SynchronizationState? {
@@ -190,893 +135,906 @@ final class DocumentSyncCoordinator: ObservableObject {
         statusSnapshot.failureRequiresSaveAs
     }
 
+    /// Main-actor event serialization boundary. Effects can enqueue a newer
+    /// event synchronously, but only this loop applies reducer transitions.
+    func dispatch(_ event: DocumentSyncEvent) {
+        guard !isTornDown else { return }
+        queuedEvents.append(event)
+        guard !isDispatching else { return }
+
+        isDispatching = true
+        defer { isDispatching = false }
+        while !queuedEvents.isEmpty {
+            let nextEvent = queuedEvents.removeFirst()
+            let previous = reducerState
+            let transition = DocumentSyncReducer.reduce(
+                previous,
+                event: nextEvent
+            )
+            reducerState = transition.state
+            publishCompatibility(from: previous, event: nextEvent)
+            for effect in transition.effects {
+                execute(effect)
+            }
+            resolveFlushWaitersIfPossible()
+        }
+    }
+
     func loadInitial(_ snapshot: DocumentSnapshot, data: Data, from url: URL?) {
-        format = snapshot.format
-        sourceBuffer.replace(with: snapshot.text, origin: .initialLoad)
-        if let url {
-            attach(
-                to: url,
-                knownData: data,
-                knownSnapshot: snapshot
+        cancelPendingAttachmentRequest()
+        replaceSource(snapshot.text, origin: .initialLoad)
+        guard let url else {
+            reducerState = DocumentSyncState(
+                lifetime: reducerState.lifetime,
+                source: sourceBuffer.revision,
+                format: snapshot.format,
+                recoveryAccess: .ready(generation: 0),
+                nextAttempt: reducerState.nextAttempt,
+                nextCommitGeneration: reducerState.nextCommitGeneration
             )
-        } else {
-            durableState = DurableFileState(
-                snapshot: snapshot,
-                fingerprint: .make(data: data),
-                generation: 0
-            )
-            durableSourceRevision = sourceBuffer.revision.number
+            unattachedDurableState = nil
+            publishCompatibility(from: reducerState, event: nil)
+            dispatch(.started)
+            return
         }
-        if url == nil {
-            state = .idle
-        } else {
-            settleState(default: .idle)
-        }
+
+        installInitialAttachment(
+            targetURL: url.standardizedFileURL,
+            data: data,
+            sourceRevision: sourceBuffer.revision,
+            initialFormat: snapshot.format
+        )
     }
 
     func attach(
         to url: URL,
         knownData: Data? = nil,
-        knownSnapshot: DocumentSnapshot? = nil
+        knownSnapshot: DocumentSnapshot? = nil,
+        completion: (@MainActor (Bool) -> Void)? = nil
     ) {
-        guard !isClosed else { return }
-        let previousURL = fileURL
-        let previousIdentity = documentIdentity
-        fileURL = url.standardizedFileURL
-        let monitorNeedsRestart = previousURL != fileURL || monitor == nil
-        if previousURL != fileURL,
-           failedOperation == .destinationRequiresSaveAs {
-            failedOperation = nil
-            saveAsRequiredFailureMessage = nil
-        }
-        let data = knownData ?? (try? Data(contentsOf: url, options: [.mappedIfSafe]))
-        let resolvedIdentity: DocumentIdentity
-        if let data, let fingerprint = try? SafeFileCommitter.fingerprint(
-            for: url,
-            data: data
-        ) {
-            let diskSnapshot = knownSnapshot
-                ?? (try? TextFileCodec.decode(data))
-                ?? currentSnapshot
-            durableState = DurableFileState(
-                snapshot: diskSnapshot,
-                fingerprint: fingerprint,
-                generation: durableState?.generation ?? 0
+        _ = knownSnapshot
+        guard !isTornDown else { return }
+        let targetURL = url.standardizedFileURL
+        let requestID = beginAttachmentRequest(completion: completion)
+
+        let capturedSource = reducerState.source
+        if let knownData {
+            completeAttachment(
+                requestID: requestID,
+                event: .attach,
+                targetURL: targetURL,
+                data: knownData,
+                sourceRevision: capturedSource
             )
-            durableSourceRevision =
-                currentSnapshot == diskSnapshot
-                    ? sourceBuffer.revision.number
-                    : nil
-            resolvedIdentity = .make(
-                url: url,
-                resourceIdentifier: fingerprint.resourceIdentifier
-            )
-        } else {
-            resolvedIdentity = .make(url: url)
+            return
         }
-        if let previousIdentity,
-           previousIdentity != resolvedIdentity {
-            do {
-                try recoveryStore.moveEntries(
-                    from: previousIdentity,
-                    to: resolvedIdentity
+
+        attachmentTask = Task { [weak self] in
+            let result = await Task.detached(priority: .utility) {
+                try Self.readAttachment(
+                    at: targetURL,
+                    sourceRevision: capturedSource
                 )
-                documentIdentity = resolvedIdentity
-                pendingRecoveryMigration = nil
-                if rawRecoveryRemovalIdentity == previousIdentity {
-                    rawRecoveryRemovalIdentity = resolvedIdentity
-                }
-            } catch {
-                documentIdentity = previousIdentity
-                pendingRecoveryMigration = PendingRecoveryMigration(
-                    source: previousIdentity,
-                    destination: resolvedIdentity
+            }.result
+            guard !Task.isCancelled, let self else { return }
+            switch result {
+            case .success(let attachment):
+                self.completeAttachment(
+                    requestID: requestID,
+                    event: .attach,
+                    targetURL: attachment.targetURL,
+                    data: attachment.data,
+                    sourceRevision: attachment.sourceRevision
                 )
-                state = .synchronizationPaused
+            case .failure:
+                self.completeAttachment(
+                    requestID: requestID,
+                    event: .attach,
+                    targetURL: targetURL,
+                    data: nil,
+                    sourceRevision: capturedSource
+                )
             }
-        } else {
-            documentIdentity = resolvedIdentity
-            pendingRecoveryMigration = nil
         }
-        refreshRecoveryState()
-        if monitorNeedsRestart {
-            restartMonitor()
-        }
-        if hasLocalChanges {
-            scheduleLocalWrite()
+    }
+
+    /// Attachment reads happen off the main actor. Consumers that need the
+    /// verified attachment state must await this boundary instead of observing
+    /// the legacy fire-and-forget call synchronously.
+    func attachAndWait(
+        to url: URL,
+        knownData: Data? = nil,
+        knownSnapshot: DocumentSnapshot? = nil
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            attach(
+                to: url,
+                knownData: knownData,
+                knownSnapshot: knownSnapshot
+            ) { didAttach in
+                continuation.resume(returning: didAttach)
+            }
         }
     }
 
     func attachAfterSaveAs(
         to url: URL,
         expectedData: Data,
-        expectedSnapshot: DocumentSnapshot
+        expectedSnapshot: DocumentSnapshot,
+        expectedSourceRevision: SourceRevision? = nil
     ) async throws {
-        guard !isClosed else { return }
+        guard !isTornDown else { return }
         let targetURL = url.standardizedFileURL
-
-        // Monitor before verifying the bytes so a replacement racing the read
-        // cannot fall into a gap between verification and event observation.
-        attachmentVerificationInProgress = true
-        defer {
-            attachmentVerificationInProgress = false
-            if externalReadPending, externalReadTask == nil {
-                externalReadPending = false
-                scheduleExternalRead()
-            }
+        guard try TextFileCodec.decode(expectedData) == expectedSnapshot else {
+            throw DocumentSyncCoordinatorAttachmentError.invalidSaveAsEvidence
         }
-        updateFileURL(targetURL)
-        let verified = try await Task.detached(priority: .utility) {
-            let data = try Data(
-                contentsOf: targetURL,
-                options: [.mappedIfSafe]
-            )
-            return VerifiedAttachment(
-                data: data,
-                matchesExpectedData: data == expectedData
+        let capturedSource = reducerState.source
+        let verification = try await Task.detached(priority: .utility) {
+            try Self.readAttachment(
+                at: targetURL,
+                sourceRevision: capturedSource
             )
         }.value
-        guard !isClosed, fileURL == targetURL else { return }
+        guard !isTornDown else { return }
 
-        attach(
-            to: targetURL,
-            knownData: expectedData,
-            knownSnapshot: expectedSnapshot
+        let requestID = beginAttachmentRequest(completion: nil)
+        completeAttachment(
+            requestID: requestID,
+            event: .saveAsAttached,
+            targetURL: targetURL,
+            data: expectedData,
+            sourceRevision: capturedSource,
+            baselineSourceRevision: expectedSourceRevision
         )
-        guard !verified.matchesExpectedData else {
-            settleState(default: .idle)
-            return
-        }
+        guard verification.data != expectedData else { return }
 
-        // The Save As bytes became the merge base. Reconcile the replacement
-        // observed on disk before reporting save completion, so it is never
-        // overwritten as though it were an ordinary newer local revision.
-        localWriteTask?.cancel()
-        localWriteTask = nil
-        let generation = nextExternalReadGeneration
-        nextExternalReadGeneration &+= 1
-        activeExternalReadGeneration = generation
-        await reconcileExternalData(
-            verified.data,
-            from: targetURL,
-            generation: generation
+        applyVerifiedSaveAsReplacement(
+            data: verification.data,
+            targetURL: targetURL,
+            identity: verification.identity
         )
-        if case let .failed(message) = state {
-            throw CocoaError(
-                .fileReadUnknown,
-                userInfo: [NSLocalizedDescriptionKey: message]
-            )
-        }
     }
 
     func updateFileURL(_ url: URL) {
-        fileURL = url.standardizedFileURL
-        restartMonitor()
+        attach(to: url)
+    }
+
+    func noteFileMoved(
+        to newURL: URL,
+        knownData: Data? = nil,
+        completion: (@MainActor (Bool) -> Void)? = nil
+    ) {
+        guard !isTornDown else { return }
+        let targetURL = newURL.standardizedFileURL
+        let requestID = beginAttachmentRequest(completion: completion)
+        let capturedSource = reducerState.source
+        if let knownData {
+            completeAttachment(
+                requestID: requestID,
+                event: .fileMoved,
+                targetURL: targetURL,
+                data: knownData,
+                sourceRevision: capturedSource
+            )
+            return
+        }
+
+        attachmentTask = Task { [weak self] in
+            let result = await Task.detached(priority: .utility) {
+                try Self.readAttachment(
+                    at: targetURL,
+                    sourceRevision: capturedSource
+                )
+            }.result
+            guard !Task.isCancelled, let self else { return }
+            switch result {
+            case .success(let attachment):
+                self.completeAttachment(
+                    requestID: requestID,
+                    event: .fileMoved,
+                    targetURL: attachment.targetURL,
+                    data: attachment.data,
+                    sourceRevision: attachment.sourceRevision
+                )
+            case .failure:
+                self.completeAttachment(
+                    requestID: requestID,
+                    event: .fileMoved,
+                    targetURL: targetURL,
+                    data: nil,
+                    sourceRevision: capturedSource
+                )
+            }
+        }
+    }
+
+    /// The file-move counterpart to `attachAndWait`. It gives hosts that must
+    /// preserve the verified move state an explicit boundary instead of
+    /// observing a fire-and-forget filesystem task.
+    func noteFileMovedAndWait(
+        to newURL: URL,
+        knownData: Data? = nil
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            noteFileMoved(to: newURL, knownData: knownData) { didMove in
+                continuation.resume(returning: didMove)
+            }
+        }
+    }
+
+    func noteCoordinatedExternalChange() {
+        guard let monitorToken = reducerState.activeTokens[.monitor] else {
+            return
+        }
+        dispatch(.monitorSignaled(monitorToken))
     }
 
     func flushNow(completion: (@MainActor (Bool) -> Void)? = nil) {
         if let completion {
             flushWaiters.append(completion)
         }
-        guard fileURL != nil,
-              !synchronizationIsPaused,
-              failedOperation != .destinationRequiresSaveAs,
-              !isClosed else {
+        guard reducerState.fileAttachment != nil, !isTornDown else {
             resolveFlushWaiters(succeeded: false)
             return
         }
-        if isFullySynchronized {
-            resolveFlushWaiters(succeeded: true)
-            return
-        }
-        localWriteTask?.cancel()
-        localWriteTask = nil
-        beginSaveIfNeeded()
+        dispatch(.saveRequested)
+        resolveFlushWaitersIfPossible()
     }
 
-    func noteCoordinatedExternalChange() {
-        scheduleExternalRead()
+    func restoreLatestRecovery() {
+        dispatch(.restoreLocalRecovery)
     }
 
-    func noteFileMoved(to newURL: URL) {
-        let oldIdentity = documentIdentity
-        updateFileURL(newURL)
-        let newIdentity = DocumentIdentity.make(url: newURL)
-        if let oldIdentity, oldIdentity != newIdentity {
-            do {
-                try recoveryStore.moveEntries(
-                    from: oldIdentity,
-                    to: newIdentity
-                )
-                documentIdentity = newIdentity
-                pendingRecoveryMigration = nil
-                if rawRecoveryRemovalIdentity == oldIdentity {
-                    rawRecoveryRemovalIdentity = newIdentity
-                }
-            } catch {
-                pendingRecoveryMigration = PendingRecoveryMigration(
-                    source: oldIdentity,
-                    destination: newIdentity
-                )
-                refreshRecoveryState()
-                state = .synchronizationPaused
-                return
-            }
-        } else {
-            documentIdentity = newIdentity
-            pendingRecoveryMigration = nil
-        }
-        refreshRecoveryState()
-        settleState(default: .idle)
-        scheduleExternalRead()
+    func resumeSynchronization() {
+        dispatch(.discardRawRecovery)
+    }
+
+    func retryRecoveryMigration() {
+        dispatch(.retry)
+    }
+
+    func retrySynchronization() {
+        dispatch(.retry)
+    }
+
+    func requestClose() {
+        dispatch(.requestClose)
+    }
+
+    func completeClose(token: SyncEffectToken, didCommit: Bool) {
+        dispatch(didCommit ? .closeCommitted(token) : .closeCancelled(token))
     }
 
     @discardableResult
-    func handleSaveCompletion(generation: UInt64, error: Error?) -> Bool {
-        guard let token = saveInFlight, token.generation == generation else {
-            return false
-        }
-        saveInFlight = nil
-
+    func handleSaveCompletion(
+        token: SyncEffectToken,
+        error: Error?
+    ) -> Bool {
         if let error {
-            bridge.cancel(generation: generation)
-            state = .failed(error.localizedDescription)
+            bridge.cancel(token: token)
             if let commitError = error as? SafeFileCommitter.CommitError {
                 switch commitError {
                 case .atomicSwapUnavailable:
-                    failedOperation = .destinationRequiresSaveAs
-                    saveAsRequiredFailureMessage =
-                        error.localizedDescription
-                case .targetChangedBeforeCommit, .targetMissingBeforeCommit:
-                    failedOperation = .externalRead
+                    dispatch(
+                        .commitFailed(
+                            token: token,
+                            disposition: .destinationRequiresSaveAs
+                        )
+                    )
                 case .invalidPreparedPayload:
-                    failedOperation = .localWrite
+                    dispatch(.commitFailed(token: token, disposition: .notStarted))
+                case .targetMissingBeforeCommit:
+                    dispatch(.commitFailed(token: token, disposition: .notStarted))
+                    noteCoordinatedExternalChange()
+                case .targetChangedBeforeCommit:
+                    dispatch(.commitFailed(token: token, disposition: .notStarted))
+                    // The committer proved no replacement began, but it also
+                    // proved that the expected durable preimage changed.
+                    // Request a fresh immutable observation before any retry.
+                    noteCoordinatedExternalChange()
                 }
             } else {
-                failedOperation = .localWrite
+                dispatch(.operationFailed(token: token, failure: .localSave))
             }
-            if failedOperation == .externalRead {
-                externalCheckPending = false
-                scheduleExternalRead()
-            } else {
-                finishDeferredExternalCheck()
-            }
-            resolveFlushWaiters(succeeded: false)
-            return false
+            return isFullySynchronized
         }
 
         do {
-            let result = try bridge.finish(generation: generation)
-            restartMonitor()
-            let preimageFingerprint = result.displacedPreimage?.fingerprint
-            let expected = token.expectedDurableState?.fingerprint
-            let unexpectedPreimage = result.displacedPreimage != nil
-                && (
-                    expected == nil
-                        || preimageFingerprint?.contentDigest
-                            != expected?.contentDigest
-                )
-
-            if unexpectedPreimage,
-               let preimage = result.displacedPreimage?.data {
-                reconcileDisplacedExternalData(
-                    preimage,
-                    committedToken: token,
-                    result: result
-                )
-            } else {
-                durableState = DurableFileState(
-                    snapshot: token.snapshot,
-                    fingerprint: result.committedFingerprint,
-                    generation: generation
-                )
-                durableSourceRevision = token.sourceRevision.number
-                if let artifact = result.recoveryArtifact {
-                    try CommitRecoveryJournalStore.acknowledge(artifact)
-                }
-                resolveCommittedRecovery(for: token)
-                let successfulState = stateAfterNextSuccessfulSave
-                    ?? (result.safety == .atomicSwap ? .idle : .limitedSyncSafety)
-                settleState(default: successfulState)
-                stateAfterNextSuccessfulSave = nil
-                if sourceBuffer.revision.number != token.sourceRevision.number {
-                    scheduleLocalWrite()
-                }
-            }
+            let result = try bridge.finish(token: token)
+            dispatch(.saveFinished(token: token, completion: .init(result: result)))
         } catch {
-            state = .failed(error.localizedDescription)
-            failedOperation = .externalRead
-            resolveFlushWaiters(succeeded: false)
-        }
-        finishDeferredExternalCheck()
-        if isFullySynchronized {
-            resolveFlushWaiters(succeeded: true)
+            dispatch(.operationFailed(token: token, failure: .localSave))
         }
         return isFullySynchronized
     }
 
-    func restoreLatestRecovery() {
-        guard resolvePendingRecoveryMigration() else { return }
-        guard let identity = documentIdentity,
-              let entry = recoveryStore.latest(for: identity) else {
-            return
+    /// Legacy delegate completion remains only for existing integrations. It
+    /// resolves the immutable bridge request first, then delegates validation
+    /// to the full token path above.
+    @discardableResult
+    func handleSaveCompletion(generation: UInt64, error: Error?) -> Bool {
+        guard let request = try? bridge.currentCommitRequest(),
+              request.pendingSave.generation == generation else {
+            return false
         }
-        pendingRecoveryRemoval = entry
-        if !recoveryStore.rawRecoveryEntries(for: identity).isEmpty {
-            rawRecoveryRemovalIdentity = identity
-        }
-        synchronizationPauseIsLatched = false
-        format = entry.snapshot.format
-        sourceBuffer.replace(with: entry.snapshot.text, origin: .recovery)
-        durableSourceRevision = nil
-        pendingRecoveryMinimumRevision = sourceBuffer.revision.number
-        scheduleLocalWrite()
+        return handleSaveCompletion(token: request.token, error: error)
     }
 
-    func resumeSynchronization() {
-        guard synchronizationIsPaused,
-              resolvePendingRecoveryMigration() else {
-            return
-        }
-        if let documentIdentity {
-            recoveryStore.removeRawRecoveryEntries(for: documentIdentity)
-        }
-        synchronizationPauseIsLatched = false
-        rawRecoveryRemovalIdentity = nil
-        settleState(default: .idle)
-        if hasLocalChanges {
-            scheduleLocalWrite()
-        } else {
-            scheduleExternalRead()
-        }
-    }
-
-    func retryRecoveryMigration() {
-        guard pendingRecoveryMigration != nil,
-              resolvePendingRecoveryMigration() else {
-            return
-        }
-        settleState(default: .idle)
-        if hasLocalChanges {
-            scheduleLocalWrite()
-        } else {
-            scheduleExternalRead()
-        }
-    }
-
-    func retrySynchronization() {
-        switch failedOperation {
-        case .externalRead:
-            scheduleExternalRead()
-        case .monitoring:
-            restartMonitor()
-            scheduleExternalRead()
-        case .localWrite:
-            flushNow()
-        case .destinationRequiresSaveAs:
-            break
-        case nil:
-            if hasLocalChanges {
-                flushNow()
-            } else {
-                scheduleExternalRead()
-            }
+    func advanceScheduledWork(by duration: Duration) {
+        guard let manualScheduler else { return }
+        for deadline in manualScheduler.advance(by: duration) {
+            dispatch(.deadlineFired(deadline))
         }
     }
 
     func close() {
-        guard !isClosed else { return }
-        isClosed = true
-        localWriteTask?.cancel()
-        localPreparationTask?.cancel()
-        localPreparationTask = nil
-        activePreparationGeneration = nil
-        externalReadTask?.cancel()
-        externalReadTask = nil
-        externalReadPending = false
-        activeExternalReadGeneration = nil
-        monitor?.cancel()
-        monitor = nil
-        resolveFlushWaiters(succeeded: false)
-        if let sourceObservation {
-            sourceBuffer.removeObserver(sourceObservation)
+        guard !isTornDown else { return }
+        if case .closing(let attempt) = reducerState.lifecycle,
+           attempt.resolution == .allowManagedClose
+                || attempt.resolution == .deferToNativeUntitledReview {
+            dispatch(.closed(attempt.token))
         }
-        sourceObservation = nil
-    }
-
-    private func finishDeferredExternalCheck() {
-        guard externalCheckPending else { return }
-        externalCheckPending = false
-        scheduleExternalRead()
+        tearDown()
     }
 
     private func sourceDidChange(
         _ revision: SourceRevision,
         origin: DocumentChangeOrigin
     ) {
-        guard !isClosed else { return }
-        let hasFinalNewline = revision.text.utf16.last == 0x000A
-        if format.hasFinalNewline != hasFinalNewline {
-            format.hasFinalNewline = hasFinalNewline
+        guard !isTornDown, !isApplyingReducerSource else { return }
+        var updatedFormat = reducerState.format
+        updatedFormat.hasFinalNewline = revision.text.utf16.last == 0x000A
+        dispatch(.sourceChanged(revision, format: updatedFormat))
+        if reducerState.fileAttachment == nil,
+           let hostURL = delegate?.synchronizationFileURL {
+            attach(to: hostURL)
         }
-        switch origin {
-        case .localEditor, .undoRedo, .merge, .recovery:
-            if fileURL == nil, let url = delegate?.synchronizationFileURL {
-                attach(to: url)
-            }
-            scheduleLocalWrite()
-        case .initialLoad, .externalReload:
-            break
-        }
+        _ = origin
     }
 
-    private func scheduleLocalWrite() {
-        guard fileURL != nil,
-              saveInFlight == nil,
-              failedOperation != .destinationRequiresSaveAs,
-              !synchronizationIsPaused else {
-            return
-        }
-        localWriteTask?.cancel()
-        state = .waitingToWrite
-        localWriteTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: Self.localWriteDelay)
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            self?.beginSaveIfNeeded()
-        }
-    }
-
-    private func beginSaveIfNeeded() {
-        guard !isClosed,
-              !synchronizationIsPaused,
-              failedOperation != .destinationRequiresSaveAs,
-              saveInFlight == nil,
-              localPreparationTask == nil,
-              let fileURL else {
-            return
-        }
-        guard FileManager.default.isWritableFile(atPath: fileURL.path) else {
-            state = .readOnly
-            resolveFlushWaiters(succeeded: false)
-            return
-        }
-        let revision = sourceBuffer.revision
-        if !hasLocalChanges {
-            settleState(default: .idle)
-            resolveFlushWaiters(succeeded: true)
-            return
-        }
-        let snapshot = currentSnapshot
-        let generation = nextGeneration
-        nextGeneration &+= 1
-        let preparationGeneration = nextPreparationGeneration
-        nextPreparationGeneration &+= 1
-        let expectedDurableState = durableState
-        localWriteTask = nil
-        activePreparationGeneration = preparationGeneration
-        state = .writing
-
-        localPreparationTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let preparedPayload = try await Task.detached(priority: .utility) {
-                    try TextFileCodec.prepareSavePayload(for: snapshot)
-                }.value
-                if let savePreparationHook = self.savePreparationHook {
-                    await savePreparationHook()
-                }
-                guard !Task.isCancelled,
-                      !self.isClosed,
-                      self.activePreparationGeneration == preparationGeneration else {
-                    return
-                }
-                self.finishLocalPreparation(preparationGeneration)
-                guard self.saveInFlight == nil,
-                      self.fileURL == fileURL,
-                      self.matchesDurableState(expectedDurableState) else {
-                    if self.hasLocalChanges {
-                        self.scheduleLocalWrite()
-                    }
-                    return
-                }
-                let token = PendingSaveToken(
-                    generation: generation,
-                    sourceRevision: revision,
-                    preparedPayload: preparedPayload,
-                    expectedDurableState: expectedDurableState,
-                    targetURL: fileURL
-                )
-                try self.bridge.install(token)
-                self.saveInFlight = token
-                self.delegate?.syncCoordinator(self, requestSave: token)
-            } catch {
-                guard self.activePreparationGeneration == preparationGeneration else {
-                    return
-                }
-                self.finishLocalPreparation(preparationGeneration)
-                if !Task.isCancelled {
-                    self.state = .failed(error.localizedDescription)
-                    self.failedOperation = .localWrite
-                    self.resolveFlushWaiters(succeeded: false)
-                }
-            }
-        }
-    }
-
-    private func finishLocalPreparation(_ generation: UInt64) {
-        guard activePreparationGeneration == generation else { return }
-        activePreparationGeneration = nil
-        localPreparationTask = nil
-    }
-
-    private func restartMonitor() {
-        monitor?.cancel()
-        monitor = nil
-        guard fileMonitoringEnabled, let fileURL else {
-            monitorFailureMessage = nil
-            return
-        }
-        let monitor = DirectoryFileMonitor(targetURL: fileURL) { [weak self] in
-            Task { @MainActor in self?.scheduleExternalRead() }
-        }
-        do {
-            try monitor.start()
-            self.monitor = monitor
-            monitorFailureMessage = nil
-            if failedOperation == .monitoring {
-                failedOperation = nil
-            }
-        } catch {
-            monitorFailureMessage = error.localizedDescription
-            state = .failed(error.localizedDescription)
-            failedOperation = .monitoring
-        }
-    }
-
-    private func scheduleExternalRead() {
-        guard !isClosed, !synchronizationIsPaused else { return }
-        if attachmentVerificationInProgress {
-            externalReadPending = true
-            return
-        }
-        if saveInFlight != nil {
-            externalCheckPending = true
-            return
-        }
-        guard externalReadTask == nil else {
-            externalReadPending = true
-            return
-        }
-        let generation = nextExternalReadGeneration
-        nextExternalReadGeneration &+= 1
-        activeExternalReadGeneration = generation
-        externalReadTask = Task { @MainActor [weak self] in
-            guard !Task.isCancelled else { return }
-            await self?.readExternalRevision(generation: generation)
-        }
-    }
-
-    private func readExternalRevision(generation: UInt64) async {
-        guard let fileURL else {
-            finishExternalRead(generation)
-            return
-        }
-        // Signals delivered before this read starts are already represented by
-        // the bytes it is about to load. Only retain signals that arrive while
-        // the read is in flight.
-        externalReadPending = false
-        state = .checkingExternalChange
-        do {
-            let data = try await Task.detached(priority: .utility) {
-                try Data(contentsOf: fileURL, options: [.mappedIfSafe])
-            }.value
-            if let externalReadHook {
-                await externalReadHook(generation)
-            }
-            guard isCurrentExternalRead(generation, url: fileURL) else {
-                finishExternalRead(generation)
-                return
-            }
-            await reconcileExternalData(
-                data,
-                from: fileURL,
-                generation: generation
-            )
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            guard isCurrentExternalRead(generation, url: fileURL) else {
-                finishExternalRead(generation)
-                return
-            }
-            state = .missing
-            finishExternalRead(generation)
-        } catch {
-            guard isCurrentExternalRead(generation, url: fileURL) else {
-                finishExternalRead(generation)
-                return
-            }
-            state = .failed(error.localizedDescription)
-            failedOperation = .externalRead
-            finishExternalRead(generation)
-        }
-    }
-
-    private func reconcileExternalData(
-        _ data: Data,
-        from url: URL,
-        generation: UInt64
-    ) async {
-        let capturedDurableState = durableState
-        let capturedLocal = currentSnapshot
-        let capturedSourceRevision = sourceBuffer.revision.number
-        do {
-            let merger = self.merger
-            let reconciliation = try await Task.detached(priority: .utility) {
-                let fingerprint = try SafeFileCommitter.fingerprint(
-                    for: url,
-                    data: data
-                )
-                let observedIdentity = DocumentIdentity.make(url: url)
-                if fingerprint.contentDigest
-                    == capturedDurableState?.fingerprint.contentDigest {
-                    return ExternalReconciliation.unchanged(
-                        fingerprint: fingerprint,
-                        documentIdentity: observedIdentity
-                    )
-                }
-                let external = try TextFileCodec.decode(data)
-                let mergeResult = capturedDurableState.map {
-                    merger.merge(
-                        base: $0.snapshot.text,
-                        local: capturedLocal.text,
-                        external: external.text
-                    )
-                }
-                return ExternalReconciliation.changed(
-                    fingerprint: fingerprint,
-                    documentIdentity: observedIdentity,
-                    snapshot: external,
-                    mergeResult: mergeResult
-                )
-            }.value
-            guard isCurrentExternalRead(generation, url: url) else {
-                finishExternalRead(generation)
-                return
-            }
-            guard matchesDurableState(capturedDurableState),
-                  sourceBuffer.revision.number == capturedSourceRevision else {
-                externalReadPending = true
-                finishExternalRead(generation)
-                return
-            }
-
-            switch reconciliation {
-            case let .unchanged(fingerprint, observedIdentity):
-                guard migrateDocumentIdentityIfNeeded(
-                    to: observedIdentity
-                ) else {
-                    finishExternalRead(generation)
-                    return
-                }
-                if fingerprint.resourceIdentifier
-                    != capturedDurableState?.fingerprint.resourceIdentifier {
-                    restartMonitor()
-                }
-                if let capturedDurableState {
-                    durableState = DurableFileState(
-                        snapshot: capturedDurableState.snapshot,
-                        fingerprint: fingerprint,
-                        generation: capturedDurableState.generation
-                    )
-                }
-                settleState(default: .idle)
-                finishExternalRead(generation)
-                if hasLocalChanges {
-                    ensureLocalWriteScheduled()
-                }
-                return
-            case let .changed(
-                fingerprint,
-                observedIdentity,
-                external,
-                mergeResult
-            ):
-                guard migrateDocumentIdentityIfNeeded(
-                    to: observedIdentity
-                ) else {
-                    finishExternalRead(generation)
-                    return
-                }
-                if fingerprint.resourceIdentifier
-                    != capturedDurableState?.fingerprint.resourceIdentifier {
-                    restartMonitor()
-                }
-                applyExternalReconciliation(
-                    fingerprint: fingerprint,
-                    external: external,
-                    mergeResult: mergeResult,
-                    capturedDurableState: capturedDurableState,
-                    local: capturedLocal,
-                    url: url
-                )
-            }
-            finishExternalRead(generation)
-        } catch {
-            guard isCurrentExternalRead(generation, url: url) else {
-                finishExternalRead(generation)
-                return
-            }
-            state = .failed(error.localizedDescription)
-            failedOperation = .externalRead
-            finishExternalRead(generation)
-        }
-    }
-
-    @discardableResult
-    private func migrateDocumentIdentityIfNeeded(
-        to observedIdentity: DocumentIdentity
-    ) -> Bool {
-        guard let previousIdentity = documentIdentity,
-              previousIdentity != observedIdentity else {
-            documentIdentity = observedIdentity
-            return true
-        }
-        do {
-            try recoveryStore.moveEntries(
-                from: previousIdentity,
-                to: observedIdentity
-            )
-            documentIdentity = observedIdentity
-            pendingRecoveryMigration = nil
-            if rawRecoveryRemovalIdentity == previousIdentity {
-                rawRecoveryRemovalIdentity = observedIdentity
-            }
-            refreshRecoveryState()
-            return true
-        } catch {
-            pendingRecoveryMigration = PendingRecoveryMigration(
-                source: previousIdentity,
-                destination: observedIdentity
-            )
-            refreshRecoveryState()
-            state = .synchronizationPaused
-            return false
-        }
-    }
-
-    private func applyExternalReconciliation(
-        fingerprint: FileFingerprint,
-        external: DocumentSnapshot,
-        mergeResult: ThreeWayMergeResult?,
-        capturedDurableState: DurableFileState?,
-        local: DocumentSnapshot,
-        url: URL
+    private func installInitialAttachment(
+        targetURL: URL,
+        data: Data?,
+        sourceRevision: SourceRevision,
+        baselineSourceRevision: SourceRevision? = nil,
+        initialFormat: TextFileFormat? = nil
     ) {
-        state = .reloading
-        guard let durableState = capturedDurableState,
-              let mergeResult else {
-            format = external.format
-            sourceBuffer.replace(with: external.text, origin: .externalReload)
-            self.durableState = DurableFileState(
-                snapshot: external,
-                fingerprint: fingerprint,
-                generation: 0
+        let previous = reducerState
+        let source = sourceRevision
+        let baselineSource = baselineSourceRevision ?? source
+        let identity = DocumentIdentity.make(url: targetURL)
+        let baseline = data.flatMap {
+            makeBaseline(
+                data: $0,
+                targetURL: targetURL,
+                identity: identity,
+                sourceRevision: baselineSource
             )
-            durableSourceRevision = sourceBuffer.revision.number
-            delegate?.syncCoordinator(
-                self,
-                acceptedExternalFileAt: url,
-                hasLocalChanges: false
+        }
+        let format = initialFormat ?? baseline?.snapshot.format ?? previous.format
+        let recoveryIssue = legacyRecoveryIssue(for: identity)
+        let requiresExternalVerification = baseline?.snapshot
+            != DocumentSnapshot(text: source.text, format: format)
+        reducerState = DocumentSyncState(
+            lifetime: previous.lifetime,
+            source: source,
+            format: format,
+            attachment: .file(
+                DocumentSyncFileAttachment(
+                    identity: identity,
+                    url: targetURL,
+                    epoch: previous.attachmentEpoch + 1
+                )
+            ),
+            attachmentEpoch: previous.attachmentEpoch + 1,
+            durableBaseline: baseline,
+            recoveryAccess: recoveryIssue == nil
+                ? .ready(
+                    generation: recoveryStore.typedMutationGeneration(
+                        for: identity
+                    )
+                )
+                : .failed(.recovery),
+            issue: recoveryIssue,
+            nextAttempt: previous.nextAttempt,
+            nextCommitGeneration: previous.nextCommitGeneration,
+            externalSignalPending: requiresExternalVerification
+        )
+        unattachedDurableState = nil
+        publishCompatibility(from: previous, event: nil)
+        dispatch(.started)
+        guard recoveryIssue == nil,
+              requiresExternalVerification,
+              let monitorToken = reducerState.activeTokens[.monitor] else {
+            return
+        }
+        dispatch(.monitorSignaled(monitorToken))
+    }
+
+    private func beginAttachmentRequest(
+        completion: (@MainActor (Bool) -> Void)?
+    ) -> UUID {
+        cancelPendingAttachmentRequest()
+        let requestID = UUID()
+        attachmentRequestID = requestID
+        if let completion {
+            attachmentCompletions[requestID] = completion
+        }
+        return requestID
+    }
+
+    private func cancelPendingAttachmentRequest() {
+        attachmentTask?.cancel()
+        attachmentTask = nil
+        if let requestID = attachmentRequestID {
+            attachmentCompletions.removeValue(forKey: requestID)?(false)
+        }
+        attachmentRequestID = nil
+    }
+
+    private func completeAttachment(
+        requestID: UUID,
+        event: AttachmentEvent,
+        targetURL: URL,
+        data: Data?,
+        sourceRevision: SourceRevision,
+        baselineSourceRevision: SourceRevision? = nil
+    ) {
+        guard !isTornDown, attachmentRequestID == requestID else { return }
+        attachmentTask = nil
+        attachmentRequestID = nil
+        let identity = DocumentIdentity.make(url: targetURL)
+        let baseline = data.flatMap {
+            makeBaseline(
+                data: $0,
+                targetURL: targetURL,
+                identity: identity,
+                sourceRevision: baselineSourceRevision ?? reducerState.source
             )
-            settleState(default: .idle)
+        }
+
+        if reducerState.fileAttachment == nil,
+           reducerState.recoveryRecords == nil,
+           event != .fileMoved {
+            // Initial document attachment is construction, not a relocation.
+            // It keeps ordinary editing usable while P1 replaces the legacy
+            // recovery store with exact typed receipts.
+            installInitialAttachment(
+                targetURL: targetURL,
+                data: data,
+                sourceRevision: sourceRevision,
+                baselineSourceRevision: baselineSourceRevision
+            )
+            finishAttachmentRequest(requestID, didAttach: data != nil)
             return
         }
 
-        switch mergeResult {
-        case let .unchanged(text):
-            format = external.format
-            if text == external.text {
-                sourceBuffer.replace(with: external.text, origin: .externalReload)
+        unattachedDurableState = nil
+        switch event {
+        case .attach:
+            dispatch(.attach(identity: identity, url: targetURL, durableBaseline: baseline))
+        case .fileMoved:
+            dispatch(.fileMoved(identity: identity, url: targetURL, durableBaseline: baseline))
+        case .saveAsAttached:
+            dispatch(.saveAsAttached(identity: identity, url: targetURL, durableBaseline: baseline))
+        }
+        finishAttachmentRequest(requestID, didAttach: data != nil)
+    }
+
+    private func finishAttachmentRequest(
+        _ requestID: UUID,
+        didAttach: Bool
+    ) {
+        attachmentCompletions.removeValue(forKey: requestID)?(didAttach)
+    }
+
+    private func legacyRecoveryIssue(
+        for identity: DocumentIdentity
+    ) -> DocumentSyncIssue? {
+        guard recoveryStore.latest(for: identity) != nil
+            || !recoveryStore.rawRecoveryEntries(for: identity).isEmpty else {
+            return nil
+        }
+
+        // We deliberately retain no partial `DocumentSyncRecoveryRecords`
+        // here. The legacy store exposes only one decoded entry and no
+        // generation, so presenting that subset as a complete mutable record
+        // set could authorize an unsafe restore, discard, or migration.
+        return DocumentSyncIssue(
+            failure: .recovery,
+            retryable: false,
+            requiresSaveAs: false,
+            rawRecoveryURL: nil
+        )
+    }
+
+    /// Save As has already captured the target bytes off the main actor. If
+    /// those bytes changed before verification completed, feed the immutable
+    /// observation straight back through the reducer so this async API does
+    /// not return with a stale baseline. The concurrently started executor
+    /// completion is harmless: its token is stale after this result wins.
+    private func applyVerifiedSaveAsReplacement(
+        data: Data,
+        targetURL: URL,
+        identity: DocumentIdentity
+    ) {
+        guard let monitorToken = reducerState.activeTokens[.monitor] else {
+            return
+        }
+        dispatch(.monitorSignaled(monitorToken))
+        guard case .debouncing(let ticket) = reducerState.external else {
+            return
+        }
+        dispatch(
+            .deadlineFired(
+                SyncDeadline(kind: .externalRead, token: ticket.token)
+            )
+        )
+        guard case .reading(let read) = reducerState.external,
+              read.token == ticket.token else {
+            return
+        }
+
+        do {
+            let fingerprint = try SafeFileCommitter.fingerprint(
+                for: targetURL,
+                data: data
+            )
+            let change = try TextFileCodec.decodeExternalChange(
+                data: data,
+                targetURL: targetURL,
+                identity: identity,
+                fingerprint: fingerprint
+            )
+            dispatch(
+                .externalReadFinished(token: read.token, result: .changed(change))
+            )
+        } catch {
+            dispatch(.operationFailed(token: read.token, failure: .externalRead))
+        }
+    }
+
+    private func publishCompatibility(
+        from previous: DocumentSyncState,
+        event: DocumentSyncEvent?
+    ) {
+        let next = reducerState
+        if previous.source != next.source,
+           sourceBuffer.revision != next.source {
+            replaceSource(next.source.text, origin: sourceReplacementOrigin(for: event))
+        }
+        if format != next.format {
+            format = next.format
+        }
+        durableState = next.durableBaseline?.asDurableFileState
+            ?? unattachedDurableState
+        let nextURL = next.fileAttachment?.url.standardizedFileURL
+        if fileURL != nextURL {
+            fileURL = nextURL
+        }
+
+        let projection = next.statusProjection
+        let nextStatus = DocumentSynchronizationStatusSnapshot(
+            presentedState: projection.presentedState,
+            failureRequiresSaveAs: projection.failureRequiresSaveAs,
+            recoveryMigrationIsPending: projection.recoveryMigrationIsPending,
+            rawRecoveryURL: projection.rawRecoveryURL,
+            hasLocalRecovery: projection.hasLocalRecovery
+        )
+        if statusSnapshot != nextStatus {
+            statusSnapshot = nextStatus
+        }
+        state = synchronizationState(for: next, status: nextStatus)
+
+        if didAcceptExternalSource(event, previous: previous, next: next),
+           let url = next.fileAttachment?.url {
+            delegate?.syncCoordinator(
+                self,
+                acceptedExternalFileAt: url,
+                hasLocalChanges: next.local.isDirty
+            )
+        }
+    }
+
+    private func execute(_ effect: DocumentSyncEffect) {
+        switch effect {
+        case .schedule(let request):
+            if let manualScheduler {
+                manualScheduler.schedule(request.deadline, after: request.delay)
+            } else {
+                scheduler.schedule(request)
             }
-            self.durableState = DurableFileState(
-                snapshot: external,
-                fingerprint: fingerprint,
-                generation: durableState.generation
-            )
-            durableSourceRevision =
-                text == external.text
-                    ? sourceBuffer.revision.number
-                    : nil
-            delegate?.syncCoordinator(
-                self,
-                acceptedExternalFileAt: url,
-                hasLocalChanges: text != external.text
-            )
-            settleState(default: .idle)
-            if text != external.text { scheduleLocalWrite() }
-        case let .merged(text):
-            state = .merging
-            self.durableState = DurableFileState(
-                snapshot: external,
-                fingerprint: fingerprint,
-                generation: durableState.generation
-            )
-            durableSourceRevision = nil
-            format = external.format
-            sourceBuffer.replace(with: text, origin: .merge)
-            delegate?.syncCoordinator(
-                self,
-                acceptedExternalFileAt: url,
-                hasLocalChanges: true
-            )
-            scheduleLocalWrite()
-        case .conflict:
-            guard let identity = documentIdentity else {
-                state = .failed(
-                    "The local revision could not be associated with this file."
+        case .cancelDeadline(let deadline):
+            if let manualScheduler {
+                manualScheduler.cancel(deadline)
+            } else {
+                scheduler.cancel(deadline)
+            }
+        case .cancelAllDeadlines:
+            if let manualScheduler {
+                manualScheduler.cancelAll()
+            } else {
+                scheduler.cancelAll()
+            }
+        case .prepareSave(let request):
+            executeSavePreparation(request)
+        case .commitSave(let request):
+            executeSaveCommit(request)
+        case .reconcileCommit(let request):
+            effectExecutor.reconcileCommit(request) { [weak self] result in
+                self?.dispatch(
+                    .commitReconciliationFinished(
+                        token: request.token,
+                        result: result
+                    )
                 )
-                failedOperation = .externalRead
-                return
+            }
+        case .readExternal(let request):
+            executeExternalRead(request)
+        case .merge(let request):
+            effectExecutor.merge(request) { [weak self] execution in
+                guard let self else { return }
+                switch execution {
+                case .finished(let result):
+                    self.dispatch(.mergeFinished(token: request.token, result: result))
+                case .failed(let failure):
+                    self.dispatch(.operationFailed(token: request.token, failure: failure))
+                }
+            }
+        case .recovery(let request):
+            executeLegacyRecovery(request)
+        case .monitor(let request):
+            executeMonitor(request)
+        case .resolveClose(let resolution):
+            (delegate as? DocumentSyncCoordinatorHost)?.syncCoordinator(
+                self,
+                resolveClose: resolution
+            )
+        }
+    }
+
+    private func executeSavePreparation(
+        _ request: DocumentSyncSavePreparationRequest
+    ) {
+        guard let savePreparationHook else {
+            beginSavePreparationEffect(request)
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            await savePreparationHook()
+            guard let self, !self.isTornDown else { return }
+            self.beginSavePreparationEffect(request)
+        }
+    }
+
+    private func beginSavePreparationEffect(
+        _ request: DocumentSyncSavePreparationRequest
+    ) {
+        effectExecutor.prepareSave(request) { [weak self] execution in
+            guard let self else { return }
+            switch execution {
+            case .prepared(let pendingSave):
+                self.dispatch(
+                    .savePrepared(
+                        token: request.token,
+                        pendingSave: pendingSave
+                    )
+                )
+            case .failed(let failure):
+                self.dispatch(
+                    .operationFailed(token: request.token, failure: failure)
+                )
+            }
+        }
+    }
+
+    private func executeSaveCommit(_ request: DocumentSyncSaveCommitRequest) {
+        do {
+            try bridge.install(request)
+        } catch {
+            dispatch(.operationFailed(token: request.token, failure: .localSave))
+            return
+        }
+        if let host = delegate as? DocumentSyncCoordinatorHost {
+            host.syncCoordinator(self, requestSave: request)
+        } else {
+            delegate?.syncCoordinator(self, requestSave: request.pendingSave)
+        }
+    }
+
+    private func executeExternalRead(_ request: DocumentSyncExternalReadRequest) {
+        guard let externalReadHook else {
+            beginExternalReadEffect(request)
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            await externalReadHook(request.token.attempt)
+            guard let self, !self.isTornDown else { return }
+            self.beginExternalReadEffect(request)
+        }
+    }
+
+    private func beginExternalReadEffect(
+        _ request: DocumentSyncExternalReadRequest
+    ) {
+        effectExecutor.readExternal(request) { [weak self] execution in
+            guard let self else { return }
+            switch execution {
+            case .finished(let result):
+                self.dispatch(
+                    .externalReadFinished(token: request.token, result: result)
+                )
+            case .failed(let failure):
+                self.dispatch(
+                    .operationFailed(token: request.token, failure: failure)
+                )
+            }
+        }
+    }
+
+    private func executeMonitor(_ request: DocumentSyncMonitorRequest) {
+        switch request.action {
+        case .start:
+            monitors.values.forEach { $0.cancel() }
+            monitors.removeAll()
+            guard fileMonitoringEnabled else { return }
+            let token = request.token
+            let monitor = DirectoryFileMonitor(targetURL: request.targetURL) {
+                Task { @MainActor [weak self] in
+                    self?.dispatch(.monitorSignaled(token))
+                }
             }
             do {
-                try recoveryStore.add(snapshot: local, for: identity)
-                hasRecoverableLocalRevision = true
+                try monitor.start()
+                monitors[token] = monitor
             } catch {
-                state = .failed(
-                    "The local revision could not be stored for recovery: "
-                        + error.localizedDescription
-                )
-                failedOperation = .externalRead
-                return
+                dispatch(.operationFailed(token: token, failure: .monitor))
             }
-            self.durableState = DurableFileState(
-                snapshot: external,
-                fingerprint: fingerprint,
-                generation: durableState.generation
-            )
-            format = external.format
-            sourceBuffer.replace(with: external.text, origin: .externalReload)
-            durableSourceRevision = sourceBuffer.revision.number
-            delegate?.syncCoordinator(
-                self,
-                acceptedExternalFileAt: url,
-                hasLocalChanges: false
-            )
-            state = .recoveredConflict
+        case .stop:
+            monitors.removeValue(forKey: request.token)?.cancel()
         }
     }
 
-    private func isCurrentExternalRead(_ generation: UInt64, url: URL) -> Bool {
-        !Task.isCancelled
-            && !isClosed
-            && activeExternalReadGeneration == generation
-            && fileURL == url
-    }
-
-    private func finishExternalRead(_ generation: UInt64) {
-        guard activeExternalReadGeneration == generation else { return }
-        activeExternalReadGeneration = nil
-        externalReadTask = nil
-        if externalReadPending {
-            externalReadPending = false
-            scheduleExternalRead()
-        }
-    }
-
-    private func ensureLocalWriteScheduled() {
-        guard localWriteTask == nil,
-              localPreparationTask == nil,
-              saveInFlight == nil else {
+    private func executeLegacyRecovery(_ request: DocumentSyncRecoveryRequest) {
+        if case .migrate(let migration) = request,
+           migration.records.isEmpty,
+           legacyRecoveryIssue(for: migration.sourceIdentity) == nil,
+           legacyRecoveryIssue(for: migration.destinationIdentity) == nil {
+            // Recordless migration changes no recovery file, but it still
+            // advances the reducer's receipt generation. Keep that generation
+            // in the store so a later fresh conflict cannot be rejected as a
+            // fabricated coordinator completion.
+            do {
+                let receipt = try recoveryStore.advanceEmptyRecoveryMigration(
+                    from: migration.sourceIdentity,
+                    to: migration.destinationIdentity,
+                    expectedGeneration: migration.expectedStoreGeneration
+                )
+                dispatch(
+                    .recoveryFinished(
+                        token: migration.token,
+                        result: .migrated(
+                            DocumentSyncRecoveryMutationResult(
+                                previousGeneration: receipt.previousGeneration,
+                                generation: receipt.generation,
+                                records: recoveryRecords(from: receipt)
+                            )
+                        )
+                    )
+                )
+            } catch {
+                dispatch(
+                    .operationFailed(token: migration.token, failure: .recovery)
+                )
+            }
             return
         }
-        scheduleLocalWrite()
+
+        switch request {
+        case .persist(let persistence):
+            executeLegacyConflictPersistence(persistence)
+        case .discard(let discard):
+            executeLegacyDecodedRecoveryDiscard(discard)
+        case .load, .reconcile, .migrate:
+            // P1 owns complete record loading, reconciliation, and
+            // cross-identity FIFO migration. Until then, unknown legacy
+            // evidence remains paused rather than being reconstructed from a
+            // partial store view.
+            dispatch(.operationFailed(token: request.token, failure: .recovery))
+        }
+    }
+
+    private func executeLegacyConflictPersistence(
+        _ request: DocumentSyncRecoveryPersistRequest
+    ) {
+        guard request.purpose == .persistConflict,
+              request.expectedRecords.isEmpty,
+              request.displacedPreimageContinuation == nil,
+              case .snapshot(let snapshot) = request.payload else {
+            dispatch(.operationFailed(token: request.token, failure: .recovery))
+            return
+        }
+
+        do {
+            let receipt = try recoveryStore.persistFreshDecodedConflict(
+                id: request.entryID,
+                snapshot: snapshot,
+                for: request.identity,
+                expectedGeneration: request.expectedStoreGeneration
+            )
+            dispatch(
+                .recoveryFinished(
+                    token: request.token,
+                    result: .persisted(
+                        DocumentSyncRecoveryMutationResult(
+                            previousGeneration: receipt.previousGeneration,
+                            generation: receipt.generation,
+                            records: recoveryRecords(from: receipt)
+                        )
+                    )
+                )
+            )
+        } catch {
+            dispatch(.operationFailed(token: request.token, failure: .recovery))
+        }
+    }
+
+    private func executeLegacyDecodedRecoveryDiscard(
+        _ request: DocumentSyncRecoveryDiscardRequest
+    ) {
+        guard case .decoded(let entry) = request.target,
+              entry.documentIdentity == request.identity else {
+            dispatch(.operationFailed(token: request.token, failure: .recovery))
+            return
+        }
+
+        do {
+            let receipt = try recoveryStore.discardExactDecodedConflict(
+                entry,
+                for: request.identity,
+                expectedGeneration: request.expectedStoreGeneration
+            )
+            dispatch(
+                .recoveryFinished(
+                    token: request.token,
+                    result: .discarded(
+                        DocumentSyncRecoveryMutationResult(
+                            previousGeneration: receipt.previousGeneration,
+                            generation: receipt.generation,
+                            records: recoveryRecords(from: receipt)
+                        )
+                    )
+                )
+            )
+        } catch {
+            dispatch(.operationFailed(token: request.token, failure: .recovery))
+        }
+    }
+
+    private func recoveryRecords(
+        from receipt: SessionRecoveryStoreMutationReceipt
+    ) -> DocumentSyncRecoveryRecords {
+        DocumentSyncRecoveryRecords(
+            decoded: receipt.decodedEntries,
+            raw: receipt.rawEntries.map {
+                DocumentSyncRawRecoveryReference(entry: $0)
+            }
+        )
+    }
+
+    private func resolveFlushWaitersIfPossible() {
+        guard !flushWaiters.isEmpty else { return }
+        if isFullySynchronized {
+            resolveFlushWaiters(succeeded: true)
+        } else if reducerState.issue != nil
+                    || reducerState.lifecycle == .closed {
+            resolveFlushWaiters(succeeded: false)
+        }
     }
 
     private func resolveFlushWaiters(succeeded: Bool) {
-        guard !flushWaiters.isEmpty else { return }
         let waiters = flushWaiters
         flushWaiters.removeAll()
         for waiter in waiters {
@@ -1084,239 +1042,160 @@ final class DocumentSyncCoordinator: ObservableObject {
         }
     }
 
-    private func refreshRecoveryState() {
-        guard let documentIdentity else {
-            hasRecoverableLocalRevision = false
-            refreshStatusSnapshot()
-            return
-        }
-        hasRecoverableLocalRevision =
-            recoveryStore.latest(for: documentIdentity) != nil
-        if !recoveryStore.rawRecoveryEntries(for: documentIdentity).isEmpty {
-            synchronizationPauseIsLatched = true
-        }
-        refreshStatusSnapshot()
-    }
-
-    private func refreshStatusSnapshot() {
-        let rawRecoveryURL: URL?
-        if let documentIdentity {
-            rawRecoveryURL = recoveryStore
-                .rawRecoveryEntries(for: documentIdentity)
-                .first?
-                .dataURL
-        } else {
-            rawRecoveryURL = nil
-        }
-        let snapshot = DocumentSynchronizationStatusSnapshot(
-            presentedState: presentedStateValue,
-            failureRequiresSaveAs:
-                failedOperation == .destinationRequiresSaveAs,
-            recoveryMigrationIsPending: pendingRecoveryMigration != nil,
-            rawRecoveryURL: rawRecoveryURL,
-            hasLocalRecovery: hasRecoverableLocalRevision
-        )
-        if snapshot != statusSnapshot {
-            statusSnapshot = snapshot
-        }
-    }
-
-    private func settleState(default defaultState: SynchronizationState) {
-        if synchronizationIsPaused {
-            state = .synchronizationPaused
-        } else if hasRecoverableLocalRevision {
-            state = .recoveredConflict
-        } else if failedOperation == .destinationRequiresSaveAs,
-                  hasLocalChanges {
-            state = .failed(
-                saveAsRequiredFailureMessage
-                    ?? SafeFileCommitter.CommitError
-                        .atomicSwapUnavailable.localizedDescription
-            )
-        } else if let monitorFailureMessage {
-            failedOperation = .monitoring
-            state = .failed(monitorFailureMessage)
-        } else {
-            failedOperation = nil
-            saveAsRequiredFailureMessage = nil
-            state = defaultState
-        }
-    }
-
-    private static func persistentPresentedState(
-        for state: SynchronizationState
-    ) -> SynchronizationState? {
-        switch state {
-        case .idle,
-             .waitingToWrite,
-             .writing,
-             .checkingExternalChange,
-             .reloading,
-             .merging:
-            nil
-        case .recoveredConflict,
-             .readOnly,
-             .missing,
-             .failed,
-             .limitedSyncSafety,
-             .synchronizationPaused:
-            state
-        }
-    }
-
-    private var synchronizationIsPaused: Bool {
-        synchronizationPauseIsLatched || pendingRecoveryMigration != nil
-    }
-
-    @discardableResult
-    private func resolvePendingRecoveryMigration() -> Bool {
-        guard let migration = pendingRecoveryMigration else { return true }
-        do {
-            try recoveryStore.moveEntries(
-                from: migration.source,
-                to: migration.destination
-            )
-            documentIdentity = migration.destination
-            if rawRecoveryRemovalIdentity == migration.source {
-                rawRecoveryRemovalIdentity = migration.destination
-            }
-            pendingRecoveryMigration = nil
-            refreshRecoveryState()
-            return true
-        } catch {
-            state = .synchronizationPaused
-            return false
-        }
-    }
-
-    private func resolveCommittedRecovery(for token: PendingSaveToken) {
-        if let entry = pendingRecoveryRemoval,
-           let minimumRevision = pendingRecoveryMinimumRevision,
-           token.sourceRevision.number >= minimumRevision {
-            recoveryStore.remove(entry)
-            pendingRecoveryRemoval = nil
-            pendingRecoveryMinimumRevision = nil
-        }
-        if let identity = rawRecoveryRemovalIdentity {
-            recoveryStore.removeRawRecoveryEntries(for: identity)
-            rawRecoveryRemovalIdentity = nil
-        }
-        refreshRecoveryState()
-    }
-
     private var isFullySynchronized: Bool {
-        saveInFlight == nil
-            && localPreparationTask == nil
-            && !hasLocalChanges
-    }
-
-    private func matchesDurableState(
-        _ expected: DurableFileState?
-    ) -> Bool {
-        switch (durableState, expected) {
-        case (nil, nil):
-            return true
-        case let (current?, expected?):
-            return current.generation == expected.generation
-                && current.fingerprint == expected.fingerprint
-        case (.some, nil), (nil, .some):
+        guard case .clean(let revision) = reducerState.local,
+              revision == reducerState.source,
+              reducerState.durableBaseline?.sourceRevision == revision,
+              reducerState.durableBaseline?.snapshot == reducerState.snapshot,
+              reducerState.external == .idle,
+              reducerState.mergeAttempt == nil,
+              reducerState.issue == nil else {
             return false
         }
+        return true
     }
 
-    private func reconcileDisplacedExternalData(
-        _ data: Data,
-        committedToken token: PendingSaveToken,
-        result: FileCommitResult
-    ) {
-        do {
-            guard let documentIdentity else {
-                synchronizationPauseIsLatched = true
-                state = .synchronizationPaused
-                resolveFlushWaiters(succeeded: false)
-                return
-            }
-            if let artifact = result.recoveryArtifact {
-                try recoveryStore.addRawData(
-                    data,
-                    for: documentIdentity,
-                    id: artifact.id
-                )
-                try CommitRecoveryJournalStore.acknowledge(artifact)
-            } else {
-                try recoveryStore.addRawData(data, for: documentIdentity)
-            }
-            let external = try TextFileCodec.decode(data)
-            rawRecoveryRemovalIdentity = documentIdentity
-            let local = currentSnapshot
-            let base = token.expectedDurableState?.snapshot ?? token.snapshot
-            durableState = DurableFileState(
-                snapshot: token.snapshot,
-                fingerprint: result.committedFingerprint,
-                generation: token.generation
+    private func tearDown() {
+        isTornDown = true
+        attachmentTask?.cancel()
+        attachmentTask = nil
+        attachmentRequestID = nil
+        let completions = attachmentCompletions.values
+        attachmentCompletions.removeAll()
+        for completion in completions {
+            completion(false)
+        }
+        scheduler.cancelAll()
+        manualScheduler?.cancelAll()
+        for monitor in monitors.values {
+            monitor.cancel()
+        }
+        monitors.removeAll()
+        if let sourceObservation {
+            sourceBuffer.removeObserver(sourceObservation)
+        }
+        sourceObservation = nil
+        resolveFlushWaiters(succeeded: false)
+    }
+
+    private func replaceSource(_ text: String, origin: DocumentChangeOrigin) {
+        isApplyingReducerSource = true
+        sourceBuffer.replace(with: text, origin: origin)
+        isApplyingReducerSource = false
+    }
+
+    private func makeBaseline(
+        data: Data,
+        targetURL: URL,
+        identity: DocumentIdentity,
+        sourceRevision: SourceRevision
+    ) -> DocumentSyncDurableBaseline? {
+        guard let snapshot = try? TextFileCodec.decode(data) else {
+            return nil
+        }
+        guard let fingerprint = try? SafeFileCommitter.fingerprint(
+            for: targetURL,
+            data: data
+        ) else {
+            return nil
+        }
+        let baselineSourceRevision: SourceRevision
+        if snapshot == DocumentSnapshot(
+            text: sourceRevision.text,
+            format: reducerState.format
+        ) {
+            baselineSourceRevision = sourceRevision
+        } else {
+            // A baseline must never claim a newer local source revision was
+            // persisted simply because it was current when the file read
+            // completed. Keep the same revision number only as an ordering
+            // anchor; the differing text makes the state unambiguously dirty.
+            baselineSourceRevision = SourceRevision(
+                number: sourceRevision.number,
+                text: snapshot.text
             )
-            durableSourceRevision = token.sourceRevision.number
-            format = external.format
+        }
+        return try? TextFileCodec.durableBaseline(
+            data: data,
+            targetURL: targetURL,
+            fingerprint: fingerprint,
+            documentIdentity: identity,
+            sourceRevision: baselineSourceRevision,
+            commitGeneration: reducerState.durableBaseline?.commitGeneration ?? 0
+        )
+    }
 
-            switch merger.merge(
-                base: base.text,
-                local: local.text,
-                external: external.text
-            ) {
-            case let .unchanged(text):
-                if text == external.text {
-                    sourceBuffer.replace(with: external.text, origin: .externalReload)
-                    durableSourceRevision = nil
-                } else if text != local.text {
-                    sourceBuffer.replace(with: text, origin: .merge)
-                    durableSourceRevision = nil
-                }
-                state = .merging
-            case let .merged(text):
-                sourceBuffer.replace(with: text, origin: .merge)
-                durableSourceRevision = nil
-                state = .merging
-            case .conflict:
-                try recoveryStore.add(
-                    snapshot: local,
-                    for: documentIdentity
-                )
-                hasRecoverableLocalRevision = true
-                sourceBuffer.replace(with: external.text, origin: .externalReload)
-                // The just-committed bytes are still `token.snapshot`; the
-                // displaced external text is now visible but must be written
-                // back before it becomes durable.
-                durableSourceRevision = nil
-                stateAfterNextSuccessfulSave = .recoveredConflict
-                state = .recoveredConflict
-            }
+    private nonisolated static func readAttachment(
+        at targetURL: URL,
+        sourceRevision: SourceRevision
+    ) throws -> VerifiedCoordinatorAttachment {
+        let data = try Data(contentsOf: targetURL, options: [.mappedIfSafe])
+        return VerifiedCoordinatorAttachment(
+            targetURL: targetURL,
+            identity: DocumentIdentity.make(url: targetURL),
+            data: data,
+            sourceRevision: sourceRevision
+        )
+    }
 
-            if hasLocalChanges {
-                scheduleLocalWrite()
-            } else if let stateAfterNextSuccessfulSave {
-                if let identity = rawRecoveryRemovalIdentity {
-                    recoveryStore.removeRawRecoveryEntries(for: identity)
-                    rawRecoveryRemovalIdentity = nil
-                }
-                refreshRecoveryState()
-                settleState(default: stateAfterNextSuccessfulSave)
-                self.stateAfterNextSuccessfulSave = nil
-            } else {
-                if let identity = rawRecoveryRemovalIdentity {
-                    recoveryStore.removeRawRecoveryEntries(for: identity)
-                    rawRecoveryRemovalIdentity = nil
-                }
-                refreshRecoveryState()
-                settleState(
-                    default: result.safety == .atomicSwap
-                        ? .idle
-                        : .limitedSyncSafety
-                )
-            }
-        } catch {
-            synchronizationPauseIsLatched = true
-            state = .synchronizationPaused
-            resolveFlushWaiters(succeeded: false)
+    private func sourceReplacementOrigin(
+        for event: DocumentSyncEvent?
+    ) -> DocumentChangeOrigin {
+        switch event {
+        case .restoreLocalRecovery:
+            .recovery
+        case .mergeFinished:
+            .merge
+        case .externalReadFinished:
+            .externalReload
+        default:
+            .externalReload
         }
     }
+
+    private func didAcceptExternalSource(
+        _ event: DocumentSyncEvent?,
+        previous: DocumentSyncState,
+        next: DocumentSyncState
+    ) -> Bool {
+        guard previous.source != next.source else { return false }
+        return switch event {
+        case .externalReadFinished, .mergeFinished:
+            true
+        default:
+            false
+        }
+    }
+
+    private func synchronizationState(
+        for state: DocumentSyncState,
+        status: DocumentSynchronizationStatusSnapshot
+    ) -> SynchronizationState {
+        if let presented = status.presentedState {
+            return presented
+        }
+        if state.mergeAttempt != nil {
+            return .merging
+        }
+        switch state.external {
+        case .reading, .debouncing:
+            return .checkingExternalChange
+        case .idle:
+            break
+        }
+        switch state.local {
+        case .preparing, .writing:
+            return .writing
+        case .dirty(let dirty) where dirty.scheduledToken != nil:
+            return .waitingToWrite
+        case .clean, .dirty:
+            return .idle
+        }
+    }
+}
+
+private enum AttachmentEvent {
+    case attach
+    case fileMoved
+    case saveAsAttached
 }

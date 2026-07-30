@@ -2,11 +2,29 @@ import Foundation
 
 enum SessionRecoveryStoreError: LocalizedError, Equatable {
     case unreadableMigrationJournal
+    case unexpectedMutationGeneration
+    case recoveryRecordsNotEmpty
+    case conflictingEntryID
+    case missingRecoveryEntry
+    case recoveryEntryEvicted
+    case mutationGenerationExhausted
 
     var errorDescription: String? {
         switch self {
         case .unreadableMigrationJournal:
             "The recovery migration journal is unreadable."
+        case .unexpectedMutationGeneration:
+            "The recovery store changed before the requested mutation."
+        case .recoveryRecordsNotEmpty:
+            "The requested recovery mutation requires an empty record set."
+        case .conflictingEntryID:
+            "The recovery entry identifier is already in use."
+        case .missingRecoveryEntry:
+            "The requested recovery entry is unavailable."
+        case .recoveryEntryEvicted:
+            "The recovery entry could not be retained."
+        case .mutationGenerationExhausted:
+            "The recovery store generation cannot advance further."
         }
     }
 }
@@ -49,6 +67,19 @@ struct RawRecoveryEntry: Identifiable, Sendable, Equatable {
     }
 }
 
+/// A store-owned receipt for the narrowly supported G4 decoded-conflict path.
+///
+/// The receipt deliberately exposes the complete records for one identity and
+/// a generation assigned by this store. It is not a general recovery-store
+/// transaction API: raw evidence, record loading, migration, and cross-restart
+/// generation continuity remain P1 work.
+struct SessionRecoveryStoreMutationReceipt: Sendable, Equatable {
+    let previousGeneration: UInt64
+    let generation: UInt64
+    let decodedEntries: [RecoveryEntry]
+    let rawEntries: [RawRecoveryEntry]
+}
+
 @MainActor
 final class SessionRecoveryStore {
     private static let maximumResidentRawRecoveryBytes = 1 * 1_024 * 1_024
@@ -64,6 +95,13 @@ final class SessionRecoveryStore {
     private let migrationWriteHook: ((Int) throws -> Void)?
     private var entries: [RecoveryEntry] = []
     private var rawEntries: [RawRecoveryEntry] = []
+    /// Only typed G4 mutations advance these live-store counters. Generations
+    /// are identity-scoped because independent documents share this store but
+    /// do not share a recovery mutation history. Existing recovery data is
+    /// intentionally not reconstructed into a mutable typed session; it
+    /// remains fail-closed until P1 provides the actor-backed persistent
+    /// transaction boundary.
+    private var mutationGenerations: [DocumentIdentity: UInt64] = [:]
 
     init(
         persistenceDirectory: URL? = nil,
@@ -79,7 +117,10 @@ final class SessionRecoveryStore {
         importPendingCommitRecoveries()
     }
 
-    func add(snapshot: DocumentSnapshot, for identity: DocumentIdentity) throws {
+    func add(
+        snapshot: DocumentSnapshot,
+        for identity: DocumentIdentity
+    ) throws {
         let entry = RecoveryEntry(
             id: UUID(),
             documentIdentity: identity,
@@ -89,6 +130,89 @@ final class SessionRecoveryStore {
         try persist(entry)
         entries.insert(entry, at: 0)
         trim()
+    }
+
+    /// Persists a fresh decoded conflict and returns a truthful, store-owned
+    /// receipt. This intentionally supports only an empty record set so the
+    /// compatibility adapter cannot reinterpret pre-existing recovery data.
+    func persistFreshDecodedConflict(
+        id: UUID,
+        snapshot: DocumentSnapshot,
+        for identity: DocumentIdentity,
+        expectedGeneration: UInt64
+    ) throws -> SessionRecoveryStoreMutationReceipt {
+        try validateTypedMutation(
+            for: identity,
+            expectedGeneration: expectedGeneration
+        )
+        guard perDocumentLimit > 0 else {
+            throw SessionRecoveryStoreError.recoveryEntryEvicted
+        }
+        guard decodedEntries(for: identity).isEmpty,
+              rawRecoveryEntries(for: identity).isEmpty else {
+            throw SessionRecoveryStoreError.recoveryRecordsNotEmpty
+        }
+        guard !entries.contains(where: { $0.id == id }),
+              !rawEntries.contains(where: { $0.id == id }) else {
+            throw SessionRecoveryStoreError.conflictingEntryID
+        }
+
+        let entry = RecoveryEntry(
+            id: id,
+            documentIdentity: identity,
+            snapshot: snapshot,
+            createdAt: Date()
+        )
+        try persist(entry)
+        entries.insert(entry, at: 0)
+        trim()
+        guard decodedEntries(for: identity).contains(entry),
+              rawRecoveryEntries(for: identity).isEmpty else {
+            throw SessionRecoveryStoreError.recoveryEntryEvicted
+        }
+
+        let previousGeneration = advanceTypedMutationGeneration(for: identity)
+        return typedMutationReceipt(
+            for: identity,
+            previousGeneration: previousGeneration
+        )
+    }
+
+    /// Advances the live generation for a recordless identity transition.
+    /// This is the only migration supported before P1: neither side may hold
+    /// decoded or raw evidence, so the operation changes no recovery files.
+    func advanceEmptyRecoveryMigration(
+        from sourceIdentity: DocumentIdentity,
+        to destinationIdentity: DocumentIdentity,
+        expectedGeneration: UInt64
+    ) throws -> SessionRecoveryStoreMutationReceipt {
+        try validateTypedMutation(
+            for: sourceIdentity,
+            expectedGeneration: expectedGeneration
+        )
+        guard decodedEntries(for: sourceIdentity).isEmpty,
+              rawRecoveryEntries(for: sourceIdentity).isEmpty,
+              decodedEntries(for: destinationIdentity).isEmpty,
+              rawRecoveryEntries(for: destinationIdentity).isEmpty else {
+            throw SessionRecoveryStoreError.recoveryRecordsNotEmpty
+        }
+        if sourceIdentity != destinationIdentity,
+           typedMutationGeneration(for: destinationIdentity) != 0 {
+            throw SessionRecoveryStoreError.unexpectedMutationGeneration
+        }
+
+        let previousGeneration = typedMutationGeneration(for: sourceIdentity)
+        let nextGeneration = previousGeneration + 1
+        if sourceIdentity == destinationIdentity {
+            mutationGenerations[sourceIdentity] = nextGeneration
+        } else {
+            mutationGenerations.removeValue(forKey: sourceIdentity)
+            mutationGenerations[destinationIdentity] = nextGeneration
+        }
+        return typedMutationReceipt(
+            for: destinationIdentity,
+            previousGeneration: previousGeneration
+        )
     }
 
     @discardableResult
@@ -192,10 +316,86 @@ final class SessionRecoveryStore {
         entries.first { $0.documentIdentity == identity }
     }
 
+    /// Removes precisely one freshly decoded conflict after its durable file
+    /// has been removed. It does not generalize to raw, selected, or
+    /// multi-record cleanup; those paths remain P1-only.
+    func discardExactDecodedConflict(
+        _ entry: RecoveryEntry,
+        for identity: DocumentIdentity,
+        expectedGeneration: UInt64
+    ) throws -> SessionRecoveryStoreMutationReceipt {
+        try validateTypedMutation(
+            for: identity,
+            expectedGeneration: expectedGeneration
+        )
+        guard entry.documentIdentity == identity,
+              decodedEntries(for: identity) == [entry],
+              rawRecoveryEntries(for: identity).isEmpty else {
+            throw SessionRecoveryStoreError.missingRecoveryEntry
+        }
+        if let persistenceDirectory {
+            let url = snapshotURL(for: entry.id, in: persistenceDirectory)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw SessionRecoveryStoreError.missingRecoveryEntry
+            }
+            try FileManager.default.removeItem(at: url)
+        }
+        entries.removeAll { $0 == entry }
+
+        let previousGeneration = advanceTypedMutationGeneration(for: identity)
+        return typedMutationReceipt(
+            for: identity,
+            previousGeneration: previousGeneration
+        )
+    }
+
+    private func decodedEntries(for identity: DocumentIdentity) -> [RecoveryEntry] {
+        entries.filter { $0.documentIdentity == identity }
+    }
+
     func rawRecoveryEntries(
         for identity: DocumentIdentity
     ) -> [RawRecoveryEntry] {
         rawEntries.filter { $0.documentIdentity == identity }
+    }
+
+    /// Returns only the live typed generation for one identity. It does not
+    /// load, reinterpret, or authorize persisted recovery records.
+    func typedMutationGeneration(for identity: DocumentIdentity) -> UInt64 {
+        mutationGenerations[identity, default: 0]
+    }
+
+    private func validateTypedMutation(
+        for identity: DocumentIdentity,
+        expectedGeneration: UInt64
+    ) throws {
+        let currentGeneration = typedMutationGeneration(for: identity)
+        guard currentGeneration == expectedGeneration else {
+            throw SessionRecoveryStoreError.unexpectedMutationGeneration
+        }
+        guard currentGeneration < UInt64.max else {
+            throw SessionRecoveryStoreError.mutationGenerationExhausted
+        }
+    }
+
+    private func advanceTypedMutationGeneration(
+        for identity: DocumentIdentity
+    ) -> UInt64 {
+        let previousGeneration = typedMutationGeneration(for: identity)
+        mutationGenerations[identity] = previousGeneration + 1
+        return previousGeneration
+    }
+
+    private func typedMutationReceipt(
+        for identity: DocumentIdentity,
+        previousGeneration: UInt64
+    ) -> SessionRecoveryStoreMutationReceipt {
+        SessionRecoveryStoreMutationReceipt(
+            previousGeneration: previousGeneration,
+            generation: typedMutationGeneration(for: identity),
+            decodedEntries: decodedEntries(for: identity),
+            rawEntries: rawRecoveryEntries(for: identity)
+        )
     }
 
     func remove(_ entry: RecoveryEntry) {

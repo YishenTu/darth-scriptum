@@ -280,7 +280,7 @@ final class LivePreviewTextViewTests: XCTestCase {
         window.layoutIfNeeded()
         try await waitUntil {
             let identifiers = Set(
-                self.descendantTextViews(in: hostingView)
+                MarkdownEngineCompatibility.nativeTextViews(in: hostingView)
                     .compactMap(\.identifier?.rawValue)
             )
             return identifiers.contains(
@@ -296,12 +296,12 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
 
         try await waitUntil {
-            self.descendantTextViews(in: hostingView)
+            MarkdownEngineCompatibility.nativeTextViews(in: hostingView)
                 .allSatisfy { $0.string == updatedSource }
         }
         XCTAssertEqual(secondaryPane.selectedRange.location, 15)
         let secondaryTextView = try XCTUnwrap(
-            descendantTextViews(in: hostingView)
+            MarkdownEngineCompatibility.nativeTextViews(in: hostingView)
                 .first(where: {
                     $0.identifier?.rawValue
                         == "DarthScriptum.MarkdownEditor."
@@ -354,10 +354,12 @@ final class LivePreviewTextViewTests: XCTestCase {
         window.layoutIfNeeded()
 
         try await waitUntil {
-            self.descendantTextViews(in: hostingView).count == 1
+            MarkdownEngineCompatibility.nativeTextViews(
+                in: hostingView
+            ).count == 1
         }
         let textView = try XCTUnwrap(
-            descendantTextViews(in: hostingView).first
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
         )
         try await waitUntil {
             textView.identifier?.rawValue
@@ -384,16 +386,14 @@ final class LivePreviewTextViewTests: XCTestCase {
                 at: headingLocation,
                 effectiveRange: nil
             ) as? NSFont
-            let bullet = storage.attribute(
-                NSAttributedString.Key("BulletListMarker"),
-                at: bulletLocation,
-                effectiveRange: nil
-            ) as? Bool
-            let inlineLatex = storage.attribute(
-                NSAttributedString.Key("LatexRenderedImage"),
-                at: inlineLatexLocation,
-                effectiveRange: nil
-            ) as? NSImage
+            let bullet = MarkdownEngineCompatibility.isBulletListMarker(
+                in: storage,
+                at: bulletLocation
+            )
+            let inlineLatex = MarkdownEngineCompatibility.renderedBlock(
+                in: storage,
+                at: inlineLatexLocation
+            )?.image
             return headingFont?.pointSize == 28
                 && bullet == true
                 && inlineLatex != nil
@@ -413,24 +413,23 @@ final class LivePreviewTextViewTests: XCTestCase {
             NSFontManager.shared.traits(of: headingFont)
                 .contains(.boldFontMask)
         )
-        XCTAssertEqual(
-            textView.textStorage?.attribute(
-                NSAttributedString.Key("BulletListMarker"),
-                at: (source as NSString).range(of: "- item").location,
-                effectiveRange: nil
-            ) as? Bool,
-            true
+        XCTAssertTrue(
+            MarkdownEngineCompatibility.isBulletListMarker(
+                in: try XCTUnwrap(textView.textStorage),
+                at: (source as NSString).range(of: "- item").location
+            )
         )
         XCTAssertNotNil(
-            textView.textStorage?.attribute(
-                NSAttributedString.Key("LatexRenderedImage"),
-                at: (source as NSString).range(of: "4+3=7").location,
-                effectiveRange: nil
-            ) as? NSImage
+            textView.textStorage.flatMap {
+                MarkdownEngineCompatibility.renderedBlock(
+                    in: $0,
+                    at: (source as NSString).range(of: "4+3=7").location
+                )?.image
+            }
         )
         let storage = try XCTUnwrap(textView.textStorage)
         XCTAssertTrue(
-            containsRenderedLatex(
+            MarkdownEngineCompatibility.containsRenderedImage(
                 in: storage,
                 range: NSRange(
                     location: (source as NSString).range(of: "$$").location,
@@ -480,10 +479,12 @@ final class LivePreviewTextViewTests: XCTestCase {
         window.layoutIfNeeded()
 
         try await waitUntil(timeout: .seconds(5)) {
-            self.descendantTextViews(in: hostingView).count == 1
+            MarkdownEngineCompatibility.nativeTextViews(
+                in: hostingView
+            ).count == 1
         }
         let textView = try XCTUnwrap(
-            descendantTextViews(in: hostingView).first
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
         )
 
         try await waitUntil(timeout: .seconds(5)) {
@@ -491,7 +492,7 @@ final class LivePreviewTextViewTests: XCTestCase {
                   storage.length == (source as NSString).length else {
                 return false
             }
-            return self.containsRenderedLatex(
+            return MarkdownEngineCompatibility.containsRenderedImage(
                 in: storage,
                 range: NSRange(location: 0, length: storage.length)
             )
@@ -499,7 +500,7 @@ final class LivePreviewTextViewTests: XCTestCase {
 
         XCTAssertEqual(textView.string, source)
         XCTAssertTrue(
-            containsRenderedLatex(
+            MarkdownEngineCompatibility.containsRenderedImage(
                 in: try XCTUnwrap(textView.textStorage),
                 range: NSRange(
                     location: 0,
@@ -549,10 +550,12 @@ final class LivePreviewTextViewTests: XCTestCase {
         window.layoutIfNeeded()
 
         try await waitUntil {
-            self.descendantTextViews(in: hostingView).count == 1
+            MarkdownEngineCompatibility.nativeTextViews(
+                in: hostingView
+            ).count == 1
         }
         let textView = try XCTUnwrap(
-            descendantTextViews(in: hostingView).first
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
         )
         try await waitUntil {
             textView.identifier?.rawValue
@@ -608,10 +611,12 @@ final class LivePreviewTextViewTests: XCTestCase {
         window.layoutIfNeeded()
 
         try await waitUntil {
-            self.descendantTextViews(in: hostingView).count == 1
+            MarkdownEngineCompatibility.nativeTextViews(
+                in: hostingView
+            ).count == 1
         }
         let textView = try XCTUnwrap(
-            descendantTextViews(in: hostingView).first
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
         )
         try await waitUntil {
             textView.identifier?.rawValue
@@ -682,10 +687,12 @@ final class LivePreviewTextViewTests: XCTestCase {
         window.contentView = hostingView
         window.layoutIfNeeded()
         try await waitUntil {
-            self.descendantTextViews(in: hostingView).count == 1
+            MarkdownEngineCompatibility.nativeTextViews(
+                in: hostingView
+            ).count == 1
         }
         let textView = try XCTUnwrap(
-            descendantTextViews(in: hostingView).first
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
         )
         try await waitUntil {
             textView.identifier?.rawValue
@@ -730,10 +737,12 @@ final class LivePreviewTextViewTests: XCTestCase {
         window.contentView = hostingView
         window.layoutIfNeeded()
         try await waitUntil {
-            self.descendantTextViews(in: hostingView).count == 1
+            MarkdownEngineCompatibility.nativeTextViews(
+                in: hostingView
+            ).count == 1
         }
         let textView = try XCTUnwrap(
-            descendantTextViews(in: hostingView).first
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
         )
         try await waitUntil {
             textView.identifier?.rawValue
@@ -820,27 +829,4 @@ final class LivePreviewTextViewTests: XCTestCase {
         XCTFail("Timed out waiting for editor state.")
     }
 
-    private func descendantTextViews(in view: NSView) -> [NSTextView] {
-        if let textView = view as? NSTextView {
-            return [textView]
-        }
-        return view.subviews.flatMap(descendantTextViews)
-    }
-
-    private func containsRenderedLatex(
-        in storage: NSTextStorage,
-        range: NSRange
-    ) -> Bool {
-        var found = false
-        storage.enumerateAttribute(
-            NSAttributedString.Key("LatexRenderedImage"),
-            in: range
-        ) { value, _, stop in
-            if value is NSImage {
-                found = true
-                stop.pointee = true
-            }
-        }
-        return found
-    }
 }

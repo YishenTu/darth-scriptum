@@ -36,6 +36,116 @@ final class SessionRecoveryStoreTests: XCTestCase {
         )
     }
 
+    func testFreshConflictReceiptUsesStoreGenerationAndDurablyRemovesExactEntry()
+        throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let identity = DocumentIdentity(stableKey: "path:/tmp/exact-id.md")
+        let snapshot = DocumentSnapshot(
+            text: "exact recovery\n",
+            format: .newDocument
+        )
+        let entryID = UUID()
+        let store = SessionRecoveryStore(persistenceDirectory: directory)
+
+        XCTAssertThrowsError(
+            try store.persistFreshDecodedConflict(
+                id: entryID,
+                snapshot: snapshot,
+                for: identity,
+                expectedGeneration: 1
+            )
+        )
+
+        let persisted = try store.persistFreshDecodedConflict(
+            id: entryID,
+            snapshot: snapshot,
+            for: identity,
+            expectedGeneration: 0
+        )
+        let entry = try XCTUnwrap(persisted.decodedEntries.first)
+
+        XCTAssertEqual(persisted.previousGeneration, 0)
+        XCTAssertEqual(persisted.generation, 1)
+        XCTAssertEqual(entry.id, entryID)
+        XCTAssertEqual(persisted.decodedEntries, [entry])
+        XCTAssertTrue(persisted.rawEntries.isEmpty)
+        XCTAssertEqual(store.latest(for: identity), entry)
+
+        let discarded = try store.discardExactDecodedConflict(
+            entry,
+            for: identity,
+            expectedGeneration: persisted.generation
+        )
+
+        XCTAssertEqual(discarded.previousGeneration, 1)
+        XCTAssertEqual(discarded.generation, 2)
+        XCTAssertTrue(discarded.decodedEntries.isEmpty)
+        XCTAssertTrue(discarded.rawEntries.isEmpty)
+        XCTAssertNil(store.latest(for: identity))
+        XCTAssertNil(SessionRecoveryStore(persistenceDirectory: directory).latest(for: identity))
+    }
+
+    func testEmptyMigrationAdvancesTheDestinationGenerationForFreshConflict()
+        throws {
+        let source = DocumentIdentity(stableKey: "path:/tmp/empty-source.md")
+        let destination = DocumentIdentity(
+            stableKey: "path:/tmp/empty-destination.md"
+        )
+        let snapshot = DocumentSnapshot(
+            text: "fresh conflict\n",
+            format: .newDocument
+        )
+        let store = SessionRecoveryStore()
+
+        let migration = try store.advanceEmptyRecoveryMigration(
+            from: source,
+            to: destination,
+            expectedGeneration: 0
+        )
+
+        XCTAssertEqual(migration.previousGeneration, 0)
+        XCTAssertEqual(migration.generation, 1)
+        XCTAssertTrue(migration.decodedEntries.isEmpty)
+        XCTAssertTrue(migration.rawEntries.isEmpty)
+
+        let persisted = try store.persistFreshDecodedConflict(
+            id: UUID(),
+            snapshot: snapshot,
+            for: destination,
+            expectedGeneration: migration.generation
+        )
+
+        XCTAssertEqual(persisted.previousGeneration, 1)
+        XCTAssertEqual(persisted.generation, 2)
+        XCTAssertEqual(persisted.decodedEntries.first?.snapshot, snapshot)
+    }
+
+    func testTypedConflictGenerationsAreIndependentPerDocumentIdentity()
+        throws {
+        let firstIdentity = DocumentIdentity(stableKey: "path:/tmp/first.md")
+        let secondIdentity = DocumentIdentity(stableKey: "path:/tmp/second.md")
+        let store = SessionRecoveryStore()
+
+        let first = try store.persistFreshDecodedConflict(
+            id: UUID(),
+            snapshot: DocumentSnapshot(text: "first\n", format: .newDocument),
+            for: firstIdentity,
+            expectedGeneration: 0
+        )
+        let second = try store.persistFreshDecodedConflict(
+            id: UUID(),
+            snapshot: DocumentSnapshot(text: "second\n", format: .newDocument),
+            for: secondIdentity,
+            expectedGeneration: 0
+        )
+
+        XCTAssertEqual(first.previousGeneration, 0)
+        XCTAssertEqual(first.generation, 1)
+        XCTAssertEqual(second.previousGeneration, 0)
+        XCTAssertEqual(second.generation, 1)
+    }
+
     func testRawRecoverySurvivesStoreRecreationWithoutDecoding() throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

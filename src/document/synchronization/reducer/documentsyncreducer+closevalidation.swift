@@ -517,7 +517,14 @@ extension DocumentSyncReducer {
     }
 
     static func canCoordinate(_ state: DocumentSyncState) -> Bool {
-        canAcceptSourceChanges(state)
+        // A failed atomic replacement leaves the original destination
+        // intentionally non-writable. Local edits remain valid, but no save,
+        // monitor reconciliation, or close flush may resume until the user
+        // explicitly selects a new Save As destination.
+        guard state.issue?.failure != .destinationRequiresSaveAs else {
+            return false
+        }
+        return canAcceptSourceChanges(state)
     }
 
     static func canScheduleLocalSave(_ state: DocumentSyncState) -> Bool {

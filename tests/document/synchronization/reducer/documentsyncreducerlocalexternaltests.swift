@@ -136,6 +136,15 @@ extension DocumentSyncReducerTests {
         )
         XCTAssertEqual(merged.state.source.text, "local base external")
         XCTAssertTrue(merged.state.local.isDirty)
+        XCTAssertEqual(merged.state.durableBaseline?.snapshot, external.snapshot)
+        XCTAssertEqual(
+            merged.state.durableBaseline?.fingerprint,
+            external.fingerprint
+        )
+        XCTAssertEqual(
+            merged.state.durableBaseline?.sourceRevision.text,
+            external.snapshot.text
+        )
         XCTAssertNotNil(deadline(in: merged.effects, kind: .localSave))
     }
 
@@ -635,6 +644,29 @@ extension DocumentSyncReducerTests {
         let retried = DocumentSyncReducer.reduce(failed.state, event: .retry)
         XCTAssertEqual(retried.state, failed.state)
         XCTAssertTrue(retried.effects.isEmpty)
+
+        let requestedSave = DocumentSyncReducer.reduce(
+            failed.state,
+            event: .saveRequested
+        )
+        XCTAssertEqual(requestedSave.state, failed.state)
+        XCTAssertTrue(requestedSave.effects.isEmpty)
+
+        let laterLocalRevision = SourceRevision(
+            number: failed.state.source.number + 1,
+            text: "later local edit"
+        )
+        let edited = DocumentSyncReducer.reduce(
+            failed.state,
+            event: .sourceChanged(laterLocalRevision, format: .newDocument)
+        )
+        XCTAssertEqual(edited.state.source, laterLocalRevision)
+        XCTAssertEqual(
+            edited.state.issue?.failure,
+            .destinationRequiresSaveAs
+        )
+        XCTAssertNil(edited.state.activeTokens[.savePreparation])
+        XCTAssertTrue(edited.effects.isEmpty)
     }
 
 }

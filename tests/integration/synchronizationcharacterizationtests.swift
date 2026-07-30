@@ -231,16 +231,15 @@ final class SynchronizationCharacterizationTests: XCTestCase {
         let restoreSave = try XCTUnwrap(requestedTokens.last)
         let result = try SafeFileCommitter().commit(restoreSave)
         try coordinator.bridge.store(result)
-        XCTAssertTrue(
-            coordinator.handleSaveCompletion(
-                generation: restoreSave.generation,
-                error: nil
-            )
+        _ = coordinator.handleSaveCompletion(
+            generation: restoreSave.generation,
+            error: nil
         )
         try await waitUntil {
             (try? String(contentsOf: fixture.url, encoding: .utf8))
                 == "hallo\n"
                 && !coordinator.hasLocalRecovery
+                && coordinator.state == .idle
         }
     }
 

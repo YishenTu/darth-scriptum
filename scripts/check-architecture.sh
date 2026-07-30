@@ -158,8 +158,8 @@ scan_pattern \
     "editor must not reference concrete synchronization or persistence types"
 
 markdown_engine_compatibility_file="$(first_existing_file \
-    "$editor_directory/markdownenginecompatibility.swift" \
-    "$editor_directory/markdownenginecompatibility.swiftfixture" || true)"
+    "$editor_directory/compatibility/markdownenginecompatibility.swift" \
+    "$editor_directory/compatibility/markdownenginecompatibility.swiftfixture" || true)"
 if [[ -n "$markdown_engine_compatibility_file" ]]; then
     scan_pattern \
         "$source_root" \
@@ -175,5 +175,5 @@ fi
 
 print "Architecture check passed."
 if [[ -z "$markdown_engine_compatibility_file" ]]; then
-    print "Migration target: raw MarkdownEngine internal-key location enforcement activates when E1 adds src/editor/markdownenginecompatibility.swift."
+    print "Migration target: raw MarkdownEngine internal-key location enforcement activates when E1 adds src/editor/compatibility/markdownenginecompatibility.swift."
 fi

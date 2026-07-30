@@ -40,9 +40,26 @@ repository root, or use `--repo-root <fixture-root>` for isolated fixtures.
 composition adapter is app-owned at `src/app/document/markdowndocument.swift`.
 The architecture check rejects reintroduction of either legacy document path.
 
-The raw MarkdownEngine internal-key rule becomes active when E1 adds
-`src/editor/markdownenginecompatibility.swift`; current key use is intentionally
-not moved during F1.
+The raw MarkdownEngine internal-key rule lives at
+`src/editor/compatibility/markdownenginecompatibility.swift`.
+
+## Editor source layout
+
+The editor is grouped by responsibility so rendering, native composition, and
+dependency compatibility do not read as one undifferentiated folder:
+
+```text
+src/editor/
+  compatibility/  # MarkdownEngine adapter and internal-key boundary
+  composition/    # SwiftUI/AppKit pane and text-view coordination
+  presentation/   # Markdown and Mermaid display behavior
+  rendering/      # LaTeX and Mermaid renderer-specific queues/caches
+  web/            # Local-only WebKit policy and shared lifecycle
+```
+
+`tests/editor/` mirrors this layout where a test belongs to one of those
+boundaries. The Xcode project uses file-system synchronized groups, so these
+paths are the build inputs without duplicate project-file entries.
 
 ## Source and file authority
 

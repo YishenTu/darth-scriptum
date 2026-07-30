@@ -155,11 +155,12 @@ final class MermaidRendererTests: XCTestCase {
 
         let anchor = (source as NSString).range(of: "flowchart").location
         XCTAssertNotNil(
-            textView.textStorage?.attribute(
-                NSAttributedString.Key("LatexRenderedImage"),
-                at: anchor,
-                effectiveRange: nil
-            ) as? NSImage
+            textView.textStorage.flatMap {
+                MarkdownEngineCompatibility.renderedBlock(
+                    in: $0,
+                    at: anchor
+                )?.image
+            }
         )
         XCTAssertEqual(textView.string, source)
         XCTAssertEqual(
@@ -212,11 +213,12 @@ final class MermaidRendererTests: XCTestCase {
 
         let anchor = (staleSource as NSString).range(of: "flowchart").location
         XCTAssertNil(
-            textView.textStorage?.attribute(
-                NSAttributedString.Key("LatexRenderedImage"),
-                at: anchor,
-                effectiveRange: nil
-            )
+            textView.textStorage.flatMap {
+                MarkdownEngineCompatibility.renderedBlock(
+                    in: $0,
+                    at: anchor
+                )?.image
+            }
         )
         XCTAssertEqual(textView.string, staleSource)
     }
@@ -296,18 +298,22 @@ final class MermaidRendererTests: XCTestCase {
         window.layoutIfNeeded()
 
         try await waitUntil {
-            self.descendantTextViews(in: hostingView).count == 1
+            MarkdownEngineCompatibility.nativeTextViews(
+                in: hostingView
+            ).count == 1
         }
         let textView = try XCTUnwrap(
-            descendantTextViews(in: hostingView).first
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
         )
         let anchor = (source as NSString).range(of: "flowchart").location
         try await waitUntil {
-            textView.textStorage?.attribute(
-                NSAttributedString.Key("LatexRenderedImage"),
-                at: anchor,
-                effectiveRange: nil
-            ) is NSImage
+            guard let textStorage = textView.textStorage else {
+                return false
+            }
+            return MarkdownEngineCompatibility.renderedBlock(
+                in: textStorage,
+                at: anchor
+            )?.image != nil
         }
 
         XCTAssertEqual(textView.string, source)
@@ -319,10 +325,12 @@ final class MermaidRendererTests: XCTestCase {
             object: textView
         )
         try await waitUntil {
-            textView.textStorage?.attribute(
-                NSAttributedString.Key("LatexRenderedImage"),
-                at: anchor,
-                effectiveRange: nil
+            guard let textStorage = textView.textStorage else {
+                return false
+            }
+            return MarkdownEngineCompatibility.renderedBlock(
+                in: textStorage,
+                at: anchor
             ) == nil
         }
 
@@ -483,12 +491,6 @@ final class MermaidRendererTests: XCTestCase {
         XCTFail("Timed out waiting for Mermaid state.")
     }
 
-    private func descendantTextViews(in view: NSView) -> [NSTextView] {
-        if let textView = view as? NSTextView {
-            return [textView]
-        }
-        return view.subviews.flatMap(descendantTextViews)
-    }
 }
 
 @MainActor

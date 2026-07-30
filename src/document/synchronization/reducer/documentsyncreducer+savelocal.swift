@@ -24,7 +24,8 @@ extension DocumentSyncReducer {
         var updated = state
         updated.source = revision
         updated.format = format
-        if !recoveryBlocksAutomation(updated) {
+        if !recoveryBlocksAutomation(updated),
+           updated.issue?.failure != .destinationRequiresSaveAs {
             updated.issue = nil
         }
         updateClosingRevision(&updated, to: revision)

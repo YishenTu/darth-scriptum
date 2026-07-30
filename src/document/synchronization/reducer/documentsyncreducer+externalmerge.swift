@@ -177,6 +177,24 @@ extension DocumentSyncReducer {
         case .merged(let snapshot):
             updated.source = updated.source.advanced(to: snapshot.text)
             updated.format = snapshot.format
+            if case .externalRead = merge.origin {
+                // The merge result is not yet durable. The verified external
+                // observation remains the only valid preimage for the next
+                // commit, even though the in-memory source now contains the
+                // merged text.
+                let externalRevision = SourceRevision(
+                    number: merge.localSourceRevision.number,
+                    text: merge.external.snapshot.text
+                )
+                updated.durableBaseline =
+                    DocumentSyncDurableBaseline.fromExternalChange(
+                        merge.external,
+                        sourceRevision: externalRevision,
+                        commitGeneration:
+                            merge.baseline?.commitGeneration ?? 0
+                    )
+                updated.lastCommitSafety = nil
+            }
             updated.local = .dirty(
                 DocumentSyncDirtyState(
                     revision: updated.source,

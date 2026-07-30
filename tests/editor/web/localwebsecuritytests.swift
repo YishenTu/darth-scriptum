@@ -194,26 +194,13 @@ final class LocalWebSecurityTests: XCTestCase {
                     resourceRootURL: directoryURL
                 )
             )
-            let configuration = WKWebViewConfiguration()
-            configuration.websiteDataStore = .nonPersistent()
-            configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-            configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+            let session = LocalWebRenderSession(resourcePolicy: policy)
+            defer { session.dispose() }
 
-            let webView = WKWebView(frame: .zero, configuration: configuration)
-            let navigationObserver = LocalWebNavigationObserver(policy: policy)
-            webView.navigationDelegate = navigationObserver
-            webView.uiDelegate = policy
-            defer {
-                webView.stopLoading()
-                webView.navigationDelegate = nil
-                webView.uiDelegate = nil
-            }
-
-            policy.loadEntry(in: webView)
-            try await waitForHostileFixture(
-                in: webView,
-                navigationObserver: navigationObserver
-            )
+            let didLoad = await session.waitUntilReady()
+            XCTAssertTrue(didLoad)
+            let webView = try XCTUnwrap(session.webViewForTesting)
+            try await waitForHostileFixture(in: webView)
             let windowWasDenied = try await webView.callAsyncJavaScript(
                 "return window.__hostileWindowWasDenied === true;",
                 arguments: [:],
@@ -222,10 +209,192 @@ final class LocalWebSecurityTests: XCTestCase {
             ) as? Bool
 
             XCTAssertTrue(windowWasDenied ?? false)
-            XCTAssertTrue(navigationObserver.didFinish)
-            XCTAssertNil(navigationObserver.loadError)
+            XCTAssertTrue(session.isReadyForTesting)
             XCTAssertEqual(listener.requestCount, 0)
         }
+    }
+
+    func testSessionsAndBackendsDeferWebViewAllocationUntilRequested()
+        async throws {
+        let session = LocalWebRenderSession(resourcePolicy: nil)
+        let mathJaxRenderer = MathJaxFallbackRenderer()
+        let mermaidRenderer = MermaidWebRenderer()
+        defer {
+            session.dispose()
+            mathJaxRenderer.sessionForTesting.dispose()
+            mermaidRenderer.sessionForTesting.dispose()
+        }
+
+        XCTAssertNil(session.webViewForTesting)
+        XCTAssertNil(session.webViewForTesting)
+        XCTAssertNil(mathJaxRenderer.sessionForTesting.webViewForTesting)
+        XCTAssertNil(mermaidRenderer.sessionForTesting.webViewForTesting)
+
+        async let evaluation = session.waitForJavaScriptEvaluationForTesting(
+            timeout: .seconds(5)
+        )
+        try await waitUntil {
+            session.webViewForTesting != nil
+                && session.hasActiveJavaScriptEvaluationForTesting
+        }
+        session.cancelJavaScriptEvaluationForTesting()
+        guard case .cancelled = await evaluation else {
+            return XCTFail("Expected evaluation cancellation after allocation.")
+        }
+
+        async let mathJaxLoad = mathJaxRenderer.waitForLoadForTesting()
+        try await waitUntil {
+            mathJaxRenderer.sessionForTesting.webViewForTesting != nil
+        }
+        let mathJaxWebView = try XCTUnwrap(
+            mathJaxRenderer.sessionForTesting.webViewForTesting
+        )
+        mathJaxRenderer.sessionForTesting
+            .webViewWebContentProcessDidTerminate(mathJaxWebView)
+        let didLoadMathJax = await mathJaxLoad
+        XCTAssertFalse(didLoadMathJax)
+
+        async let mermaidLoad = mermaidRenderer.waitForLoadForTesting()
+        try await waitUntil {
+            mermaidRenderer.sessionForTesting.webViewForTesting != nil
+        }
+        let mermaidWebView = try XCTUnwrap(
+            mermaidRenderer.sessionForTesting.webViewForTesting
+        )
+        mermaidRenderer.sessionForTesting
+            .webViewWebContentProcessDidTerminate(mermaidWebView)
+        let didLoadMermaid = await mermaidLoad
+        XCTAssertFalse(didLoadMermaid)
+    }
+
+    func testSessionCoalescesConcurrentReadinessIntoOneEntryLoad()
+        async throws {
+        let session = LocalWebRenderSession(
+            resourcePolicy: try mathJaxPolicy()
+        )
+        defer { session.dispose() }
+
+        async let first = session.waitUntilReady()
+        async let second = session.waitUntilReady()
+        try await waitUntil {
+            session.entryLoadCountForTesting == 1
+        }
+
+        let firstResult = await first
+        let secondResult = await second
+        XCTAssertTrue(firstResult)
+        XCTAssertTrue(secondResult)
+        XCTAssertEqual(session.entryLoadCountForTesting, 1)
+    }
+
+    func testSessionResumesReadinessWaitersAndResetsAfterTermination()
+        async throws {
+        let session = LocalWebRenderSession(
+            resourcePolicy: try mathJaxPolicy()
+        )
+        defer { session.dispose() }
+
+        async let first = session.waitForReadinessForTesting(
+            loadsEntry: false
+        )
+        async let second = session.waitForReadinessForTesting(
+            loadsEntry: false
+        )
+        try await waitUntil {
+            session.loadWaiterCountForTesting == 2
+        }
+
+        let terminatedWebView = try XCTUnwrap(session.webViewForTesting)
+        session.webViewWebContentProcessDidTerminate(terminatedWebView)
+
+        let firstResult = await first
+        let secondResult = await second
+        XCTAssertFalse(firstResult)
+        XCTAssertFalse(secondResult)
+        XCTAssertEqual(session.loadWaiterCountForTesting, 0)
+        XCTAssertFalse(session.hasLoadTimeoutForTesting)
+        XCTAssertNil(terminatedWebView.navigationDelegate)
+        XCTAssertNil(terminatedWebView.uiDelegate)
+
+        let replacementWebView = try XCTUnwrap(session.webViewForTesting)
+        XCTAssertFalse(replacementWebView === terminatedWebView)
+
+        session.reload()
+        try await waitUntil {
+            session.entryLoadCountForTesting == 1
+        }
+        let didReload = await session.waitUntilReady()
+        XCTAssertTrue(didReload)
+    }
+
+    func testSessionTimesOutCancelsAndDisposesJavaScriptEvaluations()
+        async throws {
+        let session = LocalWebRenderSession(
+            resourcePolicy: nil,
+            javaScriptTimeout: .milliseconds(10)
+        )
+        defer { session.dispose() }
+
+        async let timedOut = session.waitForJavaScriptEvaluationForTesting()
+        guard case .timedOut = await timedOut else {
+            return XCTFail("Expected the session evaluation to time out.")
+        }
+        XCTAssertFalse(session.hasActiveJavaScriptEvaluationForTesting)
+
+        async let cancelled = session.waitForJavaScriptEvaluationForTesting(
+            timeout: .seconds(5)
+        )
+        try await waitUntil {
+            session.hasActiveJavaScriptEvaluationForTesting
+        }
+        session.cancelJavaScriptEvaluationForTesting()
+        guard case .cancelled = await cancelled else {
+            return XCTFail("Expected explicit evaluation cancellation.")
+        }
+
+        async let disposed = session.waitForJavaScriptEvaluationForTesting(
+            timeout: .seconds(5)
+        )
+        try await waitUntil {
+            session.hasActiveJavaScriptEvaluationForTesting
+        }
+        let disposedWebView = try XCTUnwrap(session.webViewForTesting)
+        session.dispose()
+
+        guard case .cancelled = await disposed else {
+            return XCTFail("Expected disposal to cancel the evaluation.")
+        }
+        XCTAssertFalse(session.hasActiveJavaScriptEvaluationForTesting)
+        XCTAssertNil(session.webViewForTesting)
+        XCTAssertNil(disposedWebView.navigationDelegate)
+        XCTAssertNil(disposedWebView.uiDelegate)
+    }
+
+    func testSessionTerminationResolvesActiveEvaluationAndCleansUp()
+        async throws {
+        let session = LocalWebRenderSession(resourcePolicy: nil)
+        defer { session.dispose() }
+
+        async let evaluation = session.waitForJavaScriptEvaluationForTesting(
+            timeout: .seconds(5)
+        )
+        try await waitUntil {
+            session.hasActiveJavaScriptEvaluationForTesting
+        }
+
+        let terminatedWebView = try XCTUnwrap(session.webViewForTesting)
+        session.webViewWebContentProcessDidTerminate(terminatedWebView)
+
+        guard case .processTerminated = await evaluation else {
+            return XCTFail(
+                "Expected process termination to resolve the evaluation."
+            )
+        }
+        XCTAssertFalse(session.hasActiveJavaScriptEvaluationForTesting)
+        XCTAssertNil(terminatedWebView.navigationDelegate)
+        XCTAssertNil(terminatedWebView.uiDelegate)
+        let replacementWebView = try XCTUnwrap(session.webViewForTesting)
+        XCTAssertFalse(replacementWebView === terminatedWebView)
     }
 
     func testMathJaxNavigationFailureResumesLoadWaitersOnceAndCleansUp()
@@ -237,13 +406,13 @@ final class LocalWebSecurityTests: XCTestCase {
             renderer.loadWaiterCountForTesting == 2
         }
 
-        let failedWebView = renderer.webViewForTesting
+        let failedWebView = try XCTUnwrap(renderer.webViewForTesting)
         XCTAssertNotNil(failedWebView.uiDelegate)
         XCTAssertFalse(
             failedWebView.configuration.preferences
                 .javaScriptCanOpenWindowsAutomatically
         )
-        renderer.webView(
+        renderer.sessionForTesting.webView(
             failedWebView,
             didFail: nil,
             withError: NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotLoadFromNetwork)
@@ -258,7 +427,7 @@ final class LocalWebSecurityTests: XCTestCase {
         XCTAssertNil(failedWebView.navigationDelegate)
         XCTAssertNil(failedWebView.uiDelegate)
 
-        renderer.webView(
+        renderer.sessionForTesting.webView(
             failedWebView,
             didFail: nil,
             withError: NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotLoadFromNetwork)
@@ -275,8 +444,10 @@ final class LocalWebSecurityTests: XCTestCase {
             renderer.loadWaiterCountForTesting == 2
         }
 
-        let failedWebView = renderer.webViewForTesting
-        renderer.webViewWebContentProcessDidTerminate(failedWebView)
+        let failedWebView = try XCTUnwrap(renderer.webViewForTesting)
+        renderer.sessionForTesting.webViewWebContentProcessDidTerminate(
+            failedWebView
+        )
 
         let firstResult = await first
         let secondResult = await second
@@ -287,7 +458,9 @@ final class LocalWebSecurityTests: XCTestCase {
         XCTAssertNil(failedWebView.navigationDelegate)
         XCTAssertNil(failedWebView.uiDelegate)
 
-        renderer.webViewWebContentProcessDidTerminate(failedWebView)
+        renderer.sessionForTesting.webViewWebContentProcessDidTerminate(
+            failedWebView
+        )
         XCTAssertEqual(renderer.loadWaiterCountForTesting, 0)
     }
 
@@ -299,13 +472,17 @@ final class LocalWebSecurityTests: XCTestCase {
             renderer.hasActiveInvocationForTesting
         }
 
-        let failedWebView = renderer.webViewForTesting
-        renderer.webViewWebContentProcessDidTerminate(failedWebView)
+        let failedWebView = try XCTUnwrap(renderer.webViewForTesting)
+        renderer.sessionForTesting.webViewWebContentProcessDidTerminate(
+            failedWebView
+        )
 
         let invocationResult = await invocation
         XCTAssertFalse(invocationResult)
         XCTAssertFalse(renderer.hasActiveInvocationForTesting)
-        renderer.webViewWebContentProcessDidTerminate(failedWebView)
+        renderer.sessionForTesting.webViewWebContentProcessDidTerminate(
+            failedWebView
+        )
         XCTAssertFalse(renderer.hasActiveInvocationForTesting)
     }
 
@@ -318,13 +495,13 @@ final class LocalWebSecurityTests: XCTestCase {
             renderer.loadWaiterCountForTesting == 2
         }
 
-        let failedWebView = renderer.webViewForTesting
+        let failedWebView = try XCTUnwrap(renderer.webViewForTesting)
         XCTAssertNotNil(failedWebView.uiDelegate)
         XCTAssertFalse(
             failedWebView.configuration.preferences
                 .javaScriptCanOpenWindowsAutomatically
         )
-        renderer.webView(
+        renderer.sessionForTesting.webView(
             failedWebView,
             didFail: nil,
             withError: NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotLoadFromNetwork)
@@ -339,7 +516,7 @@ final class LocalWebSecurityTests: XCTestCase {
         XCTAssertNil(failedWebView.navigationDelegate)
         XCTAssertNil(failedWebView.uiDelegate)
 
-        renderer.webView(
+        renderer.sessionForTesting.webView(
             failedWebView,
             didFail: nil,
             withError: NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotLoadFromNetwork)
@@ -356,8 +533,10 @@ final class LocalWebSecurityTests: XCTestCase {
             renderer.loadWaiterCountForTesting == 2
         }
 
-        let failedWebView = renderer.webViewForTesting
-        renderer.webViewWebContentProcessDidTerminate(failedWebView)
+        let failedWebView = try XCTUnwrap(renderer.webViewForTesting)
+        renderer.sessionForTesting.webViewWebContentProcessDidTerminate(
+            failedWebView
+        )
 
         let firstResult = await first
         let secondResult = await second
@@ -368,7 +547,9 @@ final class LocalWebSecurityTests: XCTestCase {
         XCTAssertNil(failedWebView.navigationDelegate)
         XCTAssertNil(failedWebView.uiDelegate)
 
-        renderer.webViewWebContentProcessDidTerminate(failedWebView)
+        renderer.sessionForTesting.webViewWebContentProcessDidTerminate(
+            failedWebView
+        )
         XCTAssertEqual(renderer.loadWaiterCountForTesting, 0)
     }
 
@@ -379,6 +560,7 @@ final class LocalWebSecurityTests: XCTestCase {
         port: UInt16
     ) throws {
         let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("fixtures", isDirectory: true)
@@ -397,26 +579,30 @@ final class LocalWebSecurityTests: XCTestCase {
         ).write(to: destinationURL, atomically: true, encoding: .utf8)
     }
 
+    private func mathJaxPolicy() throws -> LocalWebResourcePolicy {
+        try XCTUnwrap(
+            LocalWebResourcePolicy(
+                bundle: .main,
+                entryResourceName: "mathjax-renderer",
+                resourceDirectoryName: "MathJax.bundle"
+            )
+        )
+    }
+
     private func waitForHostileFixture(
-        in webView: WKWebView,
-        navigationObserver: LocalWebNavigationObserver
+        in webView: WKWebView
     ) async throws {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(5))
         while clock.now < deadline {
-            if let error = navigationObserver.loadError {
-                throw error
-            }
-            if navigationObserver.didFinish {
-                let didComplete = try await webView.callAsyncJavaScript(
-                    "return window.__hostileAttemptsComplete === true;",
-                    arguments: [:],
-                    in: nil,
-                    contentWorld: .page
-                ) as? Bool
-                if didComplete == true {
-                    return
-                }
+            let didComplete = try await webView.callAsyncJavaScript(
+                "return window.__hostileAttemptsComplete === true;",
+                arguments: [:],
+                in: nil,
+                contentWorld: .page
+            ) as? Bool
+            if didComplete == true {
+                return
             }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -462,45 +648,6 @@ private enum FixtureError: LocalizedError {
         case .missing:
             "Missing hostile WebKit fixture."
         }
-    }
-}
-
-@MainActor
-private final class LocalWebNavigationObserver: NSObject, WKNavigationDelegate {
-    private let policy: LocalWebResourcePolicy
-    private(set) var didFinish = false
-    private(set) var loadError: (any Error)?
-
-    init(policy: LocalWebResourcePolicy) {
-        self.policy = policy
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation?) {
-        didFinish = true
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        didFail navigation: WKNavigation?,
-        withError error: any Error
-    ) {
-        loadError = error
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        didFailProvisionalNavigation navigation: WKNavigation?,
-        withError error: any Error
-    ) {
-        loadError = error
-    }
-
-    func webView(
-        _ webView: WKWebView,
-        decidePolicyFor navigationAction: WKNavigationAction,
-        decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void
-    ) {
-        decisionHandler(policy.navigationPolicy(for: navigationAction))
     }
 }
 

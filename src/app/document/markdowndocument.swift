@@ -13,16 +13,26 @@ enum MarkdownDocumentSaveError: LocalizedError, Equatable {
 }
 
 @MainActor
-final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
+final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
     private struct EncodedDocument {
         let data: Data
         let snapshot: DocumentSnapshot
+        let sourceRevision: SourceRevision
+    }
+
+    private struct PendingCloseCallback {
+        let delegate: Any
+        let selector: Selector?
+        let contextInfo: UnsafeMutableRawPointer?
     }
 
     let syncCoordinator: DocumentSyncCoordinator
     private let saveBridge: SaveTransactionBridge
     private var sourceObservation: UUID?
     private var lastEncodedDocument: EncodedDocument?
+    private var pendingCloseCallbacks: [PendingCloseCallback] = []
+    private var nativeCloseToken: SyncEffectToken?
+    private var committedCloseToken: SyncEffectToken?
 
     var markdownWindowController: MarkdownWindowController? {
         windowControllers.first as? MarkdownWindowController
@@ -90,7 +100,8 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
             let data = try TextFileCodec.encode(snapshot)
             lastEncodedDocument = EncodedDocument(
                 data: data,
-                snapshot: snapshot
+                snapshot: snapshot,
+                sourceRevision: syncCoordinator.sourceBuffer.revision
             )
             return data
         }
@@ -110,10 +121,10 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
     ) -> Bool {
         guard saveOperation == .saveOperation
                 || saveOperation == .autosaveInPlaceOperation,
-              let token = try? saveBridge.currentToken() else {
+              let request = try? saveBridge.currentCommitRequest() else {
             return false
         }
-        return token.targetURL.standardizedFileURL == url.standardizedFileURL
+        return request.targetURL.standardizedFileURL == url.standardizedFileURL
     }
 
     override nonisolated func writeSafely(
@@ -123,13 +134,13 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
     ) throws {
         if saveOperation == .saveOperation
             || saveOperation == .autosaveInPlaceOperation {
-            guard let token = try? saveBridge.currentToken(),
-                  token.targetURL.standardizedFileURL
+            guard let request = try? saveBridge.currentCommitRequest(),
+                  request.targetURL.standardizedFileURL
                     == url.standardizedFileURL else {
                 throw MarkdownDocumentSaveError.unmanagedInPlaceSave
             }
-            let result = try SafeFileCommitter().commit(token)
-            try saveBridge.store(result)
+            let result = try SafeFileCommitter().commit(request.pendingSave)
+            try saveBridge.store(result, for: request.token)
             return
         }
         try super.writeSafely(to: url, ofType: typeName, for: saveOperation)
@@ -165,7 +176,8 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
                     try await self?.syncCoordinator.attachAfterSaveAs(
                         to: url,
                         expectedData: encoded.data,
-                        expectedSnapshot: encoded.snapshot
+                        expectedSnapshot: encoded.snapshot,
+                        expectedSourceRevision: encoded.sourceRevision
                     )
                     completionHandler(nil)
                 } catch {
@@ -177,18 +189,18 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
 
     func syncCoordinator(
         _ coordinator: DocumentSyncCoordinator,
-        requestSave token: PendingSaveToken
+        requestSave request: DocumentSyncSaveCommitRequest
     ) {
         updateChangeCount(.changeDone)
         save(
-            to: token.targetURL,
+            to: request.targetURL,
             ofType: fileType ?? "net.daringfireball.markdown",
             for: .saveOperation
         ) { [weak self] error in
             Task { @MainActor in
                 guard let self else { return }
                 let isFullySynchronized = self.syncCoordinator.handleSaveCompletion(
-                    generation: token.generation,
+                    token: request.token,
                     error: error
                 )
                 if error == nil, isFullySynchronized {
@@ -228,12 +240,17 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
     }
 
     override func close() {
+        let closeToken = committedCloseToken ?? authorizedCloseToken()
+        super.close()
+        if let closeToken {
+            syncCoordinator.completeClose(token: closeToken, didCommit: true)
+        }
+        committedCloseToken = nil
         syncCoordinator.close()
         if let sourceObservation {
             syncCoordinator.sourceBuffer.removeObserver(sourceObservation)
         }
         sourceObservation = nil
-        super.close()
     }
 
     override func canClose(
@@ -241,35 +258,14 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
         shouldClose shouldCloseSelector: Selector?,
         contextInfo: UnsafeMutableRawPointer?
     ) {
-        guard fileURL != nil else {
-            if !hasUnsavedUntitledContent {
-                updateChangeCount(.changeCleared)
-            }
-            super.canClose(
-                withDelegate: delegate,
-                shouldClose: shouldCloseSelector,
+        pendingCloseCallbacks.append(
+            PendingCloseCallback(
+                delegate: delegate,
+                selector: shouldCloseSelector,
                 contextInfo: contextInfo
             )
-            return
-        }
-        syncCoordinator.flushNow { [weak self] succeeded in
-            guard let self else { return }
-            guard succeeded else {
-                self.sendShouldClose(
-                    false,
-                    to: delegate,
-                    selector: shouldCloseSelector,
-                    contextInfo: contextInfo
-                )
-                return
-            }
-            self.updateChangeCount(.changeCleared)
-            self.completeCanClose(
-                withDelegate: delegate,
-                shouldClose: shouldCloseSelector,
-                contextInfo: contextInfo
-            )
-        }
+        )
+        syncCoordinator.requestClose()
     }
 
     func flushNow() {
@@ -277,16 +273,87 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorDelegate {
         syncCoordinator.flushNow()
     }
 
-    private func completeCanClose(
-        withDelegate delegate: Any,
-        shouldClose shouldCloseSelector: Selector?,
+    func syncCoordinator(
+        _ coordinator: DocumentSyncCoordinator,
+        resolveClose resolution: DocumentSyncCloseResolution
+    ) {
+        guard !pendingCloseCallbacks.isEmpty else {
+            if resolution.disposition == .refuseManagedClose {
+                coordinator.completeClose(token: resolution.token, didCommit: false)
+            }
+            return
+        }
+
+        switch resolution.disposition {
+        case .allowManagedClose:
+            // The reducer has already proven the managed document durable.
+            // Clear AppKit's independent dirty marker before it asks again.
+            updateChangeCount(.changeCleared)
+            beginNativeCloseReview(for: resolution.token)
+        case .refuseManagedClose:
+            resolvePendingCloseCallbacks(false)
+            coordinator.completeClose(token: resolution.token, didCommit: false)
+        case .deferToNativeUntitledReview:
+            if !hasUnsavedUntitledContent {
+                updateChangeCount(.changeCleared)
+            }
+            beginNativeCloseReview(for: resolution.token)
+        }
+    }
+
+    private func beginNativeCloseReview(for token: SyncEffectToken) {
+        guard nativeCloseToken == nil else { return }
+        nativeCloseToken = token
+        super.canClose(
+            withDelegate: self,
+            shouldClose: #selector(
+                nativeCanClose(_:shouldClose:contextInfo:)
+            ),
+            contextInfo: nil
+        )
+    }
+
+    @objc private func nativeCanClose(
+        _ document: NSDocument,
+        shouldClose: Bool,
         contextInfo: UnsafeMutableRawPointer?
     ) {
-        super.canClose(
-            withDelegate: delegate,
-            shouldClose: shouldCloseSelector,
-            contextInfo: contextInfo
-        )
+        _ = document
+        _ = contextInfo
+        guard let token = nativeCloseToken else { return }
+        nativeCloseToken = nil
+        if shouldClose {
+            // Forwarding this answer may cause NSDocumentController to call
+            // `close()` reentrantly. Store the token first; `close()` emits
+            // `closeCommitted` only after AppKit has completed that call.
+            committedCloseToken = token
+            resolvePendingCloseCallbacks(true)
+        } else {
+            resolvePendingCloseCallbacks(false)
+            syncCoordinator.completeClose(token: token, didCommit: false)
+        }
+    }
+
+    private func authorizedCloseToken() -> SyncEffectToken? {
+        guard case .closing(let attempt) = syncCoordinator.reducerState.lifecycle,
+              attempt.resolution == .allowManagedClose
+                || attempt.resolution == .deferToNativeUntitledReview else {
+            return nil
+        }
+        return attempt.token
+    }
+
+    private func resolvePendingCloseCallbacks(_ shouldClose: Bool) {
+        let callbacks = pendingCloseCallbacks
+        pendingCloseCallbacks.removeAll()
+        for callback in callbacks {
+            sendShouldClose(
+                shouldClose,
+                to: callback.delegate,
+                selector: callback.selector,
+                contextInfo: callback.contextInfo
+            )
+        }
     }
 
     private func sendShouldClose(

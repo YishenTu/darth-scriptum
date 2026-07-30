@@ -67,6 +67,10 @@ final class EditorPaneStateCoordinator: NSObject {
         mermaidParseTask = nil
         mermaidParseRevision = nil
         mermaidParseSourceRange = nil
+        MarkdownEngineCompatibility.endObservingSelection(
+            of: textView,
+            observer: self
+        )
         NotificationCenter.default.removeObserver(self)
         if let sourceObservation {
             sourceBuffer.removeObserver(sourceObservation)
@@ -106,14 +110,15 @@ final class EditorPaneStateCoordinator: NSObject {
     }
 
     private func attach(in rootView: NSView) {
-        guard let candidate = descendantTextViews(in: rootView).first else {
+        guard let candidate = MarkdownEngineCompatibility.nativeTextView(
+            in: rootView
+        ) else {
             return
         }
         if candidate !== textView {
-            NotificationCenter.default.removeObserver(
-                self,
-                name: NSTextView.didChangeSelectionNotification,
-                object: textView
+            MarkdownEngineCompatibility.endObservingSelection(
+                of: textView,
+                observer: self
             )
             if let clipView {
                 NotificationCenter.default.removeObserver(
@@ -128,11 +133,10 @@ final class EditorPaneStateCoordinator: NSObject {
             candidate.identifier = NSUserInterfaceItemIdentifier(
                 "DarthScriptum.MarkdownEditor.\(pane.id.uuidString)"
             )
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(selectionDidChange(_:)),
-                name: NSTextView.didChangeSelectionNotification,
-                object: candidate
+            MarkdownEngineCompatibility.beginObservingSelection(
+                of: candidate,
+                observer: self,
+                selector: #selector(selectionDidChange(_:))
             )
             if let clipView {
                 clipView.postsBoundsChangedNotifications = true
@@ -399,13 +403,6 @@ final class EditorPaneStateCoordinator: NSObject {
                 blocks: self.mermaidBlocks
             )
         }
-    }
-
-    private func descendantTextViews(in view: NSView) -> [NSTextView] {
-        if let textView = view as? NSTextView {
-            return [textView]
-        }
-        return view.subviews.flatMap(descendantTextViews)
     }
 
     private func clamped(_ range: NSRange, to text: String) -> NSRange {

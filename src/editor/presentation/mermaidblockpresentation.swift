@@ -203,20 +203,6 @@ enum MermaidFencedBlockParser {
 
 @MainActor
 final class MermaidBlockPresenter {
-    private enum Attribute {
-        static let renderedImage = NSAttributedString.Key(
-            "LatexRenderedImage"
-        )
-        static let imageBounds = NSAttributedString.Key("LatexImageBounds")
-        static let isBlock = NSAttributedString.Key("LatexIsBlock")
-        static let sourceIdentity = NSAttributedString.Key(
-            "MermaidSourceIdentity"
-        )
-        static let displayWidth = NSAttributedString.Key(
-            "MermaidDisplayWidth"
-        )
-    }
-
     private static let markerFont = NSFont.systemFont(ofSize: 0.1)
     private static let maximumDisplayHeight: CGFloat = 4_096
     private static let horizontalPadding: CGFloat = 16
@@ -375,15 +361,16 @@ final class MermaidBlockPresenter {
 
         let anchorRange = NSRange(location: anchorLocation, length: 1)
         let anchorCharacter = text.substring(with: anchorRange)
+        MarkdownEngineCompatibility.applyRenderedBlockImage(
+            image,
+            bounds: CGRect(origin: .zero, size: displaySize),
+            sourceIdentity: sourceIdentity,
+            displayWidth: displaySize.width,
+            to: textStorage,
+            range: anchorRange
+        )
         textStorage.addAttributes(
             [
-                Attribute.renderedImage: image,
-                Attribute.imageBounds: NSValue(
-                    rect: CGRect(origin: .zero, size: displaySize)
-                ),
-                Attribute.isBlock: true,
-                Attribute.sourceIdentity: sourceIdentity,
-                Attribute.displayWidth: displaySize.width,
                 .foregroundColor: NSColor.clear,
                 .backgroundColor: NSColor.clear,
                 .font: Self.markerFont,
@@ -437,18 +424,14 @@ final class MermaidBlockPresenter {
         sourceIdentity: Int,
         displayWidth: CGFloat
     ) -> Bool {
-        let currentIdentity = textStorage.attribute(
-            Attribute.sourceIdentity,
-            at: anchorLocation,
-            effectiveRange: nil
-        ) as? Int
-        let currentWidth = textStorage.attribute(
-            Attribute.displayWidth,
-            at: anchorLocation,
-            effectiveRange: nil
-        ) as? CGFloat
-        return currentIdentity == sourceIdentity
-            && currentWidth.map {
+        guard let current = MarkdownEngineCompatibility.renderedBlock(
+            in: textStorage,
+            at: anchorLocation
+        ) else {
+            return false
+        }
+        return current.sourceIdentity == sourceIdentity
+            && current.displayWidth.map {
                 abs($0 - displayWidth) < 0.5
             } == true
     }

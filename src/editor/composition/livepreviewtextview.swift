@@ -125,7 +125,7 @@ struct LivePreviewTextView: NSViewRepresentable {
             rawSourceMode: rawSourceMode,
             source: sourceBuffer.revision.text
         )
-        return NativeTextViewWrapper(
+        return MarkdownEngineCompatibility.makeEditorView(
             text: editorText,
             configuration: pane.configuration(
                 rawSourceMode: rawSourceMode,
@@ -134,10 +134,8 @@ struct LivePreviewTextView: NSViewRepresentable {
             ),
             fontName: AppTheme.editorFont(size: fontSize).fontName,
             fontSize: fontSize,
-            documentId: pane.id.uuidString,
-            retainedScrollDocumentIds: [pane.id.uuidString]
+            documentID: pane.id.uuidString
         )
-        .accessibilityLabel("Markdown editor")
     }
 
     private var usesRawSource: Bool {
