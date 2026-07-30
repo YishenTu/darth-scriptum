@@ -611,4 +611,30 @@ extension DocumentSyncReducerTests {
         XCTAssertNotNil(deadline(in: persisted.effects, kind: .localSave))
     }
 
+    func testAtomicSwapUnavailableRequiresSaveAsWithoutRetryingCommit() throws {
+        let write = try recoveryArtifactValidationWrite()
+
+        let failed = DocumentSyncReducer.reduce(
+            write.writing.state,
+            event: .commitFailed(
+                token: write.commit.token,
+                disposition: .destinationRequiresSaveAs
+            )
+        )
+
+        XCTAssertEqual(failed.state.source, write.writing.state.source)
+        XCTAssertTrue(failed.state.local.isDirty)
+        XCTAssertEqual(failed.state.fileAttachment, write.writing.state.fileAttachment)
+        XCTAssertNil(failed.state.activeTokens[.saveCommit])
+        XCTAssertNil(failed.state.uncertainCommit)
+        XCTAssertEqual(failed.state.issue?.failure, .destinationRequiresSaveAs)
+        XCTAssertEqual(failed.state.issue?.retryable, false)
+        XCTAssertEqual(failed.state.issue?.requiresSaveAs, true)
+        XCTAssertTrue(failed.effects.isEmpty)
+
+        let retried = DocumentSyncReducer.reduce(failed.state, event: .retry)
+        XCTAssertEqual(retried.state, failed.state)
+        XCTAssertTrue(retried.effects.isEmpty)
+    }
+
 }

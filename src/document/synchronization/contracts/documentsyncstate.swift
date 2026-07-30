@@ -277,10 +277,15 @@ struct DocumentSyncRecoveryRecords: Sendable, Equatable {
 
 struct DocumentSyncRawRecoveryPayload: Sendable, Equatable {
     private let verifiedPayload: VerifiedFilePayload
+    /// The immutable file location whose raw bytes are being preserved. Raw
+    /// recovery decoding must not reconstruct it from mutable host state or
+    /// an identity implementation detail.
+    let targetURL: URL
     let recoveryArtifact: CommitRecoveryArtifact?
 
     init(
         data: Data,
+        targetURL: URL,
         resourceIdentifier: String? = nil,
         recoveryArtifact: CommitRecoveryArtifact?
     ) {
@@ -288,6 +293,7 @@ struct DocumentSyncRawRecoveryPayload: Sendable, Equatable {
             data: data,
             resourceIdentifier: resourceIdentifier
         )
+        self.targetURL = targetURL
         self.recoveryArtifact = recoveryArtifact
     }
 

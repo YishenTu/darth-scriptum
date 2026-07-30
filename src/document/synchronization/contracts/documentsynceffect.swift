@@ -92,6 +92,10 @@ struct DocumentSyncSaveCommitRequest: Sendable, Equatable {
 enum DocumentSyncCommitFailureDisposition: Sendable, Equatable {
     /// The executor proved that no irreversible write was attempted.
     case notStarted
+    /// Coordinated replacement was unavailable before the target changed. The
+    /// captured local source remains dirty and can only continue at an
+    /// explicitly chosen Save As destination.
+    case destinationRequiresSaveAs
     /// The executor crossed, or may have crossed, the irreversible commit
     /// boundary and cannot prove the final target/journal outcome.
     case outcomeUnknown

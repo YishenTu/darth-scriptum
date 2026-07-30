@@ -17,6 +17,7 @@ extension DocumentSyncReducerTests {
         XCTAssertEqual(scenario.request.purpose, .persistDisplacedPreimage)
         XCTAssertEqual(payload.data, scenario.rawData)
         XCTAssertEqual(payload.fingerprint, FileFingerprint.make(data: scenario.rawData))
+        XCTAssertEqual(payload.targetURL, documentURL)
         XCTAssertEqual(payload.recoveryArtifact, scenario.artifact)
         XCTAssertEqual(continuation.entryID, scenario.artifact.id)
         XCTAssertEqual(continuation.originIdentity, identity())

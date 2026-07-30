@@ -119,10 +119,12 @@ final class DocumentSyncEffectContractTests: XCTestCase {
         )
         let rawPayload = DocumentSyncRawRecoveryPayload(
             data: rawData,
+            targetURL: url,
             recoveryArtifact: rawArtifact
         )
         XCTAssertEqual(rawPayload.data, rawData)
         XCTAssertEqual(rawPayload.fingerprint, FileFingerprint.make(data: rawData))
+        XCTAssertEqual(rawPayload.targetURL, url)
         let rawEntryID = UUID()
         let rawContinuation = DocumentSyncDisplacedPreimageContinuation(
             entryID: rawEntryID,

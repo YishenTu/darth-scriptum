@@ -188,6 +188,7 @@ extension DocumentSyncReducer {
                 originAttachmentEpoch: token.attachmentEpoch,
                 rawPayload: DocumentSyncRawRecoveryPayload(
                     data: displacedPreimage.data,
+                    targetURL: attempt.targetURL,
                     resourceIdentifier:
                         displacedPreimage.fingerprint.resourceIdentifier,
                     recoveryArtifact: result.recoveryArtifact
@@ -346,7 +347,17 @@ extension DocumentSyncReducer {
         guard token.operation == .saveCommit else { return unchanged(state) }
         switch disposition {
         case .notStarted:
-            return commitProvenNotStarted(state, token: token)
+            return commitProvenNotStarted(
+                state,
+                token: token,
+                failure: .localSave
+            )
+        case .destinationRequiresSaveAs:
+            return commitProvenNotStarted(
+                state,
+                token: token,
+                failure: .destinationRequiresSaveAs
+            )
         case .outcomeUnknown:
             return enterUncertainCommitOutcome(state, token: token)
         }
@@ -354,7 +365,8 @@ extension DocumentSyncReducer {
 
     private static func commitProvenNotStarted(
         _ state: DocumentSyncState,
-        token: SyncEffectToken
+        token: SyncEffectToken,
+        failure: DocumentSyncFailure
     ) -> DocumentSyncTransition {
         guard accepts(state, token: token),
               case .writing = state.local else {
@@ -368,7 +380,7 @@ extension DocumentSyncReducer {
                 scheduledToken: nil
             )
         )
-        updated.issue = issue(for: .localSave)
+        updated.issue = issue(for: failure)
         if let deferred = applyPendingAttachmentTransition(updated) {
             return deferred
         }
