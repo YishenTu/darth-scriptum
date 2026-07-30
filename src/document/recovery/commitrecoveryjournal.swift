@@ -29,7 +29,8 @@ enum CommitRecoveryJournalStore {
         replacementDirectoryURL: URL,
         targetURL: URL,
         documentIdentity: DocumentIdentity,
-        expectedContentDigest: String,
+        expectedPreimageFingerprint: FileFingerprint,
+        committedPayloadFingerprint: FileFingerprint,
         recoveryDirectory: URL
     ) throws -> CommitRecoveryArtifact {
         let id = UUID()
@@ -55,7 +56,13 @@ enum CommitRecoveryJournalStore {
         let journal = PersistedCommitRecoveryJournal(
             id: id,
             documentStableKey: documentIdentity.stableKey,
-            expectedContentDigest: expectedContentDigest,
+            expectedContentDigest: expectedPreimageFingerprint.contentDigest,
+            expectedPreimageByteCount: expectedPreimageFingerprint.byteCount,
+            expectedPreimageResourceIdentifier:
+                expectedPreimageFingerprint.resourceIdentifier,
+            committedPayloadByteCount: committedPayloadFingerprint.byteCount,
+            committedPayloadContentDigest:
+                committedPayloadFingerprint.contentDigest,
             preparedCandidateResourceIdentifier: candidateResourceIdentifier,
             replacementDirectoryResourceIdentifier:
                 replacementDirectoryResourceIdentifier,
@@ -78,7 +85,13 @@ enum CommitRecoveryJournalStore {
             candidateURL: candidateURL,
             replacementDirectoryURL: replacementDirectoryURL,
             replacementDirectoryResourceIdentifier:
-                replacementDirectoryResourceIdentifier
+                replacementDirectoryResourceIdentifier,
+            binding: CommitRecoveryArtifactBinding(
+                documentIdentity: documentIdentity,
+                targetURL: targetURL,
+                expectedPreimageFingerprint: expectedPreimageFingerprint,
+                committedPayloadFingerprint: committedPayloadFingerprint
+            )
         )
     }
 
@@ -132,8 +145,33 @@ enum CommitRecoveryJournalStore {
                 || (
                     candidateIdentifier != nil
                         && candidateIdentifier
-                            != journal.preparedCandidateResourceIdentifier
+                    != journal.preparedCandidateResourceIdentifier
                 )
+            let binding: CommitRecoveryArtifactBinding?
+            if let expectedPreimageByteCount = journal.expectedPreimageByteCount,
+               let committedPayloadByteCount = journal.committedPayloadByteCount,
+               let committedPayloadContentDigest =
+                journal.committedPayloadContentDigest {
+                binding = CommitRecoveryArtifactBinding(
+                    documentIdentity: DocumentIdentity(
+                        stableKey: journal.documentStableKey
+                    ),
+                    targetURL: targetURL,
+                    expectedPreimageFingerprint: FileFingerprint(
+                        byteCount: expectedPreimageByteCount,
+                        contentDigest: journal.expectedContentDigest,
+                        resourceIdentifier:
+                            journal.expectedPreimageResourceIdentifier
+                    ),
+                    committedPayloadFingerprint: FileFingerprint(
+                        byteCount: committedPayloadByteCount,
+                        contentDigest: committedPayloadContentDigest,
+                        resourceIdentifier: nil
+                    )
+                )
+            } else {
+                binding = nil
+            }
             return PendingCommitRecovery(
                 artifact: CommitRecoveryArtifact(
                     id: journal.id,
@@ -141,7 +179,8 @@ enum CommitRecoveryJournalStore {
                     candidateURL: candidateURL,
                     replacementDirectoryURL: replacementDirectoryURL,
                     replacementDirectoryResourceIdentifier:
-                        journal.replacementDirectoryResourceIdentifier
+                        journal.replacementDirectoryResourceIdentifier,
+                    binding: binding
                 ),
                 documentIdentity: DocumentIdentity(
                     stableKey: journal.documentStableKey
@@ -236,6 +275,10 @@ private struct PersistedCommitRecoveryJournal: Codable {
     let id: UUID
     let documentStableKey: String
     let expectedContentDigest: String
+    let expectedPreimageByteCount: Int?
+    let expectedPreimageResourceIdentifier: String?
+    let committedPayloadByteCount: Int?
+    let committedPayloadContentDigest: String?
     let preparedCandidateResourceIdentifier: String
     let replacementDirectoryResourceIdentifier: String
     let targetPath: String

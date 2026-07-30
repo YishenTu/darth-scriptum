@@ -8,8 +8,9 @@ final class SaveTransactionBridgeTests: XCTestCase {
         let token = PendingSaveToken(
             generation: 4,
             sourceRevision: SourceRevision(number: 2, text: "text"),
-            snapshot: DocumentSnapshot(text: "text", format: .newDocument),
-            encodedData: data,
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: DocumentSnapshot(text: "text", format: .newDocument)
+            ),
             expectedDurableState: nil,
             targetURL: URL(fileURLWithPath: "/tmp/file.md")
         )

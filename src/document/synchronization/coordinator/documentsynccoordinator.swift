@@ -429,6 +429,8 @@ final class DocumentSyncCoordinator: ObservableObject {
                         error.localizedDescription
                 case .targetChangedBeforeCommit, .targetMissingBeforeCommit:
                     failedOperation = .externalRead
+                case .invalidPreparedPayload:
+                    failedOperation = .localWrite
                 }
             } else {
                 failedOperation = .localWrite
@@ -446,9 +448,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         do {
             let result = try bridge.finish(generation: generation)
             restartMonitor()
-            let preimageFingerprint = result.displacedPreimage.map {
-                FileFingerprint.make(data: $0)
-            }
+            let preimageFingerprint = result.displacedPreimage?.fingerprint
             let expected = token.expectedDurableState?.fingerprint
             let unexpectedPreimage = result.displacedPreimage != nil
                 && (
@@ -457,7 +457,8 @@ final class DocumentSyncCoordinator: ObservableObject {
                             != expected?.contentDigest
                 )
 
-            if unexpectedPreimage, let preimage = result.displacedPreimage {
+            if unexpectedPreimage,
+               let preimage = result.displacedPreimage?.data {
                 reconcileDisplacedExternalData(
                     preimage,
                     committedToken: token,
@@ -662,8 +663,8 @@ final class DocumentSyncCoordinator: ObservableObject {
         localPreparationTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                let data = try await Task.detached(priority: .utility) {
-                    try TextFileCodec.encode(snapshot)
+                let preparedPayload = try await Task.detached(priority: .utility) {
+                    try TextFileCodec.prepareSavePayload(for: snapshot)
                 }.value
                 if let savePreparationHook = self.savePreparationHook {
                     await savePreparationHook()
@@ -685,8 +686,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                 let token = PendingSaveToken(
                     generation: generation,
                     sourceRevision: revision,
-                    snapshot: snapshot,
-                    encodedData: data,
+                    preparedPayload: preparedPayload,
                     expectedDurableState: expectedDurableState,
                     targetURL: fileURL
                 )

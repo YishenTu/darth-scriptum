@@ -8,12 +8,15 @@ struct SafeFileCommitter: Sendable {
     }
 
     enum CommitError: LocalizedError, Equatable {
+        case invalidPreparedPayload
         case atomicSwapUnavailable
         case targetChangedBeforeCommit
         case targetMissingBeforeCommit
 
         var errorDescription: String? {
             switch self {
+            case .invalidPreparedPayload:
+                "The prepared save payload does not match its captured snapshot."
             case .atomicSwapUnavailable:
                 "This filesystem cannot safely replace the file in place. Use Save As to write a new file."
             case .targetChangedBeforeCommit:
@@ -40,6 +43,9 @@ struct SafeFileCommitter: Sendable {
     }
 
     func commit(_ token: PendingSaveToken) throws -> FileCommitResult {
+        guard token.preparedPayload.isExactEncoding() else {
+            throw CommitError.invalidPreparedPayload
+        }
         let fileManager = FileManager.default
         let requestedTargetURL = token.targetURL
 
@@ -109,16 +115,17 @@ struct SafeFileCommitter: Sendable {
             at: targetURL,
             against: token.expectedDurableState
         )
-        let expectedContentDigest = token.expectedDurableState?
-            .fingerprint.contentDigest ?? FileFingerprint.make(
-                data: preflight
-            ).contentDigest
+        guard let expectedPreimageFingerprint = token.expectedDurableState?
+            .fingerprint else {
+            throw CommitError.targetChangedBeforeCommit
+        }
         let preparedRecoveryArtifact = try CommitRecoveryJournalStore.prepare(
             candidateURL: candidateURL,
             replacementDirectoryURL: replacementDirectory,
             targetURL: targetURL,
             documentIdentity: .make(url: requestedTargetURL),
-            expectedContentDigest: expectedContentDigest,
+            expectedPreimageFingerprint: expectedPreimageFingerprint,
+            committedPayloadFingerprint: token.contentFingerprint,
             recoveryDirectory: recoveryDirectory
         )
         try beforeAtomicSwap?()
@@ -158,7 +165,8 @@ struct SafeFileCommitter: Sendable {
                 data: displacedPreimage
             )
             let hasUnexpectedPreimage =
-                displacedFingerprint.contentDigest != expectedContentDigest
+                displacedFingerprint.contentDigest
+                    != expectedPreimageFingerprint.contentDigest
             if !hasUnexpectedPreimage {
                 try CommitRecoveryJournalStore.acknowledge(
                     preparedRecoveryArtifact

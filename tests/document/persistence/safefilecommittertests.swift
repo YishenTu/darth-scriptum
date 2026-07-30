@@ -24,15 +24,21 @@ final class SafeFileCommitterTests: XCTestCase {
         let token = PendingSaveToken(
             generation: 2,
             sourceRevision: SourceRevision(number: 2, text: "# After\n"),
-            snapshot: try TextFileCodec.decode(updated),
-            encodedData: updated,
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: TextFileCodec.decode(updated)
+            ),
             expectedDurableState: state,
             targetURL: url
         )
 
         let result = try SafeFileCommitter().commit(token)
         XCTAssertEqual(try Data(contentsOf: url), updated)
-        XCTAssertEqual(result.displacedPreimage, original)
+        let displacedPreimage = try XCTUnwrap(result.displacedPreimage)
+        XCTAssertEqual(displacedPreimage.data, original)
+        XCTAssertEqual(
+            displacedPreimage.fingerprint,
+            FileFingerprint.make(data: original)
+        )
         XCTAssertEqual(
             result.committedFingerprint.contentDigest,
             FileFingerprint.make(data: updated).contentDigest
@@ -108,8 +114,9 @@ final class SafeFileCommitterTests: XCTestCase {
         let token = PendingSaveToken(
             generation: 1,
             sourceRevision: SourceRevision(number: 1, text: "local draft\n"),
-            snapshot: try TextFileCodec.decode(local),
-            encodedData: local,
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: TextFileCodec.decode(local)
+            ),
             expectedDurableState: nil,
             targetURL: url
         )
@@ -143,8 +150,9 @@ final class SafeFileCommitterTests: XCTestCase {
         let token = PendingSaveToken(
             generation: 2,
             sourceRevision: SourceRevision(number: 2, text: "local\n"),
-            snapshot: try TextFileCodec.decode(updated),
-            encodedData: updated,
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: TextFileCodec.decode(updated)
+            ),
             expectedDurableState: DurableFileState(
                 snapshot: try TextFileCodec.decode(original),
                 fingerprint: try SafeFileCommitter.fingerprint(
@@ -164,7 +172,12 @@ final class SafeFileCommitterTests: XCTestCase {
         XCTAssertEqual(values.isSymbolicLink, true)
         XCTAssertEqual(try Data(contentsOf: referent), updated)
         XCTAssertEqual(try Data(contentsOf: link), updated)
-        XCTAssertEqual(result.displacedPreimage, original)
+        let displacedPreimage = try XCTUnwrap(result.displacedPreimage)
+        XCTAssertEqual(displacedPreimage.data, original)
+        XCTAssertEqual(
+            displacedPreimage.fingerprint,
+            FileFingerprint.make(data: original)
+        )
     }
 
     func testRetargetedSymlinkCannotOverwriteAnIdenticalDifferentReferent() throws {
@@ -188,8 +201,9 @@ final class SafeFileCommitterTests: XCTestCase {
         let token = PendingSaveToken(
             generation: 2,
             sourceRevision: SourceRevision(number: 2, text: "local\n"),
-            snapshot: try TextFileCodec.decode(Data("local\n".utf8)),
-            encodedData: Data("local\n".utf8),
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: TextFileCodec.decode(Data("local\n".utf8))
+            ),
             expectedDurableState: DurableFileState(
                 snapshot: try TextFileCodec.decode(original),
                 fingerprint: try SafeFileCommitter.fingerprint(
@@ -233,7 +247,12 @@ final class SafeFileCommitterTests: XCTestCase {
         ).commit(fixture.token(updated: "local\n"))
 
         XCTAssertEqual(try Data(contentsOf: fixture.url), Data("local\n".utf8))
-        XCTAssertEqual(result.displacedPreimage, external)
+        let displacedPreimage = try XCTUnwrap(result.displacedPreimage)
+        XCTAssertEqual(displacedPreimage.data, external)
+        XCTAssertEqual(
+            displacedPreimage.fingerprint,
+            FileFingerprint.make(data: external)
+        )
         let artifact = try XCTUnwrap(result.recoveryArtifact)
         XCTAssertTrue(
             FileManager.default.fileExists(
@@ -284,15 +303,20 @@ final class SafeFileCommitterTests: XCTestCase {
         let candidateURL = replacementDirectory.appendingPathComponent(
             "candidate"
         )
-        try Data("local\n".utf8).write(to: candidateURL)
+        let candidateData = Data("local\n".utf8)
+        try candidateData.write(to: candidateURL)
         let artifact = try CommitRecoveryJournalStore.prepare(
             candidateURL: candidateURL,
             replacementDirectoryURL: replacementDirectory,
             targetURL: fixture.url,
             documentIdentity: .make(url: fixture.url),
-            expectedContentDigest: FileFingerprint.make(
+            expectedPreimageFingerprint: try SafeFileCommitter.fingerprint(
+                for: fixture.url,
                 data: fixture.original
-            ).contentDigest,
+            ),
+            committedPayloadFingerprint: FileFingerprint.make(
+                data: candidateData
+            ),
             recoveryDirectory: recoveryDirectory
         )
 
@@ -335,15 +359,20 @@ final class SafeFileCommitterTests: XCTestCase {
         let candidateURL = replacementDirectory.appendingPathComponent(
             "candidate"
         )
-        try Data("local\n".utf8).write(to: candidateURL)
+        let candidateData = Data("local\n".utf8)
+        try candidateData.write(to: candidateURL)
         let artifact = try CommitRecoveryJournalStore.prepare(
             candidateURL: candidateURL,
             replacementDirectoryURL: replacementDirectory,
             targetURL: fixture.url,
             documentIdentity: .make(url: fixture.url),
-            expectedContentDigest: FileFingerprint.make(
+            expectedPreimageFingerprint: try SafeFileCommitter.fingerprint(
+                for: fixture.url,
                 data: fixture.original
-            ).contentDigest,
+            ),
+            committedPayloadFingerprint: FileFingerprint.make(
+                data: candidateData
+            ),
             recoveryDirectory: recoveryDirectory
         )
         try FileManager.default.removeItem(at: replacementDirectory)
@@ -404,8 +433,9 @@ private struct CommitFixture {
         return PendingSaveToken(
             generation: 2,
             sourceRevision: SourceRevision(number: 2, text: updated),
-            snapshot: try TextFileCodec.decode(updatedData),
-            encodedData: updatedData,
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: TextFileCodec.decode(updatedData)
+            ),
             expectedDurableState: state,
             targetURL: url
         )

@@ -134,8 +134,12 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         let token = PendingSaveToken(
             generation: 1,
             sourceRevision: SourceRevision(number: 1, text: "older\n"),
-            snapshot: DocumentSnapshot(text: "older\n", format: .newDocument),
-            encodedData: Data("older\n".utf8),
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: DocumentSnapshot(
+                    text: "older\n",
+                    format: .newDocument
+                )
+            ),
             expectedDurableState: document.syncCoordinator.durableState,
             targetURL: fixture.url
         )

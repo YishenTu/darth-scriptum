@@ -1,5 +1,30 @@
 import Foundation
 
+/// Merge evidence minted by the worker that consumed one exact immutable
+/// merge request. A reducer cannot be handed an unrelated snapshot as a
+/// purported merge result.
+struct DocumentSyncMergeResult: Sendable, Equatable {
+    enum Outcome: Sendable, Equatable {
+        case merged(DocumentSnapshot)
+        case conflict
+    }
+
+    let request: DocumentSyncMergeRequest
+    let outcome: Outcome
+
+    var token: SyncEffectToken {
+        request.token
+    }
+
+    fileprivate init(
+        request: DocumentSyncMergeRequest,
+        outcome: Outcome
+    ) {
+        self.request = request
+        self.outcome = outcome
+    }
+}
+
 enum ThreeWayMergeResult: Sendable, Equatable {
     case unchanged(String)
     case merged(String)
@@ -7,6 +32,25 @@ enum ThreeWayMergeResult: Sendable, Equatable {
 }
 
 struct ThreeWayTextMerger: Sendable {
+    nonisolated func result(
+        for request: DocumentSyncMergeRequest
+    ) -> DocumentSyncMergeResult {
+        let outcome: DocumentSyncMergeResult.Outcome
+        switch merge(
+            base: request.base?.text ?? "",
+            local: request.local.text,
+            external: request.external.text
+        ) {
+        case .conflict:
+            outcome = .conflict
+        case .unchanged(let text), .merged(let text):
+            outcome = .merged(
+                DocumentSnapshot(text: text, format: request.local.format)
+            )
+        }
+        return DocumentSyncMergeResult(request: request, outcome: outcome)
+    }
+
     private struct Change: Sendable, Equatable {
         var range: NSRange
         var replacement: String
