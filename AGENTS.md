@@ -1,5 +1,14 @@
 # DarthScriptum Development Instructions
 
+## Project structure
+
+- Organize code by clear domain responsibility rather than accumulating related files in flat directories.
+- Keep each feature's public entry point small and obvious; place its contracts, state, orchestration, adapters, persistence, and implementation in focused subfolders when the feature warrants them.
+- Use meaningful ownership-based folder names. Do not create catch-all `utils`, `common`, or miscellaneous folders.
+- Mirror the relevant production structure in tests so ownership and coverage remain easy to find.
+- Avoid both flat dumping grounds and unnecessary nesting. Before a material reorganization, propose the target tree and explain each group's responsibility.
+- Preserve project tooling, build configuration, imports, and test discovery when moving files, and verify the affected build and tests afterward.
+
 ## Build and verification
 
 - Preserve the native macOS architecture and keep changes focused on the requested behavior.
