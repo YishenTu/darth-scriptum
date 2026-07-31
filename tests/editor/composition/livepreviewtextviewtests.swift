@@ -557,6 +557,8 @@ final class LivePreviewTextViewTests: XCTestCase {
             textView.string == source
         }
         let wideLineCount = wrappedLineCount(in: textView)
+        let wideViewportWidth = scrollView.contentView.bounds.width
+        let wideContainerWidth = textContainer.containerSize.width
 
         let narrowSize = NSSize(width: 560, height: initialSize.height)
         hostingView.frame.size = narrowSize
@@ -564,7 +566,9 @@ final class LivePreviewTextViewTests: XCTestCase {
         window.layoutIfNeeded()
 
         try await waitUntil {
-            abs(scrollView.contentView.bounds.width - narrowSize.width) < 1
+            scrollView.contentView.bounds.width < wideViewportWidth
+                && textContainer.containerSize.width < wideContainerWidth
+                && self.wrappedLineCount(in: textView) > wideLineCount
         }
         let narrowLineCount = wrappedLineCount(in: textView)
         let horizontalInset = textView.textContainerInset.width
