@@ -4,6 +4,17 @@ import XCTest
 
 @MainActor
 final class MarkdownConfigurationFactoryTests: XCTestCase {
+    func testEditorUsesComfortableSymmetricContentInsets() {
+        let configuration = MarkdownConfigurationFactory.make(
+            rawSourceMode: false,
+            fontSize: 14,
+            documentURL: nil
+        )
+
+        XCTAssertEqual(configuration.textInsets.horizontal, 48)
+        XCTAssertEqual(configuration.textInsets.vertical, 28)
+    }
+
     func testConfiguredSyntaxHighlighterHighlightsPythonCode() throws {
         let configuration = MarkdownConfigurationFactory.make(
             rawSourceMode: false,

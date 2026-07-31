@@ -54,7 +54,7 @@ enum MarkdownConfigurationFactory {
             ),
             latex: activeLatexRenderer
         )
-        configuration.textInsets = TextInsets(horizontal: 32, vertical: 28)
+        configuration.textInsets = TextInsets(horizontal: 48, vertical: 28)
         configuration.headings = HeadingStyle(
             fontMultipliers: [2, 1.6, 1.35, 1.15, 1, 0.9],
             topSpacingEm: [0.5, 0.42, 0.34, 0.26, 0.18, 0.1]

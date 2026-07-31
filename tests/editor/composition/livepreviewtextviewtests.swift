@@ -513,6 +513,77 @@ final class LivePreviewTextViewTests: XCTestCase {
         _ = window
     }
 
+    func testLiveResizeKeepsWrappedProseInsideTrailingInset() async throws {
+        let source = String(
+            repeating:
+                "Option pricing connects probability, economics, and numerical methods. ",
+            count: 24
+        )
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(text: source, format: .newDocument)
+        )
+        let pane = EditorPaneModel()
+        let initialSize = NSSize(width: 960, height: 420)
+        let hostingView = NSHostingView(
+            rootView: LivePreviewTextView(
+                sourceBuffer: buffer,
+                pane: pane,
+                sourceMode: false,
+                fontSize: 14,
+                newlineStyle: .lf
+            )
+        )
+        hostingView.frame = NSRect(origin: .zero, size: initialSize)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+
+        try await waitUntil {
+            MarkdownEngineCompatibility.nativeTextViews(
+                in: hostingView
+            ).count == 1
+        }
+        let textView = try XCTUnwrap(
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
+        )
+        let scrollView = try XCTUnwrap(textView.enclosingScrollView)
+        let textContainer = try XCTUnwrap(textView.textContainer)
+        try await waitUntil {
+            textView.string == source
+        }
+        let wideLineCount = wrappedLineCount(in: textView)
+
+        let narrowSize = NSSize(width: 560, height: initialSize.height)
+        hostingView.frame.size = narrowSize
+        window.setContentSize(narrowSize)
+        window.layoutIfNeeded()
+
+        try await waitUntil {
+            abs(scrollView.contentView.bounds.width - narrowSize.width) < 1
+        }
+        let narrowLineCount = wrappedLineCount(in: textView)
+        let horizontalInset = textView.textContainerInset.width
+        let maximumWrapWidth =
+            scrollView.contentView.bounds.width - horizontalInset * 2
+
+        XCTAssertGreaterThan(narrowLineCount, wideLineCount)
+        XCTAssertLessThanOrEqual(
+            textContainer.containerSize.width,
+            maximumWrapWidth + 1
+        )
+        XCTAssertLessThanOrEqual(
+            maximumRenderedLineX(in: textView),
+            textView.bounds.width - horizontalInset + 1
+        )
+        XCTAssertFalse(scrollView.hasHorizontalScroller)
+        _ = window
+    }
+
     func testEngineRestylesWhenMathJaxFallbackCompletes() async throws {
         let source = """
         before
@@ -901,4 +972,41 @@ final class LivePreviewTextViewTests: XCTestCase {
         XCTFail("Timed out waiting for editor state.")
     }
 
+    private func wrappedLineCount(in textView: NSTextView) -> Int {
+        guard let layoutManager = textView.textLayoutManager else {
+            return 0
+        }
+        layoutManager.ensureLayout(for: layoutManager.documentRange)
+        var count = 0
+        layoutManager.enumerateTextLayoutFragments(
+            from: layoutManager.documentRange.location,
+            options: [.ensuresLayout]
+        ) { fragment in
+            count += fragment.textLineFragments.count
+            return true
+        }
+        return count
+    }
+
+    private func maximumRenderedLineX(in textView: NSTextView) -> CGFloat {
+        guard let layoutManager = textView.textLayoutManager else {
+            return 0
+        }
+        layoutManager.ensureLayout(for: layoutManager.documentRange)
+        var maximumX: CGFloat = 0
+        layoutManager.enumerateTextLayoutFragments(
+            from: layoutManager.documentRange.location,
+            options: [.ensuresLayout]
+        ) { fragment in
+            for line in fragment.textLineFragments {
+                maximumX = max(
+                    maximumX,
+                    fragment.layoutFragmentFrame.minX
+                        + line.typographicBounds.maxX
+                )
+            }
+            return true
+        }
+        return maximumX
+    }
 }
