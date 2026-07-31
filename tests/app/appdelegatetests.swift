@@ -17,7 +17,7 @@ import XCTest
 
 @MainActor
 final class AppDelegateTests: XCTestCase {
-    func testFileMenuContainsNoManualSaveCommands() {
+    func testFileMenuContainsNativeSaveAsWithoutManualInPlaceSaveCommands() {
         let originalMenu = NSApp.mainMenu
         defer {
             NSApp.mainMenu = originalMenu
@@ -32,11 +32,19 @@ final class AppDelegateTests: XCTestCase {
 
         XCTAssertNil(fileMenu?.item(withTitle: "Save / Flush Now"))
         XCTAssertNil(fileMenu?.item(withTitle: "Revert to Saved"))
-        XCTAssertNil(fileMenu?.item(withTitle: "Save As…"))
+        let saveAsItem = fileMenu?.item(withTitle: "Save As…")
+        XCTAssertNil(saveAsItem?.target)
+        assertShortcut(
+            saveAsItem,
+            key: "s",
+            modifiers: [.command, .shift],
+            action: #selector(NSDocument.saveAs(_:))
+        )
         XCTAssertFalse(
             fileMenu?.items.contains {
                 $0.keyEquivalent.lowercased() == "s"
                     && $0.keyEquivalentModifierMask.contains(.command)
+                    && !$0.keyEquivalentModifierMask.contains(.shift)
             } ?? true
         )
     }

@@ -32,6 +32,78 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
     }
 
+    func testNativeEditorPreservesCRLFForAppendedLineAndFinalNewline() async throws {
+        let source = "# CRLF\r\n\r\nFirst line\r\nSecond line\r\n"
+        let appendedLine = source + "Saved line"
+        let expected = appendedLine + "\r\n"
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(
+                text: source,
+                format: TextFileFormat(
+                    encoding: .utf8,
+                    dominantNewline: .crlf,
+                    hasFinalNewline: true
+                )
+            )
+        )
+        let pane = EditorPaneModel()
+        let hostingView = NSHostingView(
+            rootView: LivePreviewTextView(
+                sourceBuffer: buffer,
+                pane: pane,
+                sourceMode: false,
+                fontSize: 14,
+                newlineStyle: .crlf
+            )
+            .frame(width: 480, height: 320)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 480, height: 320)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+
+        try await waitUntil {
+            MarkdownEngineCompatibility.nativeTextViews(
+                in: hostingView
+            ).count == 1
+        }
+        let textView = try XCTUnwrap(
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
+        )
+        try await waitUntil {
+            textView.string == source
+        }
+        textView.setSelectedRange(
+            NSRange(location: (textView.string as NSString).length, length: 0)
+        )
+        textView.insertText(
+            "Saved line",
+            replacementRange: textView.selectedRange()
+        )
+
+        try await waitUntil {
+            buffer.revision.text == appendedLine
+        }
+        textView.setSelectedRange(
+            NSRange(location: (textView.string as NSString).length, length: 0)
+        )
+        textView.insertText(
+            "\n",
+            replacementRange: textView.selectedRange()
+        )
+
+        try await waitUntil {
+            buffer.revision.text == expected
+        }
+        XCTAssertEqual(buffer.revision.text, expected)
+        _ = window
+    }
+
     func testEditorTextAdapterPreservesUntouchedMixedNewlines() {
         XCTAssertEqual(
             MarkdownEditorTextAdapter.reconcile(
