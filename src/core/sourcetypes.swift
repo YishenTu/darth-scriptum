@@ -466,11 +466,27 @@ struct FileCommitResult: Sendable, Equatable {
         safety: FileCommitSafety,
         recoveryArtifact: CommitRecoveryArtifact? = nil
     ) {
+        self.init(
+            generation: generation,
+            committedFingerprint: committedFingerprint,
+            verifiedDisplacedPreimage: displacedPreimage.map {
+                VerifiedFilePayload(data: $0)
+            },
+            safety: safety,
+            recoveryArtifact: recoveryArtifact
+        )
+    }
+
+    init(
+        generation: UInt64,
+        committedFingerprint: FileFingerprint,
+        verifiedDisplacedPreimage: VerifiedFilePayload?,
+        safety: FileCommitSafety,
+        recoveryArtifact: CommitRecoveryArtifact? = nil
+    ) {
         self.generation = generation
         self.committedFingerprint = committedFingerprint
-        self.displacedPreimage = displacedPreimage.map {
-            VerifiedFilePayload(data: $0)
-        }
+        self.displacedPreimage = verifiedDisplacedPreimage
         self.safety = safety
         self.recoveryArtifact = recoveryArtifact
     }

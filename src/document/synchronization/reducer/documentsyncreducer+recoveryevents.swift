@@ -198,21 +198,18 @@ extension DocumentSyncReducer {
                attempt.purpose == .persistConflict,
                let entryID = attempt.entryID,
                let snapshot = attempt.snapshot,
-               result.records.decoded.contains(where: {
+               let persistedEntry = result.records.decoded.first(where: {
                    $0.id == entryID
                        && $0.documentIdentity == attempt.identity
                        && $0.snapshot == snapshot
                }) {
                 updated.pendingConflict = nil
-                if let minimumSourceRevision = attempt.cleanupMinimumSourceRevision {
-                    updated.recoveryCleanup = DocumentSyncRecoveryCleanup(
-                        records: result.records,
-                        target: attempt.cleanupTarget,
-                        discardPurpose: attempt.cleanupPurpose
-                            ?? .discardRestoredRecords,
-                        minimumSourceRevision: minimumSourceRevision
-                    )
-                }
+                updated.recoveryCleanup = cleanupForPersistedConflict(
+                    state: state,
+                    attempt: attempt,
+                    persistedEntry: persistedEntry,
+                    records: result.records
+                )
             }
             let effects = finishRecoveryMutation(
                 &updated,
@@ -231,7 +228,7 @@ extension DocumentSyncReducer {
                   let snapshot = attempt.snapshot,
                   let expectedRecords = attempt.expectedRecords,
                   recordsPreserve(expectedRecords, in: result.records),
-                  result.records.decoded.contains(where: {
+                  let persistedEntry = result.records.decoded.first(where: {
                       $0.id == entryID
                           && $0.documentIdentity == attempt.identity
                           && $0.snapshot == snapshot
@@ -241,15 +238,12 @@ extension DocumentSyncReducer {
             }
             var updated = state
             updated.pendingConflict = nil
-            if let minimumSourceRevision = attempt.cleanupMinimumSourceRevision {
-                updated.recoveryCleanup = DocumentSyncRecoveryCleanup(
-                    records: result.records,
-                    target: attempt.cleanupTarget,
-                    discardPurpose: attempt.cleanupPurpose
-                        ?? .discardRestoredRecords,
-                    minimumSourceRevision: minimumSourceRevision
-                )
-            }
+            updated.recoveryCleanup = cleanupForPersistedConflict(
+                state: state,
+                attempt: attempt,
+                persistedEntry: persistedEntry,
+                records: result.records
+            )
             let effects = finishRecoveryMutation(
                 &updated,
                 records: result.records,
@@ -551,8 +545,31 @@ extension DocumentSyncReducer {
             minimumSourceRevision: updated.source
         )
         updated.issue = nil
-        let effects = scheduleLocalSave(&updated)
+        let effects = continueSynchronization(&updated)
         return transition(updated, effects: effects)
+    }
+
+    private static func cleanupForPersistedConflict(
+        state: DocumentSyncState,
+        attempt: DocumentSyncRecoveryAttempt,
+        persistedEntry: RecoveryEntry,
+        records: DocumentSyncRecoveryRecords
+    ) -> DocumentSyncRecoveryCleanup? {
+        if let minimumSourceRevision = attempt.cleanupMinimumSourceRevision {
+            return DocumentSyncRecoveryCleanup(
+                records: records,
+                target: attempt.cleanupTarget,
+                discardPurpose: attempt.cleanupPurpose
+                    ?? .discardRestoredRecords,
+                minimumSourceRevision: minimumSourceRevision
+            )
+        }
+        guard state.local.isDirty else { return nil }
+        return DocumentSyncRecoveryCleanup(
+            records: records,
+            target: .decoded(persistedEntry),
+            minimumSourceRevision: state.source
+        )
     }
 
     static func discardRawRecovery(

@@ -32,6 +32,7 @@ if [[ ! -d "$repository_root" ]]; then
 fi
 repository_root="$(cd "$repository_root" && pwd -P)"
 source_root="$repository_root/src"
+tests_root="$repository_root/tests"
 
 if [[ ! -d "$source_root" ]]; then
     print -u2 "Architecture check expected src directory: $source_root"
@@ -53,6 +54,58 @@ report_violation() {
     local message="$1"
     print -u2 "architecture violation: $message"
     (( violation_count += 1 ))
+}
+
+validate_scoped_instructions() {
+    local scoped_directory
+    local agents_file
+    local claude_file
+    local relative_agents_file
+    local relative_claude_file
+    local discovered_file
+    local relative_discovered_file
+    local -a scoped_directories=(
+        "$source_root/app"
+        "$source_root/core"
+        "$source_root/document"
+        "$source_root/editor"
+        "$source_root/workspace"
+        "$source_root/resources"
+        "$tests_root"
+    )
+    local -A expected_files
+
+    for scoped_directory in "${scoped_directories[@]}"; do
+        agents_file="$scoped_directory/AGENTS.md"
+        claude_file="$scoped_directory/CLAUDE.md"
+        relative_agents_file="$(relative_path "$agents_file")"
+        relative_claude_file="$(relative_path "$claude_file")"
+        expected_files[$relative_agents_file]=1
+        expected_files[$relative_claude_file]=1
+
+        if [[ ! -f "$agents_file" ]]; then
+            report_violation "required scoped AGENTS.md is missing: $relative_agents_file"
+        elif [[ ! -s "$agents_file" ]]; then
+            report_violation "scoped AGENTS.md must not be empty: $relative_agents_file"
+        fi
+
+        if [[ ! -f "$claude_file" ]]; then
+            report_violation "required scoped CLAUDE.md is missing: $relative_claude_file"
+        elif ! /usr/bin/cmp -s "$claude_file" <(/usr/bin/printf '@AGENTS.md\n'); then
+            report_violation "scoped CLAUDE.md must contain exactly @AGENTS.md plus a terminal newline: $relative_claude_file"
+        fi
+    done
+
+    while IFS= read -r -d '' discovered_file; do
+        relative_discovered_file="$(relative_path "$discovered_file")"
+        if [[ -z "${expected_files[$relative_discovered_file]-}" ]]; then
+            report_violation "unexpected scoped instruction file: $relative_discovered_file"
+        fi
+    done < <(
+        /usr/bin/find "$source_root" "$tests_root" \
+            \( -name AGENTS.md -o -name CLAUDE.md \) \
+            -print0
+    )
 }
 
 scan_pattern() {
@@ -118,6 +171,14 @@ assert_legacy_ownership_paths_absent() {
         done
     done
 }
+
+if [[ -f "$repository_root/DarthScriptum.xcodeproj/project.pbxproj" ]]; then
+    if [[ ! -d "$tests_root" ]]; then
+        print -u2 "Architecture check expected tests directory: $tests_root"
+        exit 2
+    fi
+    validate_scoped_instructions
+fi
 
 swift_import_prefix='^[[:space:]]*(@[^[:space:]]+[[:space:]]+)*import[[:space:]]+((class|enum|func|let|protocol|struct|var)[[:space:]]+)?'
 forbidden_ui_or_engine_import="${swift_import_prefix}(AppKit|SwiftUI|WebKit|MarkdownEngine|MarkdownEngineLatex|MarkdownEngineCodeBlocks)([[:space:].]|$)"

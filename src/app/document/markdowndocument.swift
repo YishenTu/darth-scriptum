@@ -3,11 +3,14 @@ import UniformTypeIdentifiers
 
 enum MarkdownDocumentSaveError: LocalizedError, Equatable {
     case unmanagedInPlaceSave
+    case synchronousWriteOnMainThread
 
     var errorDescription: String? {
         switch self {
         case .unmanagedInPlaceSave:
             return "The in-place save was not prepared by the document synchronizer."
+        case .synchronousWriteOnMainThread:
+            return "The managed file write cannot run on the main thread."
         }
     }
 }
@@ -50,13 +53,17 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
     nonisolated override class var preservesVersions: Bool { false }
     nonisolated override class var autosavesDrafts: Bool { false }
 
-    override init() {
+    override convenience init() {
+        self.init(recoveryStore: .shared)
+    }
+
+    init(recoveryStore: SessionRecoveryStore) {
         let bridge = SaveTransactionBridge()
         saveBridge = bridge
         syncCoordinator = DocumentSyncCoordinator(
             snapshot: DocumentSnapshot(text: "", format: .newDocument),
             bridge: bridge,
-            recoveryStore: .shared
+            recoveryStore: recoveryStore
         )
         super.init()
         hasUndoManager = true
@@ -139,8 +146,13 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
                     == url.standardizedFileURL else {
                 throw MarkdownDocumentSaveError.unmanagedInPlaceSave
             }
-            let result = try SafeFileCommitter().commit(request.pendingSave)
-            try saveBridge.store(result, for: request.token)
+            guard !Thread.isMainThread else {
+                throw MarkdownDocumentSaveError.synchronousWriteOnMainThread
+            }
+            try DocumentFileAccess.performSynchronously {
+                let result = try SafeFileCommitter().commit(request.pendingSave)
+                try self.saveBridge.store(result, for: request.token)
+            }
             return
         }
         try super.writeSafely(to: url, ofType: typeName, for: saveOperation)
@@ -215,14 +227,19 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         acceptedExternalFileAt url: URL,
         hasLocalChanges: Bool
     ) {
-        let values = try? url.resourceValues(
-            forKeys: [.contentModificationDateKey]
-        )
-        if let modificationDate = values?.contentModificationDate {
-            fileModificationDate = modificationDate
-        }
-        if !hasLocalChanges {
-            updateChangeCount(.changeCleared)
+        Task { [weak self] in
+            let modificationDate = try? await DocumentFileAccess.perform {
+                try url.resourceValues(
+                    forKeys: [.contentModificationDateKey]
+                ).contentModificationDate
+            }
+            guard let self else { return }
+            if let modificationDate {
+                self.fileModificationDate = modificationDate
+            }
+            if !hasLocalChanges {
+                self.updateChangeCount(.changeCleared)
+            }
         }
     }
 

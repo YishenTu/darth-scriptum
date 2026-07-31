@@ -231,7 +231,7 @@ final class SafeFileCommitterTests: XCTestCase {
     }
 
     @MainActor
-    func testContestedSwapKeepsDurablePreimageUntilRecoveryImportsIt() throws {
+    func testContestedSwapKeepsDurablePreimageUntilRecoveryImportsIt() async throws {
         let fixture = try CommitFixture(original: "base\n")
         defer { fixture.remove() }
         let recoveryDirectory = FileManager.default.temporaryDirectory
@@ -269,10 +269,12 @@ final class SafeFileCommitterTests: XCTestCase {
             persistenceDirectory: recoveryDirectory
         )
         let identity = DocumentIdentity.make(url: fixture.url)
-        XCTAssertEqual(
-            reopenedStore.rawRecoveryEntries(for: identity).first?.data,
-            external
+        let recoveredEntries = try await reopenedStore.rawRecoveryEntries(
+            for: identity
         )
+        let recoveredEntry = try XCTUnwrap(recoveredEntries.first)
+        let recoveredData = try await recoveredEntry.loadData()
+        XCTAssertEqual(recoveredData, external)
         XCTAssertFalse(
             FileManager.default.fileExists(
                 atPath: artifact.candidateURL.path
@@ -286,7 +288,7 @@ final class SafeFileCommitterTests: XCTestCase {
     }
 
     @MainActor
-    func testPreparedButUnswappedJournalDoesNotCreateFalseRecovery() throws {
+    func testPreparedButUnswappedJournalDoesNotCreateFalseRecovery() async throws {
         let fixture = try CommitFixture(original: "base\n")
         defer { fixture.remove() }
         let recoveryDirectory = FileManager.default.temporaryDirectory
@@ -324,11 +326,10 @@ final class SafeFileCommitterTests: XCTestCase {
             persistenceDirectory: recoveryDirectory
         )
 
-        XCTAssertTrue(
-            reopenedStore.rawRecoveryEntries(
-                for: .make(url: fixture.url)
-            ).isEmpty
+        let rawEntries = try await reopenedStore.rawRecoveryEntries(
+            for: .make(url: fixture.url)
         )
+        XCTAssertTrue(rawEntries.isEmpty)
         XCTAssertFalse(
             FileManager.default.fileExists(
                 atPath: artifact.candidateURL.path

@@ -6,11 +6,18 @@ import Foundation
 extension DocumentSyncReducer {
     static func startRecoveryLoad(
         _ state: inout DocumentSyncState,
-        scope: DocumentSyncRecoveryLoadScope
+        scope: DocumentSyncRecoveryLoadScope,
+        retriesStartup: Bool = false
     ) -> DocumentSyncEffect {
         let token = makeToken(&state, operation: .recovery)
         return .recovery(
-            .load(DocumentSyncRecoveryLoadRequest(token: token, scope: scope))
+            .load(
+                DocumentSyncRecoveryLoadRequest(
+                    token: token,
+                    scope: scope,
+                    retriesStartup: retriesStartup
+                )
+            )
         )
     }
 
@@ -215,6 +222,7 @@ extension DocumentSyncReducer {
                         token: token,
                         identity: attachment.identity,
                         target: target,
+                        expectedRecords: records,
                         expectedStoreGeneration: generation
                     )
                 )

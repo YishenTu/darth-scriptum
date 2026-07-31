@@ -202,12 +202,19 @@ extension DocumentSyncReducerTests {
 
         let destinationURL = URL(fileURLWithPath: "/tmp/restored-recovery-moved.md")
         let destination = DocumentIdentity.make(url: destinationURL)
+        let destinationBaseline = durableBaseline(
+            for: DocumentSnapshot(text: "base", format: .newDocument),
+            targetURL: destinationURL,
+            identity: destination,
+            sourceRevision: SourceRevision(number: 7, text: "base"),
+            resource: "restored-recovery-moved-baseline"
+        )
         let moved = DocumentSyncReducer.reduce(
             restored.state,
             event: .fileMoved(
                 identity: destination,
                 url: destinationURL,
-                durableBaseline: nil
+                durableBaseline: destinationBaseline
             )
         )
         let migration = try XCTUnwrap(recoveryMigrationRequest(in: moved.effects))
@@ -230,17 +237,39 @@ extension DocumentSyncReducerTests {
         XCTAssertEqual(migrated.state.recoveryCleanup?.records, migratedRecords)
         XCTAssertNil(recoveryDiscardRequest(in: migrated.effects))
 
+        let verificationDeadline = try XCTUnwrap(
+            deadline(in: migrated.effects, kind: .externalRead)
+        )
+        let verifying = DocumentSyncReducer.reduce(
+            migrated.state,
+            event: .deadlineFired(verificationDeadline)
+        )
+        let verification = try XCTUnwrap(readRequest(in: verifying.effects))
+        let verified = DocumentSyncReducer.reduce(
+            verifying.state,
+            event: .externalReadFinished(
+                token: verification.token,
+                result: .unchanged(
+                    externalObservation(
+                        destinationBaseline.snapshot,
+                        targetURL: destinationURL,
+                        identity: destination,
+                        fingerprint: destinationBaseline.fingerprint
+                    )
+                )
+            )
+        )
         let saveDeadline = try XCTUnwrap(
-            deadline(in: migrated.effects, kind: .localSave)
+            deadline(in: verified.effects, kind: .localSave)
         )
         let preparing = DocumentSyncReducer.reduce(
-            migrated.state,
+            verified.state,
             event: .deadlineFired(saveDeadline)
         )
         let preparation = try XCTUnwrap(prepareRequest(in: preparing.effects))
         XCTAssertEqual(preparation.targetURL, destinationURL)
         XCTAssertEqual(preparation.identity, destination)
-        XCTAssertNil(preparation.expectedBaseline)
+        XCTAssertEqual(preparation.expectedBaseline, destinationBaseline)
 
         let pendingSave = PendingSaveToken(
             generation: preparation.commitGeneration,
@@ -248,7 +277,7 @@ extension DocumentSyncReducerTests {
             preparedPayload: try TextFileCodec.prepareSavePayload(
                 for: preparation.snapshot
             ),
-            expectedDurableState: nil,
+            expectedDurableState: destinationBaseline.asDurableFileState,
             targetURL: destinationURL
         )
         let writing = DocumentSyncReducer.reduce(

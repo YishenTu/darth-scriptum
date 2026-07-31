@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+script_path="${0:A}"
+repository_root="${script_path:h:h}"
 project_path="DarthScriptum.xcodeproj"
 scheme_name="DarthScriptum"
 destination_name="platform=macOS,arch=arm64"
@@ -11,6 +13,10 @@ cleanup() {
   /usr/bin/find "$derived_data" -depth -delete
 }
 trap cleanup EXIT
+
+cd "$repository_root"
+
+./scripts/check-architecture.sh
 
 xcodebuild \
   -project "$project_path" \

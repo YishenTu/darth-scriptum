@@ -162,6 +162,14 @@ struct MarkdownWorkspace: View {
                     .foregroundStyle(Color(nsColor: AppTheme.accent))
                     .accessibilityLabel(action.label)
                 }
+                if statusPresentation.offersSaveAs {
+                    Button("Save As…") {
+                        performStatusAction(.saveAs)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color(nsColor: AppTheme.accent))
+                    .accessibilityLabel("Save As…")
+                }
                 if statusPresentation.offersLocalRevisionRestore {
                     Button("Restore Local Revision") {
                         syncCoordinator.restoreLatestRecovery()
@@ -227,6 +235,7 @@ struct MarkdownWorkspace: View {
                 failureRequiresSaveAs: snapshot.failureRequiresSaveAs,
                 recoveryMigrationIsPending:
                     snapshot.recoveryMigrationIsPending,
+                recoveryRetryAvailable: snapshot.recoveryRetryAvailable,
                 rawRecoveryURL: snapshot.rawRecoveryURL,
                 hasLocalRecovery: snapshot.hasLocalRecovery
             )
@@ -294,6 +303,7 @@ struct SynchronizationStatusPresentation: Equatable {
     let systemImage: String
     let tone: Tone
     let primaryAction: Action?
+    let offersSaveAs: Bool
     let offersLocalRevisionRestore: Bool
     let offersRawRecoveryDiscard: Bool
 
@@ -301,6 +311,7 @@ struct SynchronizationStatusPresentation: Equatable {
         for state: SynchronizationState,
         failureRequiresSaveAs: Bool = false,
         recoveryMigrationIsPending: Bool = false,
+        recoveryRetryAvailable: Bool = false,
         rawRecoveryURL: URL? = nil,
         hasLocalRecovery: Bool = false
     ) -> SynchronizationStatusPresentation? {
@@ -332,6 +343,8 @@ struct SynchronizationStatusPresentation: Equatable {
             tone = .failure
             if recoveryMigrationIsPending {
                 primaryAction = .retryRecoveryMigration
+            } else if recoveryRetryAvailable {
+                primaryAction = .retrySynchronization
             } else if let rawRecoveryURL {
                 primaryAction = .showRecoveryFile(rawRecoveryURL)
             } else {
@@ -350,6 +363,8 @@ struct SynchronizationStatusPresentation: Equatable {
             systemImage: systemImage,
             tone: tone,
             primaryAction: primaryAction,
+            offersSaveAs:
+                state == .synchronizationPaused && recoveryRetryAvailable,
             offersLocalRevisionRestore:
                 state == .synchronizationPaused && hasLocalRecovery,
             offersRawRecoveryDiscard:

@@ -56,6 +56,28 @@ extension DocumentSyncReducerTests {
         XCTAssertTrue(lateMonitorFailure.effects.isEmpty)
     }
 
+    func testRetryAfterStartupFailureMarksTheLoadAsAnExplicitStoreRestart()
+        throws {
+        var loading = makeState()
+        let recoveryToken = SyncEffectToken(
+            lifetime: lifetime,
+            attachmentEpoch: loading.attachmentEpoch,
+            operation: .recovery,
+            attempt: 91
+        )
+        loading.recoveryAccess = .loading
+        loading.activeTokens[.recovery] = recoveryToken
+        let failed = DocumentSyncReducer.reduce(
+            loading,
+            event: .recoveryFinished(token: recoveryToken, result: .failed(.recovery))
+        )
+
+        let retried = DocumentSyncReducer.reduce(failed.state, event: .retry)
+        let load = try XCTUnwrap(recoveryLoadRequest(in: retried.effects))
+
+        XCTAssertTrue(load.retriesStartup)
+    }
+
     func testStartupRecoveryLoadValidatesItsCapturedScope() throws {
         let loading = DocumentSyncState(
             lifetime: lifetime,

@@ -45,11 +45,32 @@ extension DocumentSyncReducerTests {
             )
         )
         XCTAssertEqual(loaded.state.recoveryCleanup?.target, .decoded(entry))
+        let baseline = try XCTUnwrap(loaded.state.durableBaseline)
+        let verificationDeadline = try XCTUnwrap(
+            deadline(in: loaded.effects, kind: .externalRead)
+        )
+        let verifying = DocumentSyncReducer.reduce(
+            loaded.state,
+            event: .deadlineFired(verificationDeadline)
+        )
+        let verification = try XCTUnwrap(readRequest(in: verifying.effects))
+        let verified = DocumentSyncReducer.reduce(
+            verifying.state,
+            event: .externalReadFinished(
+                token: verification.token,
+                result: .unchanged(
+                    externalObservation(
+                        baseline.snapshot,
+                        fingerprint: baseline.fingerprint
+                    )
+                )
+            )
+        )
         let saveDeadline = try XCTUnwrap(
-            deadline(in: loaded.effects, kind: .localSave)
+            deadline(in: verified.effects, kind: .localSave)
         )
         let preparing = DocumentSyncReducer.reduce(
-            loaded.state,
+            verified.state,
             event: .deadlineFired(saveDeadline)
         )
         let preparation = try XCTUnwrap(prepareRequest(in: preparing.effects))

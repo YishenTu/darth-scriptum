@@ -156,6 +156,13 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(paused?.primaryAction, .showRecoveryFile(recoveryURL))
         XCTAssertTrue(paused?.offersLocalRevisionRestore == true)
         XCTAssertTrue(paused?.offersRawRecoveryDiscard == true)
+
+        let failedStartup = SynchronizationStatusPresentation.make(
+            for: .synchronizationPaused,
+            recoveryRetryAvailable: true
+        )
+        XCTAssertEqual(failedStartup?.primaryAction, .retrySynchronization)
+        XCTAssertTrue(failedStartup?.offersSaveAs == true)
     }
 
     func testTabShortcutPolicyUsesOneThroughEightAndNineForLast() {

@@ -7,7 +7,7 @@ import XCTest
 
 @MainActor
 final class SynchronizationCharacterizationTests: XCTestCase {
-    func testDocumentReadOpensAndAttachesTheDecodedSnapshot() throws {
+    func testDocumentReadOpensAndAttachesTheDecodedSnapshot() async throws {
         let fixture = try CharacterizationMarkdownFile(contents: "opened\r\n")
         defer { fixture.remove() }
 
@@ -25,6 +25,14 @@ final class SynchronizationCharacterizationTests: XCTestCase {
             document.syncCoordinator.fileURL,
             fixture.url.standardizedFileURL
         )
+        XCTAssertNil(document.syncCoordinator.durableState)
+
+        let didAttach = await document.syncCoordinator.waitForInitialAttachment()
+        XCTAssertTrue(didAttach)
+        guard case .ready =
+            await document.syncCoordinator.waitForRecoveryStartup() else {
+            return XCTFail("Opening the document must finish recovery startup.")
+        }
         XCTAssertEqual(
             document.syncCoordinator.durableState?.snapshot.text,
             "opened\r\n"
@@ -50,6 +58,7 @@ final class SynchronizationCharacterizationTests: XCTestCase {
             from: fixture.url
         )
         defer { coordinator.close() }
+        try await awaitManagedFileStartup(coordinator)
 
         delegate.onSave = { token in
             do {
@@ -99,6 +108,7 @@ final class SynchronizationCharacterizationTests: XCTestCase {
             from: fixture.url
         )
         defer { coordinator.close() }
+        try await awaitManagedFileStartup(coordinator)
 
         try Data("external\n".utf8).write(to: fixture.url)
         coordinator.noteCoordinatedExternalChange()
@@ -130,6 +140,7 @@ final class SynchronizationCharacterizationTests: XCTestCase {
             from: fixture.url
         )
         defer { coordinator.close() }
+        try await awaitManagedFileStartup(coordinator)
 
         coordinator.sourceBuffer.replace(
             with: "local first\nmiddle\nlast\n",
@@ -198,6 +209,7 @@ final class SynchronizationCharacterizationTests: XCTestCase {
             from: fixture.url
         )
         defer { coordinator.close() }
+        try await awaitManagedFileStartup(coordinator)
 
         coordinator.sourceBuffer.replace(
             with: "hallo\n",
@@ -218,7 +230,7 @@ final class SynchronizationCharacterizationTests: XCTestCase {
                 && coordinator.sourceBuffer.revision.text == "hullo\n"
                 && coordinator.hasLocalRecovery
         }
-        let recoveredEntry = recoveryStore.latest(
+        let recoveredEntry = try await recoveryStore.latest(
             for: DocumentIdentity.make(url: fixture.url)
         )
         XCTAssertEqual(recoveredEntry?.snapshot.text, "hallo\n")
@@ -345,12 +357,28 @@ final class SynchronizationCharacterizationTests: XCTestCase {
         XCTFail("Timed out waiting for synchronization characterization.")
     }
 
+    private func awaitManagedFileStartup(
+        _ coordinator: DocumentSyncCoordinator
+    ) async throws {
+        guard await coordinator.waitForInitialAttachment() else {
+            throw CharacterizationStartupError.attachmentFailed
+        }
+        guard case .ready = await coordinator.waitForRecoveryStartup() else {
+            throw CharacterizationStartupError.recoveryFailed
+        }
+    }
+
     private func descendantTextViews(in view: NSView) -> [NSTextView] {
         if let textView = view as? NSTextView {
             return [textView]
         }
         return view.subviews.flatMap(descendantTextViews)
     }
+}
+
+private enum CharacterizationStartupError: Error {
+    case attachmentFailed
+    case recoveryFailed
 }
 
 @MainActor

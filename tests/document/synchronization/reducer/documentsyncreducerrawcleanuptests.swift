@@ -379,10 +379,7 @@ extension DocumentSyncReducerTests {
         XCTAssertEqual(rejectedUnresolved.state, unresolved)
         XCTAssertTrue(rejectedUnresolved.effects.isEmpty)
 
-        var recoverable = makeState()
-        recoverable.recovery = .available(
-            DocumentSyncRecoveryRecords(decoded: [entry], raw: [])
-        )
+        let recoverable = makeState()
         let edited = DocumentSyncReducer.reduce(
             recoverable,
             event: .sourceChanged(
@@ -413,11 +410,15 @@ extension DocumentSyncReducerTests {
                 )
             )
         )
+        var writingWithRecovery = writing.state
+        writingWithRecovery.recovery = .available(
+            DocumentSyncRecoveryRecords(decoded: [entry], raw: [])
+        )
         let rejectedWriting = DocumentSyncReducer.reduce(
-            writing.state,
+            writingWithRecovery,
             event: .restoreLocalRecovery
         )
-        XCTAssertEqual(rejectedWriting.state, writing.state)
+        XCTAssertEqual(rejectedWriting.state, writingWithRecovery)
         XCTAssertTrue(rejectedWriting.effects.isEmpty)
     }
 

@@ -97,6 +97,36 @@ enum DurableFileIO {
         try synchronizeDirectory(directoryURL.deletingLastPathComponent())
     }
 
+    /// Renames one recovery artifact within its owning filesystem and makes
+    /// the directory entry durable before returning. Recovery transactions use
+    /// this instead of a best-effort FileManager move so interrupted deletes
+    /// can be deterministically replayed from their journal.
+    static func moveAtomically(from sourceURL: URL, to destinationURL: URL) throws {
+        let result = sourceURL.path.withCString { sourcePath in
+            destinationURL.path.withCString { destinationPath in
+                Darwin.rename(sourcePath, destinationPath)
+            }
+        }
+        guard result == 0 else {
+            throw posixError()
+        }
+        try synchronizeDirectory(sourceURL.deletingLastPathComponent())
+        if sourceURL.deletingLastPathComponent().standardizedFileURL
+            != destinationURL.deletingLastPathComponent().standardizedFileURL {
+            try synchronizeDirectory(destinationURL.deletingLastPathComponent())
+        }
+    }
+
+    /// Removes a file and synchronizes its parent directory. Callers must
+    /// first make recovery deletion recoverable through a durable journal.
+    static func removeDurably(at url: URL) throws {
+        let result = url.path.withCString { Darwin.unlink($0) }
+        guard result == 0 else {
+            throw posixError()
+        }
+        try synchronizeDirectory(url.deletingLastPathComponent())
+    }
+
     static func synchronizeDirectory(_ url: URL) throws {
         let descriptor = url.path.withCString {
             Darwin.open($0, O_RDONLY)

@@ -24,13 +24,37 @@ struct DocumentSyncFileAttachment: Sendable, Equatable {
     let epoch: UInt64
 }
 
+/// A host has selected a managed file URL, but its canonical identity and
+/// durable baseline are still being verified on `DocumentFileAccess`. It is
+/// sufficient to keep close handling managed, but must never authorize I/O.
+struct DocumentSyncProvisionalFileAttachment: Sendable, Equatable {
+    let url: URL
+    let epoch: UInt64
+}
+
 enum DocumentSyncAttachment: Sendable, Equatable {
     case untitled
+    case provisional(DocumentSyncProvisionalFileAttachment)
     case file(DocumentSyncFileAttachment)
 
     var file: DocumentSyncFileAttachment? {
         guard case .file(let attachment) = self else { return nil }
         return attachment
+    }
+
+    var managedFileURL: URL? {
+        switch self {
+        case .untitled:
+            nil
+        case .provisional(let attachment):
+            attachment.url
+        case .file(let attachment):
+            attachment.url
+        }
+    }
+
+    var isManagedFile: Bool {
+        managedFileURL != nil
     }
 }
 
@@ -266,6 +290,10 @@ struct DocumentSyncRecoveryRecords: Sendable, Equatable {
         raw.first?.dataURL
     }
 
+    var hasRawRecovery: Bool {
+        !raw.isEmpty
+    }
+
     var hasLocalRecovery: Bool {
         !decoded.isEmpty
     }
@@ -293,6 +321,16 @@ struct DocumentSyncRawRecoveryPayload: Sendable, Equatable {
             data: data,
             resourceIdentifier: resourceIdentifier
         )
+        self.targetURL = targetURL
+        self.recoveryArtifact = recoveryArtifact
+    }
+
+    init(
+        verifiedPayload: VerifiedFilePayload,
+        targetURL: URL,
+        recoveryArtifact: CommitRecoveryArtifact?
+    ) {
+        self.verifiedPayload = verifiedPayload
         self.targetURL = targetURL
         self.recoveryArtifact = recoveryArtifact
     }
@@ -508,6 +546,7 @@ struct DocumentSyncStatusProjection: Sendable, Equatable {
     let presentedState: SynchronizationState?
     let failureRequiresSaveAs: Bool
     let recoveryMigrationIsPending: Bool
+    let recoveryRetryAvailable: Bool
     let rawRecoveryURL: URL?
     let hasLocalRecovery: Bool
 
@@ -515,6 +554,7 @@ struct DocumentSyncStatusProjection: Sendable, Equatable {
         presentedState: nil,
         failureRequiresSaveAs: false,
         recoveryMigrationIsPending: false,
+        recoveryRetryAvailable: false,
         rawRecoveryURL: nil,
         hasLocalRecovery: false
     )
@@ -773,11 +813,14 @@ struct DocumentSyncState: Sendable, Equatable {
             migrationIsPending = false
         }
         let recoveryIsPaused: Bool
+        let recoveryRetryAvailable: Bool
         switch recoveryAccess {
         case .failed:
             recoveryIsPaused = true
+            recoveryRetryAvailable = true
         case .loading, .ready:
             recoveryIsPaused = false
+            recoveryRetryAvailable = false
         }
 
         let pendingConflictIsUnresolved = pendingConflict != nil
@@ -787,7 +830,7 @@ struct DocumentSyncState: Sendable, Equatable {
         if migrationIsPending
             || uncertainCommit != nil
             || recoveryMutationBarrier != nil
-            || rawRecoveryURL != nil
+            || records?.hasRawRecovery == true
             || recoveryIsPaused
             || displacedPreimageIsUnresolved
             || (pendingConflictIsUnresolved
@@ -796,6 +839,7 @@ struct DocumentSyncState: Sendable, Equatable {
                 presentedState: .synchronizationPaused,
                 failureRequiresSaveAs: issue?.requiresSaveAs ?? false,
                 recoveryMigrationIsPending: migrationIsPending,
+                recoveryRetryAvailable: recoveryRetryAvailable,
                 rawRecoveryURL: rawRecoveryURL,
                 hasLocalRecovery: records?.hasLocalRecovery ?? false
             )
@@ -806,6 +850,7 @@ struct DocumentSyncState: Sendable, Equatable {
                 presentedState: .recoveredConflict,
                 failureRequiresSaveAs: false,
                 recoveryMigrationIsPending: false,
+                recoveryRetryAvailable: false,
                 rawRecoveryURL: nil,
                 hasLocalRecovery: true
             )
@@ -831,6 +876,7 @@ struct DocumentSyncState: Sendable, Equatable {
                 presentedState: presentedState,
                 failureRequiresSaveAs: issue.requiresSaveAs,
                 recoveryMigrationIsPending: false,
+                recoveryRetryAvailable: recoveryRetryAvailable,
                 rawRecoveryURL: rawRecoveryURL,
                 hasLocalRecovery: false
             )
@@ -841,6 +887,7 @@ struct DocumentSyncState: Sendable, Equatable {
                 presentedState: .limitedSyncSafety,
                 failureRequiresSaveAs: false,
                 recoveryMigrationIsPending: false,
+                recoveryRetryAvailable: false,
                 rawRecoveryURL: nil,
                 hasLocalRecovery: false
             )
@@ -850,6 +897,7 @@ struct DocumentSyncState: Sendable, Equatable {
             presentedState: nil,
             failureRequiresSaveAs: false,
             recoveryMigrationIsPending: false,
+            recoveryRetryAvailable: false,
             rawRecoveryURL: nil,
             hasLocalRecovery: false
         )

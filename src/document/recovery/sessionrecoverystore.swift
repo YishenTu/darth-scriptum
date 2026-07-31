@@ -1,22 +1,35 @@
 import Foundation
 
-enum SessionRecoveryStoreError: LocalizedError, Equatable {
-    case unreadableMigrationJournal
+/// A typed, durable failure that is safe to project to synchronization.
+///
+/// The store deliberately does not expose Foundation or POSIX errors to the
+/// reducer. Those errors do not identify whether recovery evidence remains
+/// intact, while each value below has a fail-closed recovery policy.
+enum RecoveryStoreIssue: LocalizedError, Sendable, Equatable {
+    case malformedData
+    case unsupportedSchema
+    case unavailable
     case unexpectedMutationGeneration
-    case recoveryRecordsNotEmpty
+    case unexpectedRecoveryRecords
     case conflictingEntryID
     case missingRecoveryEntry
     case recoveryEntryEvicted
     case mutationGenerationExhausted
+    case unreadableMigrationJournal
+    case unreadableDeletionJournal
 
     var errorDescription: String? {
         switch self {
-        case .unreadableMigrationJournal:
-            "The recovery migration journal is unreadable."
+        case .malformedData:
+            "Recovery data is malformed and has been preserved for retry."
+        case .unsupportedSchema:
+            "Recovery data uses a newer unsupported schema and has been preserved."
+        case .unavailable:
+            "Recovery storage is temporarily unavailable."
         case .unexpectedMutationGeneration:
             "The recovery store changed before the requested mutation."
-        case .recoveryRecordsNotEmpty:
-            "The requested recovery mutation requires an empty record set."
+        case .unexpectedRecoveryRecords:
+            "The recovery records changed before the requested mutation."
         case .conflictingEntryID:
             "The recovery entry identifier is already in use."
         case .missingRecoveryEntry:
@@ -25,8 +38,44 @@ enum SessionRecoveryStoreError: LocalizedError, Equatable {
             "The recovery entry could not be retained."
         case .mutationGenerationExhausted:
             "The recovery store generation cannot advance further."
+        case .unreadableMigrationJournal:
+            "The recovery migration journal is unreadable."
+        case .unreadableDeletionJournal:
+            "The recovery deletion journal is unreadable."
         }
     }
+}
+
+/// Kept as a source-compatible name for narrow diagnostic callers. New code
+/// should use `RecoveryStoreIssue`, which also models startup failures.
+typealias SessionRecoveryStoreError = RecoveryStoreIssue
+
+enum SessionRecoveryStoreStatus: Sendable, Equatable {
+    case loading
+    case ready(generation: UInt64)
+    case failed(RecoveryStoreIssue)
+}
+
+/// Test-observable command categories for the store's FIFO boundary. Production
+/// code does not branch on these values; they make queued reentrancy assertions
+/// possible without timing-based tests.
+enum SessionRecoveryStoreCommandKind: Sendable, Equatable {
+    case startup
+    case waitForStartup
+    case load
+    case persistSnapshot
+    case persistRaw
+    case migrate
+    case discard
+    case reconcile
+}
+
+/// Test-observable fault boundaries around the durable acknowledgement that
+/// links raw recovery evidence to a commit-recovery journal.
+enum SessionRecoveryStoreRawPersistencePhase: Sendable, Equatable {
+    case beforeRawPersistence
+    case beforeAcknowledgementMetadata
+    case afterAcknowledgementMetadata
 }
 
 struct RecoveryEntry: Identifiable, Sendable, Equatable {
@@ -43,14 +92,42 @@ struct RawRecoveryEntry: Identifiable, Sendable, Equatable {
     let byteCount: Int
     let contentDigest: String
     let createdAt: Date
-    fileprivate let residentData: Data?
+    let residentData: Data?
+    let acknowledgedRecoveryArtifactID: UUID?
 
-    var data: Data? {
+    init(
+        id: UUID,
+        documentIdentity: DocumentIdentity,
+        dataURL: URL?,
+        byteCount: Int,
+        contentDigest: String,
+        createdAt: Date,
+        residentData: Data?,
+        acknowledgedRecoveryArtifactID: UUID? = nil
+    ) {
+        self.id = id
+        self.documentIdentity = documentIdentity
+        self.dataURL = dataURL
+        self.byteCount = byteCount
+        self.contentDigest = contentDigest
+        self.createdAt = createdAt
+        self.residentData = residentData
+        self.acknowledgedRecoveryArtifactID = acknowledgedRecoveryArtifactID
+    }
+
+    /// Loading raw data is intentionally asynchronous. A URL-backed recovery
+    /// entry must never cause a view or the main actor to synchronously read a
+    /// potentially large file.
+    func loadData() async throws -> Data {
         if let residentData {
             return residentData
         }
-        guard let dataURL else { return nil }
-        return try? Data(contentsOf: dataURL, options: [.mappedIfSafe])
+        guard let dataURL else {
+            throw RecoveryStoreIssue.missingRecoveryEntry
+        }
+        return try await DocumentFileAccess.perform {
+            try Data(contentsOf: dataURL, options: [.mappedIfSafe])
+        }
     }
 
     var isDataResident: Bool {
@@ -64,15 +141,64 @@ struct RawRecoveryEntry: Identifiable, Sendable, Equatable {
             && lhs.byteCount == rhs.byteCount
             && lhs.contentDigest == rhs.contentDigest
             && lhs.createdAt == rhs.createdAt
+            && lhs.acknowledgedRecoveryArtifactID
+                == rhs.acknowledgedRecoveryArtifactID
     }
 }
 
-/// A store-owned receipt for the narrowly supported G4 decoded-conflict path.
-///
-/// The receipt deliberately exposes the complete records for one identity and
-/// a generation assigned by this store. It is not a general recovery-store
-/// transaction API: raw evidence, record loading, migration, and cross-restart
-/// generation continuity remain P1 work.
+struct SessionRecoveryStoreRecords: Sendable, Equatable {
+    let decoded: [RecoveryEntry]
+    let raw: [RawRecoveryEntry]
+
+    static let empty = SessionRecoveryStoreRecords(decoded: [], raw: [])
+
+    var isEmpty: Bool {
+        decoded.isEmpty && raw.isEmpty
+    }
+}
+
+struct SessionRecoveryStoreSnapshot: Sendable, Equatable {
+    let decodedEntries: [RecoveryEntry]
+    let rawEntries: [RawRecoveryEntry]
+    private let generations: [String: UInt64]
+
+    init(
+        decodedEntries: [RecoveryEntry],
+        rawEntries: [RawRecoveryEntry],
+        generations: [String: UInt64]
+    ) {
+        self.decodedEntries = decodedEntries
+        self.rawEntries = rawEntries
+        self.generations = generations
+    }
+
+    var records: SessionRecoveryStoreRecords {
+        SessionRecoveryStoreRecords(
+            decoded: decodedEntries,
+            raw: rawEntries
+        )
+    }
+
+    func records(for identity: DocumentIdentity) -> SessionRecoveryStoreRecords {
+        SessionRecoveryStoreRecords(
+            decoded: decodedEntries.filter { $0.documentIdentity == identity },
+            raw: rawEntries.filter { $0.documentIdentity == identity }
+        )
+    }
+
+    func generation(for identity: DocumentIdentity) -> UInt64 {
+        generations[identity.stableKey, default: 0]
+    }
+}
+
+struct SessionRecoveryStoreLoadReceipt: Sendable, Equatable {
+    let scope: DocumentSyncRecoveryLoadScope
+    let generation: UInt64
+    let records: SessionRecoveryStoreRecords
+}
+
+/// A durable, identity-scoped mutation receipt. The disk operation finishes
+/// before this receipt is returned or the actor index changes.
 struct SessionRecoveryStoreMutationReceipt: Sendable, Equatable {
     let previousGeneration: UInt64
     let generation: UInt64
@@ -80,740 +206,1254 @@ struct SessionRecoveryStoreMutationReceipt: Sendable, Equatable {
     let rawEntries: [RawRecoveryEntry]
 }
 
-@MainActor
-final class SessionRecoveryStore {
+struct SessionRecoveryStoreRawMutationReceipt: Sendable, Equatable {
+    let mutation: SessionRecoveryStoreMutationReceipt
+    let entry: RawRecoveryEntry
+    let acknowledgedRecoveryArtifact: CommitRecoveryArtifact?
+}
+
+struct SessionRecoveryStoreReconciliationReceipt: Sendable, Equatable {
+    let identity: DocumentIdentity
+    let generation: UInt64
+    let records: SessionRecoveryStoreRecords
+    let acknowledgedRecoveryArtifact: CommitRecoveryArtifact?
+}
+
+final class MigrationWriteHookBox: @unchecked Sendable {
+    let hook: @Sendable (Int) throws -> Void
+
+    init(_ hook: @escaping @Sendable (Int) throws -> Void) {
+        self.hook = hook
+    }
+}
+
+private final class StartupReadHookBox: @unchecked Sendable {
+    let hook: @Sendable () throws -> Void
+
+    init(_ hook: @escaping @Sendable () throws -> Void) {
+        self.hook = hook
+    }
+}
+
+private final class StartupCompletionHookBox: @unchecked Sendable {
+    let hook: @Sendable () throws -> Void
+
+    init(_ hook: @escaping @Sendable () throws -> Void) {
+        self.hook = hook
+    }
+}
+
+private final class CommandEnqueueHookBox: @unchecked Sendable {
+    let hook: @Sendable (SessionRecoveryStoreCommandKind) -> Void
+
+    init(
+        _ hook: @escaping @Sendable (SessionRecoveryStoreCommandKind) -> Void
+    ) {
+        self.hook = hook
+    }
+}
+
+private final class RawPersistenceHookBox: @unchecked Sendable {
+    let hook: @Sendable (SessionRecoveryStoreRawPersistencePhase) throws -> Void
+
+    init(
+        _ hook: @escaping @Sendable (
+            SessionRecoveryStoreRawPersistencePhase
+        ) throws -> Void
+    ) {
+        self.hook = hook
+    }
+}
+
+enum PendingRecoveryJournal: Sendable {
+    case migration
+    case deletion
+}
+
+/// The recovery boundary owns all mutable recovery state and serializes every
+/// mutation through one FIFO drain. The actor may reenter while a command is
+/// awaiting `DocumentFileAccess`, but only the drain resumes with authority to
+/// transition the index.
+actor SessionRecoveryStore {
     private static let maximumResidentRawRecoveryBytes = 1 * 1_024 * 1_024
 
     static let shared: SessionRecoveryStore = {
-        let root = CommitRecoveryJournalStore.defaultRecoveryDirectory
-        return SessionRecoveryStore(persistenceDirectory: root)
+        SessionRecoveryStore(
+            persistenceDirectory: CommitRecoveryJournalStore.defaultRecoveryDirectory
+        )
     }()
 
     private let perDocumentLimit: Int
     private let totalByteLimit: Int
     private let persistenceDirectory: URL?
-    private let migrationWriteHook: ((Int) throws -> Void)?
+    private let migrationWriteHook: MigrationWriteHookBox?
+    private let startupReadHook: StartupReadHookBox?
+    private let startupCompletionHook: StartupCompletionHookBox?
+    private let commandEnqueueHook: CommandEnqueueHookBox?
+    private let rawPersistenceHook: RawPersistenceHookBox?
+
+    private var startupStatus: SessionRecoveryStoreStatus = .loading
+    private var startupCommandQueued = false
     private var entries: [RecoveryEntry] = []
     private var rawEntries: [RawRecoveryEntry] = []
-    /// Only typed G4 mutations advance these live-store counters. Generations
-    /// are identity-scoped because independent documents share this store but
-    /// do not share a recovery mutation history. Existing recovery data is
-    /// intentionally not reconstructed into a mutable typed session; it
-    /// remains fail-closed until P1 provides the actor-backed persistent
-    /// transaction boundary.
-    private var mutationGenerations: [DocumentIdentity: UInt64] = [:]
+    private var mutationGenerations: [String: UInt64] = [:]
+    private var commands: [Command] = []
+    private var isDraining = false
 
     init(
         persistenceDirectory: URL? = nil,
         perDocumentLimit: Int = 5,
         totalByteLimit: Int = 10 * 1_024 * 1_024,
-        migrationWriteHook: ((Int) throws -> Void)? = nil
+        migrationWriteHook: (@Sendable (Int) throws -> Void)? = nil,
+        startupReadHook: (@Sendable () throws -> Void)? = nil,
+        startupCompletionHook: (@Sendable () throws -> Void)? = nil,
+        commandEnqueueHook: (@Sendable (SessionRecoveryStoreCommandKind) -> Void)? = nil,
+        rawPersistenceHook: (@Sendable (
+            SessionRecoveryStoreRawPersistencePhase
+        ) throws -> Void)? = nil
     ) {
         self.persistenceDirectory = persistenceDirectory
         self.perDocumentLimit = perDocumentLimit
         self.totalByteLimit = totalByteLimit
-        self.migrationWriteHook = migrationWriteHook
-        loadPersistedEntries()
-        importPendingCommitRecoveries()
+        self.migrationWriteHook = migrationWriteHook.map(MigrationWriteHookBox.init)
+        self.startupReadHook = startupReadHook.map(StartupReadHookBox.init)
+        self.startupCompletionHook = startupCompletionHook.map(
+            StartupCompletionHookBox.init
+        )
+        self.commandEnqueueHook = commandEnqueueHook.map(
+            CommandEnqueueHookBox.init
+        )
+        self.rawPersistenceHook = rawPersistenceHook.map(
+            RawPersistenceHookBox.init
+        )
+    }
+
+    func status() -> SessionRecoveryStoreStatus {
+        startupStatus
+    }
+
+    /// Explicitly starts durable recovery import. The store remains `.loading`
+    /// until its first FIFO transaction finishes.
+    func start() async throws -> SessionRecoveryStoreSnapshot {
+        switch startupStatus {
+        case .ready:
+            return snapshot()
+        case .failed(let issue):
+            throw issue
+        case .loading:
+            return try await withCheckedThrowingContinuation { continuation in
+                if startupCommandQueued {
+                    appendCommand(.waitForStartup(continuation))
+                } else {
+                    startupCommandQueued = true
+                    appendCommand(.startup(continuation))
+                }
+                beginDrainIfNeeded()
+            }
+        }
+    }
+
+    /// Replaces only failed startup work. FIFO mutation intent enqueued while
+    /// loading or failed remains retained behind the new startup transaction.
+    func retryStartup() async throws -> SessionRecoveryStoreSnapshot {
+        switch startupStatus {
+        case .ready:
+            return snapshot()
+        case .loading:
+            return try await start()
+        case .failed:
+            startupStatus = .loading
+            startupCommandQueued = true
+            return try await withCheckedThrowingContinuation { continuation in
+                insertCommand(.waitForStartup(continuation), at: 0)
+                insertCommand(.startup(nil), at: 0)
+                beginDrainIfNeeded()
+            }
+        }
+    }
+
+    func load(
+        scope: DocumentSyncRecoveryLoadScope
+    ) async throws -> SessionRecoveryStoreLoadReceipt {
+        switch startupStatus {
+        case .ready:
+            return loadReceipt(scope: scope)
+        case .failed(let issue):
+            throw issue
+        case .loading:
+            return try await withCheckedThrowingContinuation { continuation in
+                enqueueStartupIfNeeded()
+                appendCommand(.load(scope, continuation))
+                beginDrainIfNeeded()
+            }
+        }
+    }
+
+    func records(
+        for identity: DocumentIdentity
+    ) async throws -> SessionRecoveryStoreRecords {
+        try await load(scope: .document(identity)).records
+    }
+
+    func latest(for identity: DocumentIdentity) async throws -> RecoveryEntry? {
+        try await records(for: identity).decoded.first
+    }
+
+    func rawRecoveryEntries(
+        for identity: DocumentIdentity
+    ) async throws -> [RawRecoveryEntry] {
+        try await records(for: identity).raw
+    }
+
+    func typedMutationGeneration(for identity: DocumentIdentity) async throws -> UInt64 {
+        try await load(scope: .document(identity)).generation
     }
 
     func add(
         snapshot: DocumentSnapshot,
         for identity: DocumentIdentity
-    ) throws {
-        let entry = RecoveryEntry(
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try await add(
             id: UUID(),
-            documentIdentity: identity,
             snapshot: snapshot,
-            createdAt: Date()
+            for: identity,
+            expectedRecords: nil,
+            expectedGeneration: nil
         )
-        try persist(entry)
-        entries.insert(entry, at: 0)
-        trim()
     }
 
-    /// Persists a fresh decoded conflict and returns a truthful, store-owned
-    /// receipt. This intentionally supports only an empty record set so the
-    /// compatibility adapter cannot reinterpret pre-existing recovery data.
+    func add(
+        snapshot: DocumentSnapshot,
+        for identity: DocumentIdentity,
+        expectedGeneration: UInt64
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try await add(
+            id: UUID(),
+            snapshot: snapshot,
+            for: identity,
+            expectedRecords: nil,
+            expectedGeneration: expectedGeneration
+        )
+    }
+
+    func add(
+        id: UUID,
+        snapshot: DocumentSnapshot,
+        for identity: DocumentIdentity,
+        expectedRecords: DocumentSyncRecoveryRecords? = nil,
+        expectedGeneration: UInt64?
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try await enqueueSnapshotPersistence(
+            SnapshotPersistenceCommand(
+                id: id,
+                snapshot: snapshot,
+                identity: identity,
+                expectedRecords: expectedRecords,
+                expectedGeneration: expectedGeneration
+            )
+        )
+    }
+
     func persistFreshDecodedConflict(
         id: UUID,
         snapshot: DocumentSnapshot,
         for identity: DocumentIdentity,
         expectedGeneration: UInt64
-    ) throws -> SessionRecoveryStoreMutationReceipt {
-        try validateTypedMutation(
-            for: identity,
-            expectedGeneration: expectedGeneration
-        )
-        guard perDocumentLimit > 0 else {
-            throw SessionRecoveryStoreError.recoveryEntryEvicted
-        }
-        guard decodedEntries(for: identity).isEmpty,
-              rawRecoveryEntries(for: identity).isEmpty else {
-            throw SessionRecoveryStoreError.recoveryRecordsNotEmpty
-        }
-        guard !entries.contains(where: { $0.id == id }),
-              !rawEntries.contains(where: { $0.id == id }) else {
-            throw SessionRecoveryStoreError.conflictingEntryID
-        }
-
-        let entry = RecoveryEntry(
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try await add(
             id: id,
-            documentIdentity: identity,
             snapshot: snapshot,
-            createdAt: Date()
-        )
-        try persist(entry)
-        entries.insert(entry, at: 0)
-        trim()
-        guard decodedEntries(for: identity).contains(entry),
-              rawRecoveryEntries(for: identity).isEmpty else {
-            throw SessionRecoveryStoreError.recoveryEntryEvicted
-        }
-
-        let previousGeneration = advanceTypedMutationGeneration(for: identity)
-        return typedMutationReceipt(
             for: identity,
-            previousGeneration: previousGeneration
-        )
-    }
-
-    /// Advances the live generation for a recordless identity transition.
-    /// This is the only migration supported before P1: neither side may hold
-    /// decoded or raw evidence, so the operation changes no recovery files.
-    func advanceEmptyRecoveryMigration(
-        from sourceIdentity: DocumentIdentity,
-        to destinationIdentity: DocumentIdentity,
-        expectedGeneration: UInt64
-    ) throws -> SessionRecoveryStoreMutationReceipt {
-        try validateTypedMutation(
-            for: sourceIdentity,
+            expectedRecords: .empty,
             expectedGeneration: expectedGeneration
         )
-        guard decodedEntries(for: sourceIdentity).isEmpty,
-              rawRecoveryEntries(for: sourceIdentity).isEmpty,
-              decodedEntries(for: destinationIdentity).isEmpty,
-              rawRecoveryEntries(for: destinationIdentity).isEmpty else {
-            throw SessionRecoveryStoreError.recoveryRecordsNotEmpty
-        }
-        if sourceIdentity != destinationIdentity,
-           typedMutationGeneration(for: destinationIdentity) != 0 {
-            throw SessionRecoveryStoreError.unexpectedMutationGeneration
-        }
-
-        let previousGeneration = typedMutationGeneration(for: sourceIdentity)
-        let nextGeneration = previousGeneration + 1
-        if sourceIdentity == destinationIdentity {
-            mutationGenerations[sourceIdentity] = nextGeneration
-        } else {
-            mutationGenerations.removeValue(forKey: sourceIdentity)
-            mutationGenerations[destinationIdentity] = nextGeneration
-        }
-        return typedMutationReceipt(
-            for: destinationIdentity,
-            previousGeneration: previousGeneration
-        )
     }
 
-    @discardableResult
     func addRawData(
         _ data: Data,
         for identity: DocumentIdentity,
         id: UUID = UUID()
-    ) throws -> RawRecoveryEntry {
-        if let existing = rawEntries.first(where: { $0.id == id }) {
-            return existing
-        }
-        let entry: RawRecoveryEntry
-        if let persistenceDirectory {
-            try ensurePersistenceDirectory()
-            let dataURL = rawDataURL(for: id, in: persistenceDirectory)
-            try DurableFileIO.writeAtomically(data, to: dataURL)
-            let metadata = PersistedRawRecoveryEntry(
+    ) async throws -> RawRecoveryEntry {
+        let receipt = try await persistRawData(
+            data,
+            for: identity,
+            id: id,
+            expectedRecords: nil,
+            expectedGeneration: nil,
+            recoveryArtifact: nil
+        )
+        return receipt.entry
+    }
+
+    func persistRawData(
+        _ data: Data,
+        for identity: DocumentIdentity,
+        id: UUID,
+        expectedRecords: DocumentSyncRecoveryRecords?,
+        expectedGeneration: UInt64?,
+        recoveryArtifact: CommitRecoveryArtifact?
+    ) async throws -> SessionRecoveryStoreRawMutationReceipt {
+        try await enqueueRawPersistence(
+            RawPersistenceCommand(
                 id: id,
-                stableKey: identity.stableKey,
-                byteCount: data.count,
-                contentDigest: FileFingerprint.make(
-                    data: data
-                ).contentDigest,
-                createdAt: Date()
+                data: data,
+                identity: identity,
+                expectedRecords: expectedRecords,
+                expectedGeneration: expectedGeneration,
+                recoveryArtifact: recoveryArtifact
             )
-            do {
-                try DurableFileIO.writeAtomically(
-                    encode(metadata),
-                    to: rawMetadataURL(for: id, in: persistenceDirectory)
-                )
-            } catch {
-                try? FileManager.default.removeItem(at: dataURL)
-                throw error
+        )
+    }
+
+    func discard(
+        target: DocumentSyncRecoveryDiscardTarget,
+        for identity: DocumentIdentity,
+        expectedRecords: DocumentSyncRecoveryRecords,
+        expectedGeneration: UInt64
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try await enqueueDiscard(
+            DiscardCommand(
+                target: target,
+                identity: identity,
+                expectedRecords: expectedRecords,
+                expectedGeneration: expectedGeneration
+            )
+        )
+    }
+
+    func discardExactDecodedConflict(
+        _ entry: RecoveryEntry,
+        for identity: DocumentIdentity,
+        expectedGeneration: UInt64
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        let expected = try await records(for: identity).asDocumentSyncRecords
+        return try await discard(
+            target: .decoded(entry),
+            for: identity,
+            expectedRecords: expected,
+            expectedGeneration: expectedGeneration
+        )
+    }
+
+    func remove(_ entry: RecoveryEntry) async throws {
+        let loaded = try await load(scope: .document(entry.documentIdentity))
+        _ = try await discard(
+            target: .decoded(entry),
+            for: entry.documentIdentity,
+            expectedRecords: loaded.records.asDocumentSyncRecords,
+            expectedGeneration: loaded.generation
+        )
+    }
+
+    func removeRawRecoveryEntries(for identity: DocumentIdentity) async throws {
+        let loaded = try await load(scope: .document(identity))
+        guard !loaded.records.raw.isEmpty else { return }
+        _ = try await discard(
+            target: .raw(loaded.records.raw.map(DocumentSyncRawRecoveryReference.init)),
+            for: identity,
+            expectedRecords: loaded.records.asDocumentSyncRecords,
+            expectedGeneration: loaded.generation
+        )
+    }
+
+    func moveEntries(
+        from sourceIdentity: DocumentIdentity,
+        to destinationIdentity: DocumentIdentity
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        let source = try await load(scope: .document(sourceIdentity))
+        return try await moveEntries(
+            from: sourceIdentity,
+            to: destinationIdentity,
+            expectedRecords: source.records.asDocumentSyncRecords,
+            expectedGeneration: source.generation
+        )
+    }
+
+    func moveEntries(
+        from sourceIdentity: DocumentIdentity,
+        to destinationIdentity: DocumentIdentity,
+        expectedRecords: DocumentSyncRecoveryRecords,
+        expectedGeneration: UInt64
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try await enqueueMigration(
+            MigrationCommand(
+                sourceIdentity: sourceIdentity,
+                destinationIdentity: destinationIdentity,
+                expectedRecords: expectedRecords,
+                expectedGeneration: expectedGeneration
+            )
+        )
+    }
+
+    func advanceEmptyRecoveryMigration(
+        from sourceIdentity: DocumentIdentity,
+        to destinationIdentity: DocumentIdentity,
+        expectedGeneration: UInt64
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try await moveEntries(
+            from: sourceIdentity,
+            to: destinationIdentity,
+            expectedRecords: .empty,
+            expectedGeneration: expectedGeneration
+        )
+    }
+
+    func reconcile(
+        _ intent: DocumentSyncRecoveryReconciliationIntent
+    ) async throws -> SessionRecoveryStoreReconciliationReceipt {
+        try await enqueueReconciliation(intent)
+    }
+
+    private enum Command {
+        case startup(CheckedContinuation<SessionRecoveryStoreSnapshot, Error>?)
+        case waitForStartup(CheckedContinuation<SessionRecoveryStoreSnapshot, Error>)
+        case load(
+            DocumentSyncRecoveryLoadScope,
+            CheckedContinuation<SessionRecoveryStoreLoadReceipt, Error>
+        )
+        case persistSnapshot(
+            SnapshotPersistenceCommand,
+            CheckedContinuation<SessionRecoveryStoreMutationReceipt, Error>
+        )
+        case persistRaw(
+            RawPersistenceCommand,
+            CheckedContinuation<SessionRecoveryStoreRawMutationReceipt, Error>
+        )
+        case migrate(
+            MigrationCommand,
+            CheckedContinuation<SessionRecoveryStoreMutationReceipt, Error>
+        )
+        case discard(
+            DiscardCommand,
+            CheckedContinuation<SessionRecoveryStoreMutationReceipt, Error>
+        )
+        case reconcile(
+            DocumentSyncRecoveryReconciliationIntent,
+            CheckedContinuation<SessionRecoveryStoreReconciliationReceipt, Error>
+        )
+
+        var kind: SessionRecoveryStoreCommandKind {
+            switch self {
+            case .startup:
+                .startup
+            case .waitForStartup:
+                .waitForStartup
+            case .load:
+                .load
+            case .persistSnapshot:
+                .persistSnapshot
+            case .persistRaw:
+                .persistRaw
+            case .migrate:
+                .migrate
+            case .discard:
+                .discard
+            case .reconcile:
+                .reconcile
             }
-            entry = RawRecoveryEntry(
-                id: id,
-                documentIdentity: identity,
-                dataURL: dataURL,
-                byteCount: data.count,
-                contentDigest: metadata.contentDigest
-                    ?? FileFingerprint.make(data: data).contentDigest,
-                createdAt: metadata.createdAt,
-                residentData: shouldKeepRawDataResident(data)
-                    ? data
-                    : nil
+        }
+    }
+
+    private struct SnapshotPersistenceCommand: Sendable {
+        let id: UUID
+        let snapshot: DocumentSnapshot
+        let identity: DocumentIdentity
+        let expectedRecords: DocumentSyncRecoveryRecords?
+        let expectedGeneration: UInt64?
+    }
+
+    private struct RawPersistenceCommand: Sendable {
+        let id: UUID
+        let data: Data
+        let identity: DocumentIdentity
+        let expectedRecords: DocumentSyncRecoveryRecords?
+        let expectedGeneration: UInt64?
+        let recoveryArtifact: CommitRecoveryArtifact?
+    }
+
+    private struct MigrationCommand: Sendable {
+        let sourceIdentity: DocumentIdentity
+        let destinationIdentity: DocumentIdentity
+        let expectedRecords: DocumentSyncRecoveryRecords
+        let expectedGeneration: UInt64
+    }
+
+    private struct DiscardCommand: Sendable {
+        let target: DocumentSyncRecoveryDiscardTarget
+        let identity: DocumentIdentity
+        let expectedRecords: DocumentSyncRecoveryRecords
+        let expectedGeneration: UInt64
+    }
+
+    private func enqueueStartupIfNeeded() {
+        guard !startupCommandQueued else { return }
+        startupCommandQueued = true
+        appendCommand(.startup(nil))
+    }
+
+    private func appendCommand(_ command: Command) {
+        commands.append(command)
+        commandEnqueueHook?.hook(command.kind)
+    }
+
+    private func insertCommand(_ command: Command, at index: Int) {
+        commands.insert(command, at: index)
+        commandEnqueueHook?.hook(command.kind)
+    }
+
+    private func beginDrainIfNeeded() {
+        guard !isDraining else { return }
+        isDraining = true
+        Task { [weak self] in
+            await self?.drain()
+        }
+    }
+
+    private func drain() async {
+        while !commands.isEmpty {
+            let command = commands.removeFirst()
+            switch command {
+            case .startup(let continuation):
+                startupCommandQueued = false
+                do {
+                    let imported = try await importStartupState()
+                    try startupCompletionHook?.hook()
+                    entries = imported.entries
+                    rawEntries = imported.rawEntries
+                    mutationGenerations = imported.generations
+                    startupStatus = .ready(generation: currentGeneration)
+                    continuation?.resume(returning: snapshot())
+                } catch {
+                    let issue = recoveryIssue(from: error)
+                    startupStatus = .failed(issue)
+                    continuation?.resume(throwing: issue)
+                    failQueuedReadCommands(with: issue)
+                    isDraining = false
+                    return
+                }
+            case .waitForStartup(let continuation):
+                switch startupStatus {
+                case .ready:
+                    continuation.resume(returning: snapshot())
+                case .failed(let issue):
+                    continuation.resume(throwing: issue)
+                case .loading:
+                    insertCommand(.waitForStartup(continuation), at: 0)
+                    isDraining = false
+                    return
+                }
+            case .load(let scope, let continuation):
+                guard case .ready = startupStatus else {
+                    let issue = failedIssueOrUnavailable()
+                    continuation.resume(throwing: issue)
+                    continue
+                }
+                continuation.resume(returning: loadReceipt(scope: scope))
+            case .persistSnapshot(let request, let continuation):
+                await resume(continuation) {
+                    try await self.persistSnapshot(request)
+                }
+            case .persistRaw(let request, let continuation):
+                await resume(continuation) {
+                    try await self.persistRaw(request)
+                }
+            case .migrate(let request, let continuation):
+                await resume(continuation) {
+                    try await self.migrate(request)
+                }
+            case .discard(let request, let continuation):
+                await resume(continuation) {
+                    try await self.discard(request)
+                }
+            case .reconcile(let intent, let continuation):
+                await resume(continuation) {
+                    try await self.reconcileFromDisk(intent)
+                }
+            }
+        }
+        isDraining = false
+    }
+
+    private func resume<Value>(
+        _ continuation: CheckedContinuation<Value, Error>,
+        operation: () async throws -> Value
+    ) async {
+        do {
+            continuation.resume(returning: try await operation())
+        } catch {
+            continuation.resume(throwing: recoveryIssue(from: error))
+        }
+    }
+
+    private func failQueuedReadCommands(with issue: RecoveryStoreIssue) {
+        var retained: [Command] = []
+        for command in commands {
+            switch command {
+            case .waitForStartup(let continuation):
+                continuation.resume(throwing: issue)
+            case .load(_, let continuation):
+                continuation.resume(throwing: issue)
+            case .startup(let continuation):
+                continuation?.resume(throwing: issue)
+            case .persistSnapshot, .persistRaw, .migrate, .discard, .reconcile:
+                retained.append(command)
+            }
+        }
+        commands = retained
+    }
+
+    private func enqueueSnapshotPersistence(
+        _ request: SnapshotPersistenceCommand
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try await withCheckedThrowingContinuation { continuation in
+            enqueueStartupForPendingMutationIfNeeded()
+            appendCommand(.persistSnapshot(request, continuation))
+            beginDrainUnlessStartupFailed()
+        }
+    }
+
+    private func enqueueRawPersistence(
+        _ request: RawPersistenceCommand
+    ) async throws -> SessionRecoveryStoreRawMutationReceipt {
+        try await withCheckedThrowingContinuation { continuation in
+            enqueueStartupForPendingMutationIfNeeded()
+            appendCommand(.persistRaw(request, continuation))
+            beginDrainUnlessStartupFailed()
+        }
+    }
+
+    private func enqueueMigration(
+        _ request: MigrationCommand
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try await withCheckedThrowingContinuation { continuation in
+            enqueueStartupForPendingMutationIfNeeded()
+            appendCommand(.migrate(request, continuation))
+            beginDrainUnlessStartupFailed()
+        }
+    }
+
+    private func enqueueDiscard(
+        _ request: DiscardCommand
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try await withCheckedThrowingContinuation { continuation in
+            enqueueStartupForPendingMutationIfNeeded()
+            appendCommand(.discard(request, continuation))
+            beginDrainUnlessStartupFailed()
+        }
+    }
+
+    private func enqueueReconciliation(
+        _ intent: DocumentSyncRecoveryReconciliationIntent
+    ) async throws -> SessionRecoveryStoreReconciliationReceipt {
+        try await withCheckedThrowingContinuation { continuation in
+            enqueueStartupForPendingMutationIfNeeded()
+            appendCommand(.reconcile(intent, continuation))
+            beginDrainUnlessStartupFailed()
+        }
+    }
+
+    /// A failed import deliberately leaves mutation intent suspended until an
+    /// explicit retry. Re-enqueuing startup here would silently erase the
+    /// user's retry boundary and could keep touching malformed evidence.
+    private func enqueueStartupForPendingMutationIfNeeded() {
+        guard case .loading = startupStatus else { return }
+        enqueueStartupIfNeeded()
+    }
+
+    private func beginDrainUnlessStartupFailed() {
+        guard case .failed = startupStatus else {
+            beginDrainIfNeeded()
+            return
+        }
+    }
+
+    private func importStartupState() async throws -> PersistedState {
+        let migrationHook = migrationWriteHook
+        let startupHook = startupReadHook
+        let persistenceDirectory = persistenceDirectory
+        return try await DocumentFileAccess.perform {
+            try startupHook?.hook()
+            guard let persistenceDirectory else {
+                return PersistedState(
+                    entries: [],
+                    rawEntries: [],
+                    generations: [:],
+                    acknowledgedArtifacts: []
+                )
+            }
+            return try Self.importPersistedState(
+                from: persistenceDirectory,
+                migrationWriteHook: migrationHook
             )
-        } else {
-            entry = RawRecoveryEntry(
-                id: id,
-                documentIdentity: identity,
-                dataURL: nil,
-                byteCount: data.count,
-                contentDigest: FileFingerprint.make(
-                    data: data
-                ).contentDigest,
-                createdAt: Date(),
-                residentData: data
-            )
+        }
+    }
+
+    private func persistSnapshot(
+        _ request: SnapshotPersistenceCommand
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try requireReady()
+        try await reconcilePendingTransactionsIfNeeded()
+        try validateMutation(
+            identity: request.identity,
+            expectedGeneration: request.expectedGeneration,
+            expectedRecords: request.expectedRecords
+        )
+        guard !entries.contains(where: { $0.id == request.id }),
+              !rawEntries.contains(where: { $0.id == request.id }) else {
+            throw RecoveryStoreIssue.conflictingEntryID
+        }
+        guard perDocumentLimit > 0 else {
+            throw RecoveryStoreIssue.recoveryEntryEvicted
+        }
+
+        let entry = RecoveryEntry(
+            id: request.id,
+            documentIdentity: request.identity,
+            snapshot: request.snapshot,
+            createdAt: Date()
+        )
+        let proposedEntries = [entry] + entries
+        let trim = Self.trim(
+            proposedEntries,
+            perDocumentLimit: perDocumentLimit,
+            totalByteLimit: totalByteLimit
+        )
+        guard trim.entries.contains(entry) else {
+            throw RecoveryStoreIssue.recoveryEntryEvicted
+        }
+        let affectedIdentities = Set(
+            trim.removed.map(\.documentIdentity) + [request.identity]
+        )
+        let previousGenerations = mutationGenerations
+        let previousGeneration = currentGeneration(for: request.identity)
+        let nextGenerations = try advancingGenerations(
+            for: affectedIdentities,
+            from: previousGenerations
+        )
+
+        if let persistenceDirectory {
+            let removedURLs = trim.removed.map {
+                Self.snapshotURL(for: $0.id, in: persistenceDirectory)
+            }
+            try await DocumentFileAccess.perform {
+                try Self.persist(entry, in: persistenceDirectory)
+                try Self.commitDeletion(
+                    of: removedURLs,
+                    in: persistenceDirectory,
+                    previousGenerations: previousGenerations,
+                    nextGenerations: nextGenerations
+                )
+            }
+        }
+        entries = trim.entries
+        mutationGenerations = nextGenerations
+        return mutationReceipt(for: request.identity, previous: previousGeneration)
+    }
+
+    private func persistRaw(
+        _ request: RawPersistenceCommand
+    ) async throws -> SessionRecoveryStoreRawMutationReceipt {
+        try requireReady()
+        try await reconcilePendingTransactionsIfNeeded()
+        try validateMutation(
+            identity: request.identity,
+            expectedGeneration: request.expectedGeneration,
+            expectedRecords: request.expectedRecords
+        )
+        guard !entries.contains(where: { $0.id == request.id }),
+              !rawEntries.contains(where: { $0.id == request.id }) else {
+            throw RecoveryStoreIssue.conflictingEntryID
+        }
+
+        let createdAt = Date()
+        let fingerprint = FileFingerprint.make(data: request.data)
+        let entry = RawRecoveryEntry(
+            id: request.id,
+            documentIdentity: request.identity,
+            dataURL: persistenceDirectory.map {
+                Self.rawDataURL(for: request.id, in: $0)
+            },
+            byteCount: request.data.count,
+            contentDigest: fingerprint.contentDigest,
+            createdAt: createdAt,
+            residentData: shouldKeepRawDataResident(request.data)
+                ? request.data
+                : nil,
+            acknowledgedRecoveryArtifactID: request.recoveryArtifact?.id
+        )
+        let previousGeneration = currentGeneration(for: request.identity)
+        let nextGenerations = try advancingGenerations(
+            for: [request.identity],
+            from: mutationGenerations
+        )
+
+        if let persistenceDirectory {
+            let artifact = request.recoveryArtifact
+            let rawPersistenceHook = rawPersistenceHook
+            try await DocumentFileAccess.perform {
+                try rawPersistenceHook?.hook(.beforeRawPersistence)
+                try Self.persistRaw(
+                    entry,
+                    data: request.data,
+                    intendedArtifactID: artifact?.id,
+                    acknowledgedArtifactID: nil,
+                    in: persistenceDirectory
+                )
+                if let artifact {
+                    try rawPersistenceHook?.hook(
+                        .beforeAcknowledgementMetadata
+                    )
+                    try Self.persistRawMetadata(
+                        entry,
+                        intendedArtifactID: artifact.id,
+                        acknowledgedArtifactID: artifact.id,
+                        in: persistenceDirectory
+                    )
+                    try rawPersistenceHook?.hook(
+                        .afterAcknowledgementMetadata
+                    )
+                    try CommitRecoveryJournalStore.acknowledge(artifact)
+                }
+                try Self.persistGenerationIndex(
+                    nextGenerations,
+                    in: persistenceDirectory
+                )
+            }
         }
         rawEntries.insert(entry, at: 0)
-        return entry
+        mutationGenerations = nextGenerations
+        let receipt = mutationReceipt(
+            for: request.identity,
+            previous: previousGeneration
+        )
+        return SessionRecoveryStoreRawMutationReceipt(
+            mutation: receipt,
+            entry: entry,
+            acknowledgedRecoveryArtifact: request.recoveryArtifact
+        )
+    }
+
+    private func migrate(
+        _ request: MigrationCommand
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try requireReady()
+        try await reconcilePendingTransactionsIfNeeded()
+        guard request.sourceIdentity != request.destinationIdentity else {
+            try validateMutation(
+                identity: request.sourceIdentity,
+                expectedGeneration: request.expectedGeneration,
+                expectedRecords: request.expectedRecords
+            )
+            let nextGenerations = try advancingGenerations(
+                for: [request.sourceIdentity],
+                from: mutationGenerations
+            )
+            let previous = currentGeneration(for: request.sourceIdentity)
+            if let persistenceDirectory {
+                try await DocumentFileAccess.perform {
+                    try Self.persistGenerationIndex(
+                        nextGenerations,
+                        in: persistenceDirectory
+                    )
+                }
+            }
+            mutationGenerations = nextGenerations
+            return mutationReceipt(for: request.sourceIdentity, previous: previous)
+        }
+
+        try validateMutation(
+            identity: request.sourceIdentity,
+            expectedGeneration: request.expectedGeneration,
+            expectedRecords: request.expectedRecords
+        )
+        guard storedRecords(for: request.destinationIdentity).isEmpty else {
+            throw RecoveryStoreIssue.unexpectedRecoveryRecords
+        }
+        let movingEntries = entries.filter {
+            $0.documentIdentity == request.sourceIdentity
+        }
+        let movingRawEntries = rawEntries.filter {
+            $0.documentIdentity == request.sourceIdentity
+        }
+        let movedEntries = entries.map { entry in
+            guard entry.documentIdentity == request.sourceIdentity else {
+                return entry
+            }
+            return RecoveryEntry(
+                id: entry.id,
+                documentIdentity: request.destinationIdentity,
+                snapshot: entry.snapshot,
+                createdAt: entry.createdAt
+            )
+        }
+        let movedRawEntries = rawEntries.map { entry in
+            guard entry.documentIdentity == request.sourceIdentity else {
+                return entry
+            }
+            return RawRecoveryEntry(
+                id: entry.id,
+                documentIdentity: request.destinationIdentity,
+                dataURL: entry.dataURL,
+                byteCount: entry.byteCount,
+                contentDigest: entry.contentDigest,
+                createdAt: entry.createdAt,
+                residentData: entry.residentData,
+                acknowledgedRecoveryArtifactID: entry.acknowledgedRecoveryArtifactID
+            )
+        }
+        let previousGeneration = currentGeneration(for: request.sourceIdentity)
+        let destinationPreviousGeneration = currentGeneration(
+            for: request.destinationIdentity
+        )
+        // Migration consumes the source's compare-and-swap generation, while
+        // the returned generation belongs to the destination identity. A
+        // destination can be empty yet have a higher historical generation;
+        // allocating from both counters keeps stale destination effects
+        // permanently invalid after a relocation.
+        let destinationNextGeneration = max(
+            previousGeneration,
+            destinationPreviousGeneration
+        )
+        guard destinationNextGeneration < UInt64.max else {
+            throw RecoveryStoreIssue.mutationGenerationExhausted
+        }
+        let previousGenerations = mutationGenerations
+        let nextGenerations: [String: UInt64] = {
+            var values = previousGenerations
+            // Preserve a source tombstone generation. Removing the key would
+            // recreate generation zero and allow a stale source mutation to
+            // become valid after its recovery records moved away.
+            values[request.sourceIdentity.stableKey] = previousGeneration + 1
+            values[request.destinationIdentity.stableKey] =
+                destinationNextGeneration + 1
+            return values
+        }()
+
+        if let persistenceDirectory {
+            let migration = PersistedRecoveryMigration(
+                sourceKey: request.sourceIdentity.stableKey,
+                destinationKey: request.destinationIdentity.stableKey,
+                snapshotIDs: movingEntries.map(\.id),
+                rawIDs: movingRawEntries.map(\.id),
+                phase: .preparing,
+                previousGenerations: previousGenerations,
+                nextGenerations: nextGenerations
+            )
+            let hook = migrationWriteHook
+            try await DocumentFileAccess.perform {
+                try Self.persistMigration(migration, in: persistenceDirectory)
+                var writeCount = 0
+                for entry in movedEntries where entry.documentIdentity == request.destinationIdentity {
+                    try Self.persist(entry, in: persistenceDirectory)
+                    writeCount += 1
+                    try hook?.hook(writeCount)
+                }
+                for entry in movedRawEntries where entry.documentIdentity == request.destinationIdentity {
+                    try Self.persistRawMetadata(
+                        entry,
+                        intendedArtifactID: entry.acknowledgedRecoveryArtifactID,
+                        acknowledgedArtifactID: entry.acknowledgedRecoveryArtifactID,
+                        in: persistenceDirectory
+                    )
+                    writeCount += 1
+                    try hook?.hook(writeCount)
+                }
+                try Self.persistMigration(migration.committed, in: persistenceDirectory)
+                try Self.persistGenerationIndex(nextGenerations, in: persistenceDirectory)
+                try Self.removeMigration(in: persistenceDirectory)
+            }
+        }
+        entries = movedEntries
+        rawEntries = movedRawEntries
+        mutationGenerations = nextGenerations
+        return mutationReceipt(
+            for: request.destinationIdentity,
+            previous: previousGeneration
+        )
+    }
+
+    private func discard(
+        _ request: DiscardCommand
+    ) async throws -> SessionRecoveryStoreMutationReceipt {
+        try requireReady()
+        try await reconcilePendingTransactionsIfNeeded()
+        try validateMutation(
+            identity: request.identity,
+            expectedGeneration: request.expectedGeneration,
+            expectedRecords: request.expectedRecords
+        )
+        let currentRecords = storedRecords(for: request.identity)
+            .asDocumentSyncRecords
+        guard let remaining = Self.recordsAfterDiscard(
+            request.target,
+            from: currentRecords
+        ) else {
+            throw RecoveryStoreIssue.missingRecoveryEntry
+        }
+        let removingDecoded = Set(currentRecords.decoded.map(\.id)).subtracting(
+            Set(remaining.decoded.map(\.id))
+        )
+        let removingRaw = Set(currentRecords.raw.map(\.id)).subtracting(
+            Set(remaining.raw.map(\.id))
+        )
+        let nextEntries = entries.filter { !removingDecoded.contains($0.id) }
+        let nextRawEntries = rawEntries.filter { !removingRaw.contains($0.id) }
+        let previousGeneration = currentGeneration(for: request.identity)
+        let previousGenerations = mutationGenerations
+        let nextGenerations = try advancingGenerations(
+            for: [request.identity],
+            from: previousGenerations
+        )
+        if let persistenceDirectory {
+            let deletionURLs = removingDecoded.map {
+                Self.snapshotURL(for: $0, in: persistenceDirectory)
+            } + removingRaw.flatMap { id in
+                [
+                    Self.rawDataURL(for: id, in: persistenceDirectory),
+                    Self.rawMetadataURL(for: id, in: persistenceDirectory)
+                ]
+            }
+            try await DocumentFileAccess.perform {
+                try Self.commitDeletion(
+                    of: deletionURLs,
+                    in: persistenceDirectory,
+                    previousGenerations: previousGenerations,
+                    nextGenerations: nextGenerations
+                )
+            }
+        }
+        entries = nextEntries
+        rawEntries = nextRawEntries
+        mutationGenerations = nextGenerations
+        return mutationReceipt(for: request.identity, previous: previousGeneration)
+    }
+
+    private func reconcileFromDisk(
+        _ intent: DocumentSyncRecoveryReconciliationIntent
+    ) async throws -> SessionRecoveryStoreReconciliationReceipt {
+        guard let persistenceDirectory else {
+            return reconciliationReceipt(for: intent, acknowledgedArtifact: nil)
+        }
+        let hook = migrationWriteHook
+        let imported = try await DocumentFileAccess.perform {
+            try Self.importPersistedState(
+                from: persistenceDirectory,
+                migrationWriteHook: hook
+            )
+        }
+        entries = imported.entries
+        rawEntries = imported.rawEntries
+        mutationGenerations = imported.generations
+        let acknowledgedArtifact: CommitRecoveryArtifact?
+        if case .persist(_, _, let payload, _, _, _, _) = intent,
+           case .raw(let rawPayload) = payload,
+           let artifact = rawPayload.recoveryArtifact,
+           imported.acknowledgedArtifacts.contains(artifact.id)
+                || rawEntries.contains(where: {
+                    $0.id == artifact.id
+                        && $0.acknowledgedRecoveryArtifactID == artifact.id
+                }) {
+            acknowledgedArtifact = artifact
+        } else {
+            acknowledgedArtifact = nil
+        }
+        return reconciliationReceipt(
+            for: intent,
+            acknowledgedArtifact: acknowledgedArtifact
+        )
+    }
+
+    /// A failed migration or deletion can leave its journal and partially
+    /// applied filesystem state on disk while the actor still holds an older
+    /// index. No later command may overwrite either journal. Re-importing
+    /// through the same durable recovery routine either repairs it before
+    /// this command runs or fails closed with the original bytes intact.
+    private func reconcilePendingTransactionsIfNeeded() async throws {
+        guard let persistenceDirectory else { return }
+        let migrationURL = Self.migrationURL(in: persistenceDirectory)
+        let deletionURL = Self.deletionURL(in: persistenceDirectory)
+        let pendingJournal: PendingRecoveryJournal? =
+            try await DocumentFileAccess.perform {
+            if FileManager.default.fileExists(atPath: migrationURL.path) {
+                return PendingRecoveryJournal.migration
+            }
+            if FileManager.default.fileExists(atPath: deletionURL.path) {
+                return PendingRecoveryJournal.deletion
+            }
+            return nil as PendingRecoveryJournal?
+        }
+        guard let pendingJournal else { return }
+
+        let hook = migrationWriteHook
+        do {
+            let imported = try await DocumentFileAccess.perform {
+                try Self.importPersistedState(
+                    from: persistenceDirectory,
+                    migrationWriteHook: hook
+                )
+            }
+            entries = imported.entries
+            rawEntries = imported.rawEntries
+            mutationGenerations = imported.generations
+        } catch let issue as RecoveryStoreIssue where issue == .malformedData {
+            switch pendingJournal {
+            case .migration:
+                throw RecoveryStoreIssue.unreadableMigrationJournal
+            case .deletion:
+                throw RecoveryStoreIssue.unreadableDeletionJournal
+            }
+        }
+    }
+
+    private func reconciliationReceipt(
+        for intent: DocumentSyncRecoveryReconciliationIntent,
+        acknowledgedArtifact: CommitRecoveryArtifact?
+    ) -> SessionRecoveryStoreReconciliationReceipt {
+        let identity: DocumentIdentity
+        switch intent {
+        case .persist(let identityValue, _, _, _, _, _, _),
+             .discard(let identityValue, _, _, _, _):
+            identity = identityValue
+        case .migrate(let source, let destination, let expectedRecords, _):
+            let destinationRecords = storedRecords(for: destination)
+                .asDocumentSyncRecords
+            let moved = Self.migratedRecords(
+                expectedRecords,
+                to: destination
+            )
+            identity = destinationRecords == moved ? destination : source
+        }
+        let resultRecords = storedRecords(for: identity)
+        return SessionRecoveryStoreReconciliationReceipt(
+            identity: identity,
+            generation: currentGeneration(for: identity),
+            records: resultRecords,
+            acknowledgedRecoveryArtifact: acknowledgedArtifact
+        )
+    }
+
+    private func requireReady() throws {
+        guard case .ready = startupStatus else {
+            throw failedIssueOrUnavailable()
+        }
+    }
+
+    private func failedIssueOrUnavailable() -> RecoveryStoreIssue {
+        if case .failed(let issue) = startupStatus {
+            return issue
+        }
+        return .unavailable
+    }
+
+    private func validateMutation(
+        identity: DocumentIdentity,
+        expectedGeneration: UInt64?,
+        expectedRecords: DocumentSyncRecoveryRecords?
+    ) throws {
+        if let expectedGeneration,
+           currentGeneration(for: identity) != expectedGeneration {
+            throw RecoveryStoreIssue.unexpectedMutationGeneration
+        }
+        if let expectedRecords,
+           storedRecords(for: identity).asDocumentSyncRecords != expectedRecords {
+            throw RecoveryStoreIssue.unexpectedRecoveryRecords
+        }
+    }
+
+    private func storedRecords(
+        for identity: DocumentIdentity
+    ) -> SessionRecoveryStoreRecords {
+        SessionRecoveryStoreRecords(
+            decoded: entries.filter { $0.documentIdentity == identity },
+            raw: rawEntries.filter { $0.documentIdentity == identity }
+        )
+    }
+
+    private func loadReceipt(
+        scope: DocumentSyncRecoveryLoadScope
+    ) -> SessionRecoveryStoreLoadReceipt {
+        switch scope {
+        case .unattached:
+            SessionRecoveryStoreLoadReceipt(
+                scope: scope,
+                generation: 0,
+                records: .empty
+            )
+        case .document(let identity):
+            SessionRecoveryStoreLoadReceipt(
+                scope: scope,
+                generation: currentGeneration(for: identity),
+                records: storedRecords(for: identity)
+            )
+        }
+    }
+
+    private func snapshot() -> SessionRecoveryStoreSnapshot {
+        SessionRecoveryStoreSnapshot(
+            decodedEntries: entries,
+            rawEntries: rawEntries,
+            generations: mutationGenerations
+        )
+    }
+
+    private var currentGeneration: UInt64 {
+        mutationGenerations.values.max() ?? 0
+    }
+
+    private func currentGeneration(for identity: DocumentIdentity) -> UInt64 {
+        mutationGenerations[identity.stableKey, default: 0]
+    }
+
+    private func mutationReceipt(
+        for identity: DocumentIdentity,
+        previous: UInt64
+    ) -> SessionRecoveryStoreMutationReceipt {
+        let records = storedRecords(for: identity)
+        return SessionRecoveryStoreMutationReceipt(
+            previousGeneration: previous,
+            generation: currentGeneration(for: identity),
+            decodedEntries: records.decoded,
+            rawEntries: records.raw
+        )
     }
 
     private func shouldKeepRawDataResident(_ data: Data) -> Bool {
         let residentBytes = rawEntries.reduce(into: 0) { total, entry in
             total += entry.residentData?.count ?? 0
         }
-        return residentBytes + data.count
-            <= Self.maximumResidentRawRecoveryBytes
+        return residentBytes + data.count <= Self.maximumResidentRawRecoveryBytes
     }
 
-    private func importPendingCommitRecoveries() {
-        guard let persistenceDirectory else { return }
-        for pending in CommitRecoveryJournalStore.pendingRecoveries(
-            in: persistenceDirectory
-        ) {
-            do {
-                if pending.swapCompleted,
-                   let data = try? Data(
-                    contentsOf: pending.artifact.candidateURL,
-                    options: [.mappedIfSafe]
-                   ),
-                   FileFingerprint.make(data: data).contentDigest
-                        != pending.expectedContentDigest {
-                    try addRawData(
-                        data,
-                        for: pending.documentIdentity,
-                        id: pending.artifact.id
-                    )
-                }
-                try CommitRecoveryJournalStore.acknowledge(
-                    pending.artifact
-                )
-            } catch {
-                continue
+    private func advancingGenerations(
+        for identities: Set<DocumentIdentity>,
+        from current: [String: UInt64]
+    ) throws -> [String: UInt64] {
+        var next = current
+        for identity in identities {
+            let generation = current[identity.stableKey, default: 0]
+            guard generation < UInt64.max else {
+                throw RecoveryStoreIssue.mutationGenerationExhausted
+            }
+            next[identity.stableKey] = generation + 1
+        }
+        return next
+    }
+
+
+    private func recoveryIssue(from error: Error) -> RecoveryStoreIssue {
+        if let issue = error as? RecoveryStoreIssue {
+            return issue
+        }
+        if let error = error as? CommitRecoveryJournalStore.JournalError {
+            switch error {
+            case .malformedJournal:
+                return .malformedData
+            case .unsupportedSchema:
+                return .unsupportedSchema
+            case .invalidArtifactPath, .unownedReplacementDirectory:
+                return .unavailable
             }
         }
-    }
-
-    func latest(for identity: DocumentIdentity) -> RecoveryEntry? {
-        entries.first { $0.documentIdentity == identity }
-    }
-
-    /// Removes precisely one freshly decoded conflict after its durable file
-    /// has been removed. It does not generalize to raw, selected, or
-    /// multi-record cleanup; those paths remain P1-only.
-    func discardExactDecodedConflict(
-        _ entry: RecoveryEntry,
-        for identity: DocumentIdentity,
-        expectedGeneration: UInt64
-    ) throws -> SessionRecoveryStoreMutationReceipt {
-        try validateTypedMutation(
-            for: identity,
-            expectedGeneration: expectedGeneration
-        )
-        guard entry.documentIdentity == identity,
-              decodedEntries(for: identity) == [entry],
-              rawRecoveryEntries(for: identity).isEmpty else {
-            throw SessionRecoveryStoreError.missingRecoveryEntry
-        }
-        if let persistenceDirectory {
-            let url = snapshotURL(for: entry.id, in: persistenceDirectory)
-            guard FileManager.default.fileExists(atPath: url.path) else {
-                throw SessionRecoveryStoreError.missingRecoveryEntry
-            }
-            try FileManager.default.removeItem(at: url)
-        }
-        entries.removeAll { $0 == entry }
-
-        let previousGeneration = advanceTypedMutationGeneration(for: identity)
-        return typedMutationReceipt(
-            for: identity,
-            previousGeneration: previousGeneration
-        )
-    }
-
-    private func decodedEntries(for identity: DocumentIdentity) -> [RecoveryEntry] {
-        entries.filter { $0.documentIdentity == identity }
-    }
-
-    func rawRecoveryEntries(
-        for identity: DocumentIdentity
-    ) -> [RawRecoveryEntry] {
-        rawEntries.filter { $0.documentIdentity == identity }
-    }
-
-    /// Returns only the live typed generation for one identity. It does not
-    /// load, reinterpret, or authorize persisted recovery records.
-    func typedMutationGeneration(for identity: DocumentIdentity) -> UInt64 {
-        mutationGenerations[identity, default: 0]
-    }
-
-    private func validateTypedMutation(
-        for identity: DocumentIdentity,
-        expectedGeneration: UInt64
-    ) throws {
-        let currentGeneration = typedMutationGeneration(for: identity)
-        guard currentGeneration == expectedGeneration else {
-            throw SessionRecoveryStoreError.unexpectedMutationGeneration
-        }
-        guard currentGeneration < UInt64.max else {
-            throw SessionRecoveryStoreError.mutationGenerationExhausted
-        }
-    }
-
-    private func advanceTypedMutationGeneration(
-        for identity: DocumentIdentity
-    ) -> UInt64 {
-        let previousGeneration = typedMutationGeneration(for: identity)
-        mutationGenerations[identity] = previousGeneration + 1
-        return previousGeneration
-    }
-
-    private func typedMutationReceipt(
-        for identity: DocumentIdentity,
-        previousGeneration: UInt64
-    ) -> SessionRecoveryStoreMutationReceipt {
-        SessionRecoveryStoreMutationReceipt(
-            previousGeneration: previousGeneration,
-            generation: typedMutationGeneration(for: identity),
-            decodedEntries: decodedEntries(for: identity),
-            rawEntries: rawRecoveryEntries(for: identity)
-        )
-    }
-
-    func remove(_ entry: RecoveryEntry) {
-        entries.removeAll { $0.id == entry.id }
-        removePersistedSnapshot(id: entry.id)
-    }
-
-    func removeRawRecoveryEntries(for identity: DocumentIdentity) {
-        let removed = rawEntries.filter {
-            $0.documentIdentity == identity
-        }
-        rawEntries.removeAll {
-            $0.documentIdentity == identity
-        }
-        for entry in removed {
-            removePersistedRawRecovery(id: entry.id)
-        }
-    }
-
-    func moveEntries(
-        from oldIdentity: DocumentIdentity,
-        to newIdentity: DocumentIdentity
-    ) throws {
-        guard oldIdentity != newIdentity else { return }
-        try recoverPersistedMigration()
-        let originalEntries = entries
-        let originalRawEntries = rawEntries
-        let movingEntryIDs = Set(
-            entries.lazy
-                .filter { $0.documentIdentity == oldIdentity }
-                .map(\.id)
-        )
-        let movingRawEntryIDs = Set(
-            rawEntries.lazy
-                .filter { $0.documentIdentity == oldIdentity }
-                .map(\.id)
-        )
-        guard !movingEntryIDs.isEmpty || !movingRawEntryIDs.isEmpty else {
-            return
-        }
-        let movedEntries = entries.map { entry in
-            guard entry.documentIdentity == oldIdentity else { return entry }
-            return RecoveryEntry(
-                id: entry.id,
-                documentIdentity: newIdentity,
-                snapshot: entry.snapshot,
-                createdAt: entry.createdAt
-            )
-        }
-        let movedRawEntries = rawEntries.map { entry in
-            guard entry.documentIdentity == oldIdentity else { return entry }
-            return RawRecoveryEntry(
-                id: entry.id,
-                documentIdentity: newIdentity,
-                dataURL: entry.dataURL,
-                byteCount: entry.byteCount,
-                contentDigest: entry.contentDigest,
-                createdAt: entry.createdAt,
-                residentData: entry.residentData
-            )
-        }
-        guard persistenceDirectory != nil else {
-            entries = movedEntries
-            rawEntries = movedRawEntries
-            trim()
-            return
-        }
-        let migration = PersistedRecoveryMigration(
-            sourceKey: oldIdentity.stableKey,
-            destinationKey: newIdentity.stableKey,
-            snapshotIDs: Array(movingEntryIDs),
-            rawIDs: Array(movingRawEntryIDs),
-            phase: .preparing
-        )
-        try persistMigration(migration)
-        var completedWriteCount = 0
-        do {
-            for entry in movedEntries
-            where movingEntryIDs.contains(entry.id) {
-                try persist(entry)
-                completedWriteCount += 1
-                try migrationWriteHook?(completedWriteCount)
-            }
-            for entry in movedRawEntries
-            where movingRawEntryIDs.contains(entry.id) {
-                try persistRawMetadata(entry)
-                completedWriteCount += 1
-                try migrationWriteHook?(completedWriteCount)
-            }
-            try persistMigration(migration.committed)
-        } catch {
-            for entry in originalEntries
-            where entry.documentIdentity == oldIdentity {
-                try? persist(entry)
-            }
-            for entry in originalRawEntries
-            where entry.documentIdentity == oldIdentity {
-                try? persistRawMetadata(entry)
-            }
-            throw error
-        }
-        entries = movedEntries
-        rawEntries = movedRawEntries
-        try? removePersistedMigration()
-        trim()
-    }
-
-    private func loadPersistedEntries() {
-        guard let persistenceDirectory else { return }
-        let fileManager = FileManager.default
-        guard let urls = try? fileManager.contentsOfDirectory(
-            at: persistenceDirectory,
-            includingPropertiesForKeys: nil
-        ) else {
-            return
-        }
-        for url in urls where url.lastPathComponent.hasSuffix(".snapshot.json") {
-            guard let data = try? Data(contentsOf: url),
-                  let persisted = try? JSONDecoder().decode(
-                    PersistedRecoveryEntry.self,
-                    from: data
-                  ),
-                  let entry = persisted.entry else {
-                continue
-            }
-            entries.append(entry)
-        }
-        for url in urls where url.lastPathComponent.hasSuffix(".raw.json") {
-            guard let data = try? Data(contentsOf: url),
-                  let persisted = try? JSONDecoder().decode(
-                    PersistedRawRecoveryEntry.self,
-                    from: data
-                  ) else {
-                continue
-            }
-            let dataURL = rawDataURL(for: persisted.id, in: persistenceDirectory)
-            guard let values = try? dataURL.resourceValues(
-                forKeys: [.fileSizeKey, .isRegularFileKey]
-            ),
-            values.isRegularFile == true,
-            let fileSize = values.fileSize,
-            persisted.byteCount == nil || persisted.byteCount == fileSize else {
-                continue
-            }
-            rawEntries.append(
-                RawRecoveryEntry(
-                    id: persisted.id,
-                    documentIdentity: DocumentIdentity(
-                        stableKey: persisted.stableKey
-                    ),
-                    dataURL: dataURL,
-                    byteCount: persisted.byteCount ?? fileSize,
-                    contentDigest: persisted.contentDigest ?? "",
-                    createdAt: persisted.createdAt,
-                    residentData: nil
-                )
-            )
-        }
-        try? recoverPersistedMigration()
-        entries.sort { $0.createdAt > $1.createdAt }
-        rawEntries.sort { $0.createdAt > $1.createdAt }
-        trim()
-    }
-
-    private func persist(_ entry: RecoveryEntry) throws {
-        guard let persistenceDirectory else { return }
-        try ensurePersistenceDirectory()
-        let persisted = PersistedRecoveryEntry(entry)
-        try DurableFileIO.writeAtomically(
-            encode(persisted),
-            to: snapshotURL(for: entry.id, in: persistenceDirectory)
-        )
-    }
-
-    private func persistRawMetadata(_ entry: RawRecoveryEntry) throws {
-        guard let persistenceDirectory else { return }
-        try ensurePersistenceDirectory()
-        let persisted = PersistedRawRecoveryEntry(
-            id: entry.id,
-            stableKey: entry.documentIdentity.stableKey,
-            byteCount: entry.byteCount,
-            contentDigest: entry.contentDigest,
-            createdAt: entry.createdAt
-        )
-        try DurableFileIO.writeAtomically(
-            encode(persisted),
-            to: rawMetadataURL(for: entry.id, in: persistenceDirectory)
-        )
-    }
-
-    private func persistMigration(
-        _ migration: PersistedRecoveryMigration
-    ) throws {
-        guard let persistenceDirectory else { return }
-        try ensurePersistenceDirectory()
-        try DurableFileIO.writeAtomically(
-            encode(migration),
-            to: migrationURL(in: persistenceDirectory)
-        )
-    }
-
-    private func recoverPersistedMigration() throws {
-        guard let persistenceDirectory else { return }
-        let url = migrationURL(in: persistenceDirectory)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            return
-        }
-        let data: Data
-        let migration: PersistedRecoveryMigration
-        do {
-            data = try Data(contentsOf: url)
-            migration = try JSONDecoder().decode(
-                PersistedRecoveryMigration.self,
-                from: data
-            )
-        } catch {
-            throw SessionRecoveryStoreError.unreadableMigrationJournal
-        }
-        let snapshotIDs = Set(migration.snapshotIDs)
-        let rawIDs = Set(migration.rawIDs)
-        let resolvedIdentity = DocumentIdentity(
-            stableKey: migration.phase == .committed
-                ? migration.destinationKey
-                : migration.sourceKey
-        )
-        entries = entries.map { entry in
-            guard snapshotIDs.contains(entry.id) else { return entry }
-            return RecoveryEntry(
-                id: entry.id,
-                documentIdentity: resolvedIdentity,
-                snapshot: entry.snapshot,
-                createdAt: entry.createdAt
-            )
-        }
-        rawEntries = rawEntries.map { entry in
-            guard rawIDs.contains(entry.id) else { return entry }
-            return RawRecoveryEntry(
-                id: entry.id,
-                documentIdentity: resolvedIdentity,
-                dataURL: entry.dataURL,
-                byteCount: entry.byteCount,
-                contentDigest: entry.contentDigest,
-                createdAt: entry.createdAt,
-                residentData: entry.residentData
-            )
-        }
-        do {
-            for entry in entries where snapshotIDs.contains(entry.id) {
-                try persist(entry)
-            }
-            for entry in rawEntries where rawIDs.contains(entry.id) {
-                try persistRawMetadata(entry)
-            }
-            try removePersistedMigration()
-        } catch {
-            throw error
-        }
-    }
-
-    private func encode<T: Encodable>(_ value: T) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return try encoder.encode(value)
-    }
-
-    private func ensurePersistenceDirectory() throws {
-        guard let persistenceDirectory else { return }
-        try DurableFileIO.createDirectory(at: persistenceDirectory)
-    }
-
-    private func trim() {
-        var counts: [DocumentIdentity: Int] = [:]
-        var removed: [RecoveryEntry] = []
-        entries = entries.filter { entry in
-            counts[entry.documentIdentity, default: 0] += 1
-            let keep = counts[entry.documentIdentity, default: 0]
-                <= perDocumentLimit
-            if !keep { removed.append(entry) }
-            return keep
-        }
-        var pinnedDocuments: Set<DocumentIdentity> = []
-        let pinnedEntryIDs = Set(
-            entries.compactMap { entry -> UUID? in
-                guard pinnedDocuments.insert(entry.documentIdentity).inserted else {
-                    return nil
-                }
-                return entry.id
-            }
-        )
-        var historicalBytes = 0
-        entries = entries.filter { entry in
-            if pinnedEntryIDs.contains(entry.id) {
-                return true
-            }
-            historicalBytes += entry.snapshot.text.utf8.count
-            let keep = historicalBytes <= totalByteLimit
-            if !keep { removed.append(entry) }
-            return keep
-        }
-        for entry in removed {
-            removePersistedSnapshot(id: entry.id)
-        }
-    }
-
-    private func removePersistedSnapshot(id: UUID) {
-        guard let persistenceDirectory else { return }
-        try? FileManager.default.removeItem(
-            at: snapshotURL(for: id, in: persistenceDirectory)
-        )
-    }
-
-    private func removePersistedRawRecovery(id: UUID) {
-        guard let persistenceDirectory else { return }
-        try? FileManager.default.removeItem(
-            at: rawDataURL(for: id, in: persistenceDirectory)
-        )
-        try? FileManager.default.removeItem(
-            at: rawMetadataURL(for: id, in: persistenceDirectory)
-        )
-    }
-
-    private func removePersistedMigration() throws {
-        guard let persistenceDirectory else { return }
-        let url = migrationURL(in: persistenceDirectory)
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        try FileManager.default.removeItem(at: url)
-    }
-
-    private func snapshotURL(for id: UUID, in directory: URL) -> URL {
-        directory.appendingPathComponent(
-            "\(id.uuidString.lowercased()).snapshot.json"
-        )
-    }
-
-    private func rawDataURL(for id: UUID, in directory: URL) -> URL {
-        directory.appendingPathComponent(
-            "\(id.uuidString.lowercased()).raw"
-        )
-    }
-
-    private func rawMetadataURL(for id: UUID, in directory: URL) -> URL {
-        directory.appendingPathComponent(
-            "\(id.uuidString.lowercased()).raw.json"
-        )
-    }
-
-    private func migrationURL(in directory: URL) -> URL {
-        directory.appendingPathComponent("migration.json")
-    }
-}
-
-private struct PersistedRecoveryEntry: Codable {
-    let id: UUID
-    let stableKey: String
-    let text: String
-    let encoding: String
-    let newline: String
-    let hasFinalNewline: Bool
-    let createdAt: Date
-
-    init(_ entry: RecoveryEntry) {
-        id = entry.id
-        stableKey = entry.documentIdentity.stableKey
-        text = entry.snapshot.text
-        encoding = entry.snapshot.format.encoding.rawValue
-        newline = entry.snapshot.format.dominantNewline.rawValue
-        hasFinalNewline = entry.snapshot.format.hasFinalNewline
-        createdAt = entry.createdAt
-    }
-
-    var entry: RecoveryEntry? {
-        guard let encoding = TextEncoding(rawValue: encoding),
-              let newline = NewlineStyle(rawValue: newline) else {
-            return nil
-        }
-        return RecoveryEntry(
-            id: id,
-            documentIdentity: DocumentIdentity(stableKey: stableKey),
-            snapshot: DocumentSnapshot(
-                text: text,
-                format: TextFileFormat(
-                    encoding: encoding,
-                    dominantNewline: newline,
-                    hasFinalNewline: hasFinalNewline
-                )
-            ),
-            createdAt: createdAt
-        )
-    }
-}
-
-private struct PersistedRawRecoveryEntry: Codable {
-    let id: UUID
-    let stableKey: String
-    let byteCount: Int?
-    let contentDigest: String?
-    let createdAt: Date
-}
-
-private struct PersistedRecoveryMigration: Codable {
-    enum Phase: String, Codable {
-        case preparing
-        case committed
-    }
-
-    let sourceKey: String
-    let destinationKey: String
-    let snapshotIDs: [UUID]
-    let rawIDs: [UUID]
-    let phase: Phase
-
-    var committed: PersistedRecoveryMigration {
-        PersistedRecoveryMigration(
-            sourceKey: sourceKey,
-            destinationKey: destinationKey,
-            snapshotIDs: snapshotIDs,
-            rawIDs: rawIDs,
-            phase: .committed
-        )
+        return .unavailable
     }
 }

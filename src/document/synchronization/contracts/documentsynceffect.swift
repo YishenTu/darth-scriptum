@@ -148,6 +148,19 @@ enum DocumentSyncRecoveryLoadScope: Sendable, Equatable {
 struct DocumentSyncRecoveryLoadRequest: Sendable, Equatable {
     let token: SyncEffectToken
     let scope: DocumentSyncRecoveryLoadScope
+    /// Only an explicit Retry may restart a failed durable import. Ordinary
+    /// load effects remain fail-closed while the actor is in `.failed`.
+    let retriesStartup: Bool
+
+    init(
+        token: SyncEffectToken,
+        scope: DocumentSyncRecoveryLoadScope,
+        retriesStartup: Bool = false
+    ) {
+        self.token = token
+        self.scope = scope
+        self.retriesStartup = retriesStartup
+    }
 }
 
 struct DocumentSyncRecoveryReconciliationRequest: Sendable, Equatable {
@@ -251,6 +264,10 @@ struct DocumentSyncRecoveryDiscardRequest: Sendable, Equatable {
     let token: SyncEffectToken
     let identity: DocumentIdentity
     let target: DocumentSyncRecoveryDiscardTarget
+    /// The complete immutable record set validated by the reducer before the
+    /// command entered the actor FIFO. Executors must not reconstruct it from
+    /// mutable coordinator or store state.
+    let expectedRecords: DocumentSyncRecoveryRecords
     let expectedStoreGeneration: UInt64
 }
 

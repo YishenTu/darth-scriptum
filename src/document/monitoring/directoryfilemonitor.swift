@@ -7,6 +7,7 @@ final class DirectoryFileMonitor: @unchecked Sendable {
     private let queue: DispatchQueue
     private let onChange: @Sendable () -> Void
     private let onDescriptorClosed: (@Sendable (Bool) -> Void)?
+    private let startupHook: (@Sendable () throws -> Void)?
     private var directoryDescriptor: Int32 = -1
     private var fileDescriptor: Int32 = -1
     private var directorySource: DispatchSourceFileSystemObject?
@@ -15,11 +16,13 @@ final class DirectoryFileMonitor: @unchecked Sendable {
     init(
         targetURL: URL,
         onChange: @escaping @Sendable () -> Void,
-        onDescriptorClosed: (@Sendable (Bool) -> Void)? = nil
+        onDescriptorClosed: (@Sendable (Bool) -> Void)? = nil,
+        startupHook: (@Sendable () throws -> Void)? = nil
     ) {
         self.targetURL = targetURL
         self.onChange = onChange
         self.onDescriptorClosed = onDescriptorClosed
+        self.startupHook = startupHook
         queue = DispatchQueue(
             label: "com.yishentu.DarthScriptum.directory-monitor.\(UUID().uuidString)",
             qos: .utility
@@ -28,6 +31,7 @@ final class DirectoryFileMonitor: @unchecked Sendable {
 
     func start() throws {
         guard directorySource == nil, fileSource == nil else { return }
+        try startupHook?()
 
         directoryDescriptor = open(
             targetURL.deletingLastPathComponent().path,

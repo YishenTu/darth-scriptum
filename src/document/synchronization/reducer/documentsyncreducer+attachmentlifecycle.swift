@@ -4,7 +4,7 @@ import Foundation
 // reducer-internal boundaries used by the dispatcher or another transition domain.
 extension DocumentSyncReducer {
     static func started(_ state: DocumentSyncState) -> DocumentSyncTransition {
-        guard state.lifecycle == .active else { return unchanged(state) }
+        guard state.lifecycle != .closed else { return unchanged(state) }
         var updated = state
         var effects: [DocumentSyncEffect] = []
 
@@ -390,8 +390,12 @@ extension DocumentSyncReducer {
                 ? baseline
                 : nil
         }
+        // A Save As baseline can describe an earlier captured revision while
+        // the editor already contains newer local text. Verify that baseline
+        // before any automatic write can target the newly attached file.
         let requiresExternalVerification = !attachmentIdentityMatchesURL
             || (durableBaseline != nil && verifiedBaseline == nil)
+            || (verifiedBaseline?.snapshot != state.snapshot)
         var effects: [DocumentSyncEffect] = [.cancelAllDeadlines]
         if let attachment = state.fileAttachment {
             effects += stopMonitor(for: state, attachment: attachment)

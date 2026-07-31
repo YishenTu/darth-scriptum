@@ -5,6 +5,7 @@ struct DocumentSynchronizationStatusSnapshot: Equatable {
     let presentedState: SynchronizationState?
     let failureRequiresSaveAs: Bool
     let recoveryMigrationIsPending: Bool
+    let recoveryRetryAvailable: Bool
     let rawRecoveryURL: URL?
     let hasLocalRecovery: Bool
 
@@ -12,6 +13,7 @@ struct DocumentSynchronizationStatusSnapshot: Equatable {
         presentedState: nil,
         failureRequiresSaveAs: false,
         recoveryMigrationIsPending: false,
+        recoveryRetryAvailable: false,
         rawRecoveryURL: nil,
         hasLocalRecovery: false
     )
@@ -20,12 +22,67 @@ struct DocumentSynchronizationStatusSnapshot: Equatable {
 private struct VerifiedCoordinatorAttachment: Sendable {
     let targetURL: URL
     let identity: DocumentIdentity
-    let data: Data
+    let sourceRevision: SourceRevision
+    let durableBaseline: DocumentSyncDurableBaseline?
+    let dataMatchesExpectedSaveAs: Bool
+    let verifiedExternalChange: DocumentSyncExternalChange?
+}
+
+private struct UnverifiedCoordinatorAttachment: Sendable {
+    let targetURL: URL
+    let identity: DocumentIdentity
     let sourceRevision: SourceRevision
 }
 
-private enum DocumentSyncCoordinatorAttachmentError: Error {
+private enum PendingVerifiedExternalReadOutcome {
+    case result(DocumentSyncExternalReadResult)
+    case failure
+}
+
+private struct PendingVerifiedExternalRead {
+    let identity: DocumentIdentity
+    let targetURL: URL
+    let outcome: PendingVerifiedExternalReadOutcome
+    let continuation: CheckedContinuation<Void, Error>
+}
+
+private enum CoordinatorAttachmentInspection: Sendable {
+    case verified(VerifiedCoordinatorAttachment)
+    case unavailable(UnverifiedCoordinatorAttachment)
+
+    var target: UnverifiedCoordinatorAttachment {
+        switch self {
+        case .verified(let attachment):
+            UnverifiedCoordinatorAttachment(
+                targetURL: attachment.targetURL,
+                identity: attachment.identity,
+                sourceRevision: attachment.sourceRevision
+            )
+        case .unavailable(let target):
+            target
+        }
+    }
+
+    var durableBaseline: DocumentSyncDurableBaseline? {
+        if case .verified(let attachment) = self {
+            return attachment.durableBaseline
+        }
+        return nil
+    }
+
+    var didReadData: Bool {
+        if case .verified = self {
+            return true
+        }
+        return false
+    }
+}
+
+enum DocumentSyncCoordinatorAttachmentError: Error, Sendable, Equatable {
     case invalidSaveAsEvidence
+    case verificationUnavailable
+    case verificationInterrupted
+    case recoveryBlocksVerification
 }
 
 @MainActor
@@ -55,6 +112,8 @@ final class DocumentSyncCoordinator: ObservableObject {
     private let manualScheduler: ManualSyncScheduler?
     private let savePreparationHook: (@MainActor () async -> Void)?
     private let externalReadHook: (@MainActor (UInt64) async -> Void)?
+    private let monitorStartHook: (@Sendable () throws -> Void)?
+    private let monitorDescriptorClosedHook: (@Sendable (Bool) -> Void)?
     private lazy var scheduler = SyncScheduler { [weak self] deadline in
         self?.dispatch(.deadlineFired(deadline))
     }
@@ -63,6 +122,16 @@ final class DocumentSyncCoordinator: ObservableObject {
     private var attachmentTask: Task<Void, Never>?
     private var attachmentRequestID: UUID?
     private var attachmentCompletions: [UUID: (@MainActor (Bool) -> Void)] = [:]
+    private var initialAttachmentPending = false
+    private var initialAttachmentResult: Bool?
+    private var initialAttachmentWaiters: [CheckedContinuation<Bool, Never>] = []
+    private var pendingVerifiedExternalRead: PendingVerifiedExternalRead?
+    private var recoveryStartupWaiters: [
+        CheckedContinuation<DocumentSyncRecoveryAccess, Never>
+    ] = []
+    private var recoveryOperationWaiters: [
+        SyncEffectToken: [CheckedContinuation<Void, Never>]
+    ] = [:]
     private var monitors: [SyncEffectToken: DirectoryFileMonitor] = [:]
     private var queuedEvents: [DocumentSyncEvent] = []
     private var isDispatching = false
@@ -80,7 +149,9 @@ final class DocumentSyncCoordinator: ObservableObject {
         externalReadHook: (@MainActor (UInt64) async -> Void)? = nil,
         effectExecutor: DocumentSyncCoordinatorEffectExecuting =
             DocumentSyncDefaultEffectExecutor(),
-        manualScheduler: ManualSyncScheduler? = nil
+        manualScheduler: ManualSyncScheduler? = nil,
+        monitorStartHook: (@Sendable () throws -> Void)? = nil,
+        monitorDescriptorClosedHook: (@Sendable (Bool) -> Void)? = nil
     ) {
         sourceBuffer = MarkdownSourceBuffer(snapshot: snapshot)
         format = snapshot.format
@@ -93,13 +164,15 @@ final class DocumentSyncCoordinator: ObservableObject {
         self.manualScheduler = manualScheduler
         self.savePreparationHook = savePreparationHook
         self.externalReadHook = externalReadHook
+        self.monitorStartHook = monitorStartHook
+        self.monitorDescriptorClosedHook = monitorDescriptorClosedHook
         reducerState = DocumentSyncState(
             source: sourceBuffer.revision,
             format: snapshot.format,
-            // The legacy store cannot mint frozen recovery receipts. Normal
-            // synchronization therefore starts ready, while every recovery
-            // mutation remains fail-closed until P1 supplies the actor API.
-            recoveryAccess: .ready(generation: 0)
+            // Recovery import is an explicit actor transaction. Editing stays
+            // available while it loads, but automation remains gated until a
+            // typed generation and complete record set arrive.
+            recoveryAccess: .loading
         )
         sourceObservation = sourceBuffer.observe { [weak self] revision, origin in
             self?.sourceDidChange(revision, origin: origin)
@@ -156,34 +229,123 @@ final class DocumentSyncCoordinator: ObservableObject {
             for effect in transition.effects {
                 execute(effect)
             }
+            if case .recoveryFinished(let token, _) = nextEvent {
+                resolveRecoveryOperationWaiters(for: token)
+            }
             resolveFlushWaitersIfPossible()
         }
+        resolveRecoveryStartupWaitersIfPossible()
     }
 
     func loadInitial(_ snapshot: DocumentSnapshot, data: Data, from url: URL?) {
         cancelPendingAttachmentRequest()
+        initialAttachmentPending = false
+        initialAttachmentResult = nil
+        let previous = reducerState
         replaceSource(snapshot.text, origin: .initialLoad)
+        installLoadingInitialSource(
+            snapshot,
+            targetURL: url?.standardizedFileURL,
+            previous: previous
+        )
         guard let url else {
-            reducerState = DocumentSyncState(
-                lifetime: reducerState.lifetime,
-                source: sourceBuffer.revision,
-                format: snapshot.format,
-                recoveryAccess: .ready(generation: 0),
-                nextAttempt: reducerState.nextAttempt,
-                nextCommitGeneration: reducerState.nextCommitGeneration
-            )
-            unattachedDurableState = nil
-            publishCompatibility(from: reducerState, event: nil)
+            resolveInitialAttachmentWaiters(didAttach: false)
             dispatch(.started)
             return
         }
-
-        installInitialAttachment(
-            targetURL: url.standardizedFileURL,
-            data: data,
-            sourceRevision: sourceBuffer.revision,
+        let targetURL = url.standardizedFileURL
+        let capturedSource = sourceBuffer.revision
+        initialAttachmentPending = true
+        let requestID = beginAttachmentRequest { [weak self] didAttach in
+            self?.resolveInitialAttachmentWaiters(didAttach: didAttach)
+        }
+        scheduleAttachmentInspection(
+            requestID: requestID,
+            event: .attach,
+            targetURL: targetURL,
+            knownData: data,
+            sourceRevision: capturedSource,
+            sourceFormat: snapshot.format,
+            baselineSourceRevision: capturedSource,
             initialFormat: snapshot.format
         )
+    }
+
+    /// Loading text is not a filesystem decision: the caller already owns
+    /// these immutable bytes. Install that source immediately so a Save or
+    /// serialization request cannot observe the constructor snapshot while
+    /// attachment identity, fingerprint, and recovery import remain pending.
+    private func installLoadingInitialSource(
+        _ snapshot: DocumentSnapshot,
+        targetURL: URL?,
+        previous: DocumentSyncState
+    ) {
+        let attachment: DocumentSyncAttachment = if let targetURL {
+            .provisional(
+                DocumentSyncProvisionalFileAttachment(
+                    url: targetURL,
+                    epoch: previous.attachmentEpoch + 1
+                )
+            )
+        } else {
+            .untitled
+        }
+        reducerState = DocumentSyncState(
+            lifetime: previous.lifetime,
+            source: sourceBuffer.revision,
+            format: snapshot.format,
+            attachment: attachment,
+            attachmentEpoch: targetURL == nil
+                ? previous.attachmentEpoch
+                : previous.attachmentEpoch + 1,
+            recoveryAccess: .loading,
+            nextAttempt: previous.nextAttempt,
+            nextCommitGeneration: previous.nextCommitGeneration
+        )
+        unattachedDurableState = nil
+        publishCompatibility(from: previous, event: nil)
+    }
+
+    /// Recovery reads are intentionally asynchronous. Hosts that need a
+    /// stable recovery decision (rather than merely editable source text)
+    /// can await this boundary without blocking the main actor.
+    func waitForRecoveryStartup() async -> DocumentSyncRecoveryAccess {
+        switch reducerState.recoveryAccess {
+        case .loading:
+            return await withCheckedContinuation { continuation in
+                recoveryStartupWaiters.append(continuation)
+            }
+        case .ready, .failed:
+            return reducerState.recoveryAccess
+        }
+    }
+
+    /// Awaits the exact recovery operation that is active when this method is
+    /// called. It is intentionally token-specific so tests and hosts cannot
+    /// mistake an earlier or later recovery transaction for this one.
+    func waitForCurrentRecoveryOperation() async {
+        guard let token = reducerState.activeTokens[.recovery] else { return }
+        await withCheckedContinuation { continuation in
+            guard reducerState.activeTokens[.recovery] == token else {
+                continuation.resume()
+                return
+            }
+            recoveryOperationWaiters[token, default: []].append(continuation)
+        }
+    }
+
+    /// Waits for the verification request originally scheduled by
+    /// `loadInitial`. Unlike `attachAndWait`, this never replaces that
+    /// in-flight request, which lets a host distinguish loaded source from a
+    /// verified file attachment without cancelling either operation.
+    func waitForInitialAttachment() async -> Bool {
+        if let initialAttachmentResult {
+            return initialAttachmentResult
+        }
+        guard initialAttachmentPending else { return false }
+        return await withCheckedContinuation { continuation in
+            initialAttachmentWaiters.append(continuation)
+        }
     }
 
     func attach(
@@ -198,44 +360,15 @@ final class DocumentSyncCoordinator: ObservableObject {
         let requestID = beginAttachmentRequest(completion: completion)
 
         let capturedSource = reducerState.source
-        if let knownData {
-            completeAttachment(
-                requestID: requestID,
-                event: .attach,
-                targetURL: targetURL,
-                data: knownData,
-                sourceRevision: capturedSource
-            )
-            return
-        }
-
-        attachmentTask = Task { [weak self] in
-            let result = await Task.detached(priority: .utility) {
-                try Self.readAttachment(
-                    at: targetURL,
-                    sourceRevision: capturedSource
-                )
-            }.result
-            guard !Task.isCancelled, let self else { return }
-            switch result {
-            case .success(let attachment):
-                self.completeAttachment(
-                    requestID: requestID,
-                    event: .attach,
-                    targetURL: attachment.targetURL,
-                    data: attachment.data,
-                    sourceRevision: attachment.sourceRevision
-                )
-            case .failure:
-                self.completeAttachment(
-                    requestID: requestID,
-                    event: .attach,
-                    targetURL: targetURL,
-                    data: nil,
-                    sourceRevision: capturedSource
-                )
-            }
-        }
+        scheduleAttachmentInspection(
+            requestID: requestID,
+            event: .attach,
+            targetURL: targetURL,
+            knownData: knownData,
+            sourceRevision: capturedSource,
+            sourceFormat: reducerState.format,
+            baselineSourceRevision: capturedSource
+        )
     }
 
     /// Attachment reads happen off the main actor. Consumers that need the
@@ -265,34 +398,38 @@ final class DocumentSyncCoordinator: ObservableObject {
     ) async throws {
         guard !isTornDown else { return }
         let targetURL = url.standardizedFileURL
-        guard try TextFileCodec.decode(expectedData) == expectedSnapshot else {
-            throw DocumentSyncCoordinatorAttachmentError.invalidSaveAsEvidence
-        }
         let capturedSource = reducerState.source
-        let verification = try await Task.detached(priority: .utility) {
-            try Self.readAttachment(
-                at: targetURL,
-                sourceRevision: capturedSource
-            )
-        }.value
-        guard !isTornDown else { return }
-
         let requestID = beginAttachmentRequest(completion: nil)
+        let sourceFormat = reducerState.format
+        let baselineSourceRevision = expectedSourceRevision ?? capturedSource
+        let commitGeneration = reducerState.durableBaseline?.commitGeneration ?? 0
+        let verification: CoordinatorAttachmentInspection
+        do {
+            verification = try await DocumentFileAccess.perform {
+                try Self.inspectSaveAsAttachment(
+                    at: targetURL,
+                    expectedData: expectedData,
+                    expectedSnapshot: expectedSnapshot,
+                    sourceRevision: capturedSource,
+                    sourceFormat: sourceFormat,
+                    baselineSourceRevision: baselineSourceRevision,
+                    commitGeneration: commitGeneration
+                )
+            }
+        } catch {
+            guard attachmentRequestID == requestID else { return }
+            attachmentRequestID = nil
+            throw error
+        }
+        guard !isTornDown, attachmentRequestID == requestID else { return }
         completeAttachment(
             requestID: requestID,
             event: .saveAsAttached,
-            targetURL: targetURL,
-            data: expectedData,
-            sourceRevision: capturedSource,
-            baselineSourceRevision: expectedSourceRevision
+            inspection: verification
         )
-        guard verification.data != expectedData else { return }
-
-        applyVerifiedSaveAsReplacement(
-            data: verification.data,
-            targetURL: targetURL,
-            identity: verification.identity
-        )
+        guard case .verified(let attachment) = verification,
+              !attachment.dataMatchesExpectedSaveAs else { return }
+        try await applyVerifiedSaveAsReplacement(attachment.verifiedExternalChange)
     }
 
     func updateFileURL(_ url: URL) {
@@ -308,44 +445,15 @@ final class DocumentSyncCoordinator: ObservableObject {
         let targetURL = newURL.standardizedFileURL
         let requestID = beginAttachmentRequest(completion: completion)
         let capturedSource = reducerState.source
-        if let knownData {
-            completeAttachment(
-                requestID: requestID,
-                event: .fileMoved,
-                targetURL: targetURL,
-                data: knownData,
-                sourceRevision: capturedSource
-            )
-            return
-        }
-
-        attachmentTask = Task { [weak self] in
-            let result = await Task.detached(priority: .utility) {
-                try Self.readAttachment(
-                    at: targetURL,
-                    sourceRevision: capturedSource
-                )
-            }.result
-            guard !Task.isCancelled, let self else { return }
-            switch result {
-            case .success(let attachment):
-                self.completeAttachment(
-                    requestID: requestID,
-                    event: .fileMoved,
-                    targetURL: attachment.targetURL,
-                    data: attachment.data,
-                    sourceRevision: attachment.sourceRevision
-                )
-            case .failure:
-                self.completeAttachment(
-                    requestID: requestID,
-                    event: .fileMoved,
-                    targetURL: targetURL,
-                    data: nil,
-                    sourceRevision: capturedSource
-                )
-            }
-        }
+        scheduleAttachmentInspection(
+            requestID: requestID,
+            event: .fileMoved,
+            targetURL: targetURL,
+            knownData: knownData,
+            sourceRevision: capturedSource,
+            sourceFormat: reducerState.format,
+            baselineSourceRevision: capturedSource
+        )
     }
 
     /// The file-move counterpart to `attachAndWait`. It gives hosts that must
@@ -485,7 +593,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         var updatedFormat = reducerState.format
         updatedFormat.hasFinalNewline = revision.text.utf16.last == 0x000A
         dispatch(.sourceChanged(revision, format: updatedFormat))
-        if reducerState.fileAttachment == nil,
+        if !reducerState.attachment.isManagedFile,
            let hostURL = delegate?.synchronizationFileURL {
             attach(to: hostURL)
         }
@@ -493,27 +601,26 @@ final class DocumentSyncCoordinator: ObservableObject {
     }
 
     private func installInitialAttachment(
-        targetURL: URL,
-        data: Data?,
-        sourceRevision: SourceRevision,
-        baselineSourceRevision: SourceRevision? = nil,
+        target: UnverifiedCoordinatorAttachment,
+        durableBaseline: DocumentSyncDurableBaseline?,
         initialFormat: TextFileFormat? = nil
     ) {
         let previous = reducerState
-        let source = sourceRevision
-        let baselineSource = baselineSourceRevision ?? source
-        let identity = DocumentIdentity.make(url: targetURL)
-        let baseline = data.flatMap {
-            makeBaseline(
-                data: $0,
-                targetURL: targetURL,
-                identity: identity,
-                sourceRevision: baselineSource
-            )
+        // A source edit can occur while the file queue verifies the initial
+        // attachment. Keep that newer source revision authoritative; the
+        // baseline remains stamped to the captured on-disk revision so the
+        // reducer correctly treats the newer edit as dirty.
+        let source = sourceBuffer.revision
+        let format = initialFormat
+            ?? durableBaseline?.snapshot.format
+            ?? previous.format
+        let attachmentEpoch: UInt64
+        if case .provisional(let provisional) = previous.attachment {
+            attachmentEpoch = provisional.epoch
+        } else {
+            attachmentEpoch = previous.attachmentEpoch + 1
         }
-        let format = initialFormat ?? baseline?.snapshot.format ?? previous.format
-        let recoveryIssue = legacyRecoveryIssue(for: identity)
-        let requiresExternalVerification = baseline?.snapshot
+        let requiresExternalVerification = durableBaseline?.snapshot
             != DocumentSnapshot(text: source.text, format: format)
         reducerState = DocumentSyncState(
             lifetime: previous.lifetime,
@@ -521,30 +628,25 @@ final class DocumentSyncCoordinator: ObservableObject {
             format: format,
             attachment: .file(
                 DocumentSyncFileAttachment(
-                    identity: identity,
-                    url: targetURL,
-                    epoch: previous.attachmentEpoch + 1
+                    identity: target.identity,
+                    url: target.targetURL,
+                    epoch: attachmentEpoch
                 )
             ),
-            attachmentEpoch: previous.attachmentEpoch + 1,
-            durableBaseline: baseline,
-            recoveryAccess: recoveryIssue == nil
-                ? .ready(
-                    generation: recoveryStore.typedMutationGeneration(
-                        for: identity
-                    )
-                )
-                : .failed(.recovery),
-            issue: recoveryIssue,
+            attachmentEpoch: attachmentEpoch,
+            durableBaseline: durableBaseline,
+            recoveryAccess: .loading,
+            lifecycle: previous.lifecycle,
+            issue: nil,
             nextAttempt: previous.nextAttempt,
             nextCommitGeneration: previous.nextCommitGeneration,
+            activeTokens: previous.activeTokens,
             externalSignalPending: requiresExternalVerification
         )
         unattachedDurableState = nil
         publishCompatibility(from: previous, event: nil)
         dispatch(.started)
-        guard recoveryIssue == nil,
-              requiresExternalVerification,
+        guard requiresExternalVerification,
               let monitorToken = reducerState.activeTokens[.monitor] else {
             return
         }
@@ -555,6 +657,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         completion: (@MainActor (Bool) -> Void)?
     ) -> UUID {
         cancelPendingAttachmentRequest()
+        resolvePendingVerifiedExternalRead(throwing: .verificationInterrupted)
         let requestID = UUID()
         attachmentRequestID = requestID
         if let completion {
@@ -572,53 +675,108 @@ final class DocumentSyncCoordinator: ObservableObject {
         attachmentRequestID = nil
     }
 
-    private func completeAttachment(
+    private func scheduleAttachmentInspection(
         requestID: UUID,
         event: AttachmentEvent,
         targetURL: URL,
-        data: Data?,
+        knownData: Data?,
         sourceRevision: SourceRevision,
-        baselineSourceRevision: SourceRevision? = nil
+        sourceFormat: TextFileFormat,
+        baselineSourceRevision: SourceRevision,
+        initialFormat: TextFileFormat? = nil
+    ) {
+        let commitGeneration = reducerState.durableBaseline?.commitGeneration ?? 0
+        attachmentTask = Task { [weak self] in
+            let inspection: CoordinatorAttachmentInspection
+            do {
+                inspection = try await DocumentFileAccess.perform {
+                    Self.inspectAttachment(
+                        at: targetURL,
+                        knownData: knownData,
+                        sourceRevision: sourceRevision,
+                        sourceFormat: sourceFormat,
+                        baselineSourceRevision: baselineSourceRevision,
+                        commitGeneration: commitGeneration
+                    )
+                }
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.completeAttachment(
+                requestID: requestID,
+                event: event,
+                inspection: inspection,
+                initialFormat: initialFormat
+            )
+        }
+    }
+
+    private func completeAttachment(
+        requestID: UUID,
+        event: AttachmentEvent,
+        inspection: CoordinatorAttachmentInspection,
+        initialFormat: TextFileFormat? = nil
     ) {
         guard !isTornDown, attachmentRequestID == requestID else { return }
         attachmentTask = nil
         attachmentRequestID = nil
-        let identity = DocumentIdentity.make(url: targetURL)
-        let baseline = data.flatMap {
-            makeBaseline(
-                data: $0,
-                targetURL: targetURL,
-                identity: identity,
-                sourceRevision: baselineSourceRevision ?? reducerState.source
-            )
-        }
+        let target = inspection.target
+        let baseline = inspection.durableBaseline
 
-        if reducerState.fileAttachment == nil,
-           reducerState.recoveryRecords == nil,
-           event != .fileMoved {
+        if case .attach = event,
+           reducerState.fileAttachment == nil,
+           reducerState.recoveryRecords == nil {
             // Initial document attachment is construction, not a relocation.
             // It keeps ordinary editing usable while P1 replaces the legacy
             // recovery store with exact typed receipts.
             installInitialAttachment(
-                targetURL: targetURL,
-                data: data,
-                sourceRevision: sourceRevision,
-                baselineSourceRevision: baselineSourceRevision
+                target: target,
+                durableBaseline: baseline,
+                initialFormat: initialFormat
             )
-            finishAttachmentRequest(requestID, didAttach: data != nil)
+            finishAttachmentRequest(requestID, didAttach: inspection.didReadData)
+            if !inspection.didReadData {
+                noteCoordinatedExternalChange()
+            }
             return
         }
 
         unattachedDurableState = nil
         switch event {
         case .attach:
-            dispatch(.attach(identity: identity, url: targetURL, durableBaseline: baseline))
+            dispatch(
+                .attach(
+                    identity: target.identity,
+                    url: target.targetURL,
+                    durableBaseline: baseline
+                )
+            )
         case .fileMoved:
-            dispatch(.fileMoved(identity: identity, url: targetURL, durableBaseline: baseline))
+            dispatch(
+                .fileMoved(
+                    identity: target.identity,
+                    url: target.targetURL,
+                    durableBaseline: baseline
+                )
+            )
         case .saveAsAttached:
-            dispatch(.saveAsAttached(identity: identity, url: targetURL, durableBaseline: baseline))
+            dispatch(
+                .saveAsAttached(
+                    identity: target.identity,
+                    url: target.targetURL,
+                    durableBaseline: baseline
+                )
+            )
         }
-        finishAttachmentRequest(requestID, didAttach: data != nil)
+        finishAttachmentRequest(requestID, didAttach: inspection.didReadData)
+        if !inspection.didReadData {
+            // The host has already chosen this URL (notably after Save As),
+            // so do not leave the old attachment live. A fresh monitor read
+            // projects the missing/unreadable target without authorizing an
+            // unchecked write.
+            noteCoordinatedExternalChange()
+        }
     }
 
     private func finishAttachmentRequest(
@@ -628,24 +786,51 @@ final class DocumentSyncCoordinator: ObservableObject {
         attachmentCompletions.removeValue(forKey: requestID)?(didAttach)
     }
 
-    private func legacyRecoveryIssue(
-        for identity: DocumentIdentity
-    ) -> DocumentSyncIssue? {
-        guard recoveryStore.latest(for: identity) != nil
-            || !recoveryStore.rawRecoveryEntries(for: identity).isEmpty else {
-            return nil
+    private func resolveInitialAttachmentWaiters(didAttach: Bool) {
+        initialAttachmentPending = false
+        initialAttachmentResult = didAttach
+        let waiters = initialAttachmentWaiters
+        initialAttachmentWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(returning: didAttach)
         }
+    }
 
-        // We deliberately retain no partial `DocumentSyncRecoveryRecords`
-        // here. The legacy store exposes only one decoded entry and no
-        // generation, so presenting that subset as a complete mutable record
-        // set could authorize an unsafe restore, discard, or migration.
-        return DocumentSyncIssue(
-            failure: .recovery,
-            retryable: false,
-            requiresSaveAs: false,
-            rawRecoveryURL: nil
-        )
+    private func resolvePendingVerifiedExternalRead(
+        throwing error: DocumentSyncCoordinatorAttachmentError? = nil
+    ) {
+        guard let pending = pendingVerifiedExternalRead else { return }
+        pendingVerifiedExternalRead = nil
+        if let error {
+            pending.continuation.resume(throwing: error)
+        } else {
+            pending.continuation.resume()
+        }
+    }
+
+    private func resolvePendingVerifiedExternalReadIfBlocked() {
+        guard let pending = pendingVerifiedExternalRead else { return }
+        guard let attachment = reducerState.fileAttachment,
+              attachment.identity == pending.identity,
+              attachment.url.standardizedFileURL
+                == pending.targetURL.standardizedFileURL else {
+            resolvePendingVerifiedExternalRead(throwing: .verificationInterrupted)
+            return
+        }
+        switch reducerState.recoveryAccess {
+        case .loading:
+            return
+        case .failed:
+            resolvePendingVerifiedExternalRead(throwing: .recoveryBlocksVerification)
+        case .ready:
+            guard DocumentSyncReducer.canScheduleExternalRead(reducerState)
+                || reducerState.external != .idle else {
+                resolvePendingVerifiedExternalRead(
+                    throwing: .recoveryBlocksVerification
+                )
+                return
+            }
+        }
     }
 
     /// Save As has already captured the target bytes off the main actor. If
@@ -654,43 +839,28 @@ final class DocumentSyncCoordinator: ObservableObject {
     /// not return with a stale baseline. The concurrently started executor
     /// completion is harmless: its token is stale after this result wins.
     private func applyVerifiedSaveAsReplacement(
-        data: Data,
-        targetURL: URL,
-        identity: DocumentIdentity
-    ) {
+        _ change: DocumentSyncExternalChange?
+    ) async throws {
         guard let monitorToken = reducerState.activeTokens[.monitor] else {
-            return
+            throw DocumentSyncCoordinatorAttachmentError.verificationInterrupted
         }
-        dispatch(.monitorSignaled(monitorToken))
-        guard case .debouncing(let ticket) = reducerState.external else {
-            return
+        guard let attachment = reducerState.fileAttachment else {
+            throw DocumentSyncCoordinatorAttachmentError.verificationInterrupted
         }
-        dispatch(
-            .deadlineFired(
-                SyncDeadline(kind: .externalRead, token: ticket.token)
-            )
-        )
-        guard case .reading(let read) = reducerState.external,
-              read.token == ticket.token else {
-            return
+        let outcome: PendingVerifiedExternalReadOutcome = if let change {
+            .result(.changed(change))
+        } else {
+            .failure
         }
-
-        do {
-            let fingerprint = try SafeFileCommitter.fingerprint(
-                for: targetURL,
-                data: data
+        try await withCheckedThrowingContinuation { continuation in
+            pendingVerifiedExternalRead = PendingVerifiedExternalRead(
+                identity: attachment.identity,
+                targetURL: attachment.url,
+                outcome: outcome,
+                continuation: continuation
             )
-            let change = try TextFileCodec.decodeExternalChange(
-                data: data,
-                targetURL: targetURL,
-                identity: identity,
-                fingerprint: fingerprint
-            )
-            dispatch(
-                .externalReadFinished(token: read.token, result: .changed(change))
-            )
-        } catch {
-            dispatch(.operationFailed(token: read.token, failure: .externalRead))
+            dispatch(.monitorSignaled(monitorToken))
+            resolvePendingVerifiedExternalReadIfBlocked()
         }
     }
 
@@ -708,7 +878,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         }
         durableState = next.durableBaseline?.asDurableFileState
             ?? unattachedDurableState
-        let nextURL = next.fileAttachment?.url.standardizedFileURL
+        let nextURL = next.attachment.managedFileURL?.standardizedFileURL
         if fileURL != nextURL {
             fileURL = nextURL
         }
@@ -718,6 +888,7 @@ final class DocumentSyncCoordinator: ObservableObject {
             presentedState: projection.presentedState,
             failureRequiresSaveAs: projection.failureRequiresSaveAs,
             recoveryMigrationIsPending: projection.recoveryMigrationIsPending,
+            recoveryRetryAvailable: projection.recoveryRetryAvailable,
             rawRecoveryURL: projection.rawRecoveryURL,
             hasLocalRecovery: projection.hasLocalRecovery
         )
@@ -782,7 +953,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                 }
             }
         case .recovery(let request):
-            executeLegacyRecovery(request)
+            executeRecovery(request)
         case .monitor(let request):
             executeMonitor(request)
         case .resolveClose(let resolution):
@@ -844,6 +1015,24 @@ final class DocumentSyncCoordinator: ObservableObject {
     }
 
     private func executeExternalRead(_ request: DocumentSyncExternalReadRequest) {
+        if let pending = pendingVerifiedExternalRead,
+           pending.identity == request.identity,
+           pending.targetURL.standardizedFileURL
+                == request.targetURL.standardizedFileURL {
+            pendingVerifiedExternalRead = nil
+            switch pending.outcome {
+            case .result(let result):
+                dispatch(.externalReadFinished(token: request.token, result: result))
+                pending.continuation.resume()
+            case .failure:
+                dispatch(.operationFailed(token: request.token, failure: .externalRead))
+                pending.continuation.resume(
+                    throwing: DocumentSyncCoordinatorAttachmentError
+                        .verificationUnavailable
+                )
+            }
+            return
+        }
         guard let externalReadHook else {
             beginExternalReadEffect(request)
             return
@@ -881,147 +1070,212 @@ final class DocumentSyncCoordinator: ObservableObject {
             monitors.removeAll()
             guard fileMonitoringEnabled else { return }
             let token = request.token
-            let monitor = DirectoryFileMonitor(targetURL: request.targetURL) {
-                Task { @MainActor [weak self] in
-                    self?.dispatch(.monitorSignaled(token))
+            let monitor = DirectoryFileMonitor(
+                targetURL: request.targetURL,
+                onChange: {
+                    Task { @MainActor [weak self] in
+                        self?.dispatch(.monitorSignaled(token))
+                    }
+                },
+                onDescriptorClosed: monitorDescriptorClosedHook,
+                startupHook: monitorStartHook
+            )
+            Task { [weak self] in
+                do {
+                    try await DocumentFileAccess.perform {
+                        try monitor.start()
+                    }
+                    guard let self,
+                          !self.isTornDown,
+                          self.reducerState.activeTokens[.monitor] == token else {
+                        monitor.cancel()
+                        return
+                    }
+                    self.monitors[token] = monitor
+                } catch {
+                    guard let self,
+                          !self.isTornDown,
+                          self.reducerState.activeTokens[.monitor] == token else {
+                        return
+                    }
+                    self.dispatch(.operationFailed(token: token, failure: .monitor))
                 }
-            }
-            do {
-                try monitor.start()
-                monitors[token] = monitor
-            } catch {
-                dispatch(.operationFailed(token: token, failure: .monitor))
             }
         case .stop:
             monitors.removeValue(forKey: request.token)?.cancel()
         }
     }
 
-    private func executeLegacyRecovery(_ request: DocumentSyncRecoveryRequest) {
-        if case .migrate(let migration) = request,
-           migration.records.isEmpty,
-           legacyRecoveryIssue(for: migration.sourceIdentity) == nil,
-           legacyRecoveryIssue(for: migration.destinationIdentity) == nil {
-            // Recordless migration changes no recovery file, but it still
-            // advances the reducer's receipt generation. Keep that generation
-            // in the store so a later fresh conflict cannot be rejected as a
-            // fabricated coordinator completion.
+    /// Recovery effects execute only their immutable request. The actor owns
+    /// the FIFO index and all blocking I/O, while this main-actor coordinator
+    /// only echoes the original reducer token with a typed result.
+    private func executeRecovery(_ request: DocumentSyncRecoveryRequest) {
+        let recoveryStore = recoveryStore
+        Task { [weak self] in
+            let result: DocumentSyncRecoveryResult
             do {
-                let receipt = try recoveryStore.advanceEmptyRecoveryMigration(
-                    from: migration.sourceIdentity,
-                    to: migration.destinationIdentity,
-                    expectedGeneration: migration.expectedStoreGeneration
-                )
-                dispatch(
-                    .recoveryFinished(
-                        token: migration.token,
-                        result: .migrated(
-                            DocumentSyncRecoveryMutationResult(
-                                previousGeneration: receipt.previousGeneration,
-                                generation: receipt.generation,
-                                records: recoveryRecords(from: receipt)
+                switch request {
+                case .load(let load):
+                    if load.retriesStartup {
+                        _ = try await recoveryStore.retryStartup()
+                    }
+                    let receipt = try await recoveryStore.load(scope: load.scope)
+                    result = .loaded(
+                        DocumentSyncRecoveryLoadResult(
+                            scope: receipt.scope,
+                            generation: receipt.generation,
+                            records: self?.recoveryRecords(from: receipt.records)
+                                ?? .empty
+                        )
+                    )
+                case .reconcile(let reconciliation):
+                    let receipt = try await recoveryStore.reconcile(
+                        reconciliation.intent
+                    )
+                    result = .reconciled(
+                        DocumentSyncRecoveryReconciliationResult(
+                            identity: receipt.identity,
+                            generation: receipt.generation,
+                            records: self?.recoveryRecords(from: receipt.records)
+                                ?? .empty,
+                            acknowledgedRecoveryArtifact:
+                                receipt.acknowledgedRecoveryArtifact
+                        )
+                    )
+                case .persist(let persistence):
+                    switch persistence.payload {
+                    case .snapshot(let snapshot):
+                        let receipt = try await recoveryStore.add(
+                            id: persistence.entryID,
+                            snapshot: snapshot,
+                            for: persistence.identity,
+                            expectedRecords: persistence.expectedRecords,
+                            expectedGeneration:
+                                persistence.expectedStoreGeneration
+                        )
+                        result = .persisted(
+                            self?.mutationResult(from: receipt) ??
+                                DocumentSyncRecoveryMutationResult(
+                                    previousGeneration: 0,
+                                    generation: 0,
+                                    records: .empty
+                                )
+                        )
+                    case .raw(let payload):
+                        let receipt = try await recoveryStore.persistRawData(
+                            payload.data,
+                            for: persistence.identity,
+                            id: persistence.entryID,
+                            expectedRecords: persistence.expectedRecords,
+                            expectedGeneration:
+                                persistence.expectedStoreGeneration,
+                            recoveryArtifact: payload.recoveryArtifact
+                        )
+                        let decodeOutcome = await Self.decodeRawRecovery(
+                            payload,
+                            identity: persistence.identity
+                        )
+                        let mutation = self?.mutationResult(from: receipt.mutation)
+                            ?? DocumentSyncRecoveryMutationResult(
+                                previousGeneration: 0,
+                                generation: 0,
+                                records: .empty
+                            )
+                        result = .rawPersisted(
+                            DocumentSyncRawRecoveryPersistResult(
+                                mutation: mutation,
+                                durablyPersistedRawEntryID: receipt.entry.id,
+                                acknowledgedRecoveryArtifact:
+                                    receipt.acknowledgedRecoveryArtifact,
+                                decodeOutcome: decodeOutcome
                             )
                         )
+                    }
+                case .migrate(let migration):
+                    let receipt = try await recoveryStore.moveEntries(
+                        from: migration.sourceIdentity,
+                        to: migration.destinationIdentity,
+                        expectedRecords: migration.records,
+                        expectedGeneration: migration.expectedStoreGeneration
                     )
-                )
+                    result = .migrated(
+                        self?.mutationResult(from: receipt) ??
+                            DocumentSyncRecoveryMutationResult(
+                                previousGeneration: 0,
+                                generation: 0,
+                                records: .empty
+                            )
+                    )
+                case .discard(let discard):
+                    let receipt = try await recoveryStore.discard(
+                        target: discard.target,
+                        for: discard.identity,
+                        expectedRecords: discard.expectedRecords,
+                        expectedGeneration: discard.expectedStoreGeneration
+                    )
+                    result = .discarded(
+                        self?.mutationResult(from: receipt) ??
+                            DocumentSyncRecoveryMutationResult(
+                                previousGeneration: 0,
+                                generation: 0,
+                                records: .empty
+                            )
+                    )
+                }
             } catch {
-                dispatch(
-                    .operationFailed(token: migration.token, failure: .recovery)
-                )
+                result = .failed(.recovery)
             }
-            return
-        }
-
-        switch request {
-        case .persist(let persistence):
-            executeLegacyConflictPersistence(persistence)
-        case .discard(let discard):
-            executeLegacyDecodedRecoveryDiscard(discard)
-        case .load, .reconcile, .migrate:
-            // P1 owns complete record loading, reconciliation, and
-            // cross-identity FIFO migration. Until then, unknown legacy
-            // evidence remains paused rather than being reconstructed from a
-            // partial store view.
-            dispatch(.operationFailed(token: request.token, failure: .recovery))
+            guard !Task.isCancelled else { return }
+            self?.dispatch(.recoveryFinished(token: request.token, result: result))
+            if case .failed = result {
+                self?.resolvePendingVerifiedExternalRead(
+                    throwing: .recoveryBlocksVerification
+                )
+            } else {
+                self?.resolvePendingVerifiedExternalReadIfBlocked()
+            }
         }
     }
 
-    private func executeLegacyConflictPersistence(
-        _ request: DocumentSyncRecoveryPersistRequest
-    ) {
-        guard request.purpose == .persistConflict,
-              request.expectedRecords.isEmpty,
-              request.displacedPreimageContinuation == nil,
-              case .snapshot(let snapshot) = request.payload else {
-            dispatch(.operationFailed(token: request.token, failure: .recovery))
-            return
-        }
-
-        do {
-            let receipt = try recoveryStore.persistFreshDecodedConflict(
-                id: request.entryID,
-                snapshot: snapshot,
-                for: request.identity,
-                expectedGeneration: request.expectedStoreGeneration
+    private func mutationResult(
+        from receipt: SessionRecoveryStoreMutationReceipt
+    ) -> DocumentSyncRecoveryMutationResult {
+        DocumentSyncRecoveryMutationResult(
+            previousGeneration: receipt.previousGeneration,
+            generation: receipt.generation,
+            records: DocumentSyncRecoveryRecords(
+                decoded: receipt.decodedEntries,
+                raw: receipt.rawEntries.map(DocumentSyncRawRecoveryReference.init)
             )
-            dispatch(
-                .recoveryFinished(
-                    token: request.token,
-                    result: .persisted(
-                        DocumentSyncRecoveryMutationResult(
-                            previousGeneration: receipt.previousGeneration,
-                            generation: receipt.generation,
-                            records: recoveryRecords(from: receipt)
-                        )
-                    )
-                )
-            )
-        } catch {
-            dispatch(.operationFailed(token: request.token, failure: .recovery))
-        }
-    }
-
-    private func executeLegacyDecodedRecoveryDiscard(
-        _ request: DocumentSyncRecoveryDiscardRequest
-    ) {
-        guard case .decoded(let entry) = request.target,
-              entry.documentIdentity == request.identity else {
-            dispatch(.operationFailed(token: request.token, failure: .recovery))
-            return
-        }
-
-        do {
-            let receipt = try recoveryStore.discardExactDecodedConflict(
-                entry,
-                for: request.identity,
-                expectedGeneration: request.expectedStoreGeneration
-            )
-            dispatch(
-                .recoveryFinished(
-                    token: request.token,
-                    result: .discarded(
-                        DocumentSyncRecoveryMutationResult(
-                            previousGeneration: receipt.previousGeneration,
-                            generation: receipt.generation,
-                            records: recoveryRecords(from: receipt)
-                        )
-                    )
-                )
-            )
-        } catch {
-            dispatch(.operationFailed(token: request.token, failure: .recovery))
-        }
+        )
     }
 
     private func recoveryRecords(
-        from receipt: SessionRecoveryStoreMutationReceipt
+        from records: SessionRecoveryStoreRecords
     ) -> DocumentSyncRecoveryRecords {
         DocumentSyncRecoveryRecords(
-            decoded: receipt.decodedEntries,
-            raw: receipt.rawEntries.map {
-                DocumentSyncRawRecoveryReference(entry: $0)
-            }
+            decoded: records.decoded,
+            raw: records.raw.map(DocumentSyncRawRecoveryReference.init)
         )
+    }
+
+    private nonisolated static func decodeRawRecovery(
+        _ payload: DocumentSyncRawRecoveryPayload,
+        identity: DocumentIdentity
+    ) async -> DocumentSyncDisplacedPreimageDecodeOutcome {
+        do {
+            let change = try await DocumentFileAccess.perform {
+                try TextFileCodec.decodeExternalChange(
+                    data: payload.data,
+                    targetURL: payload.targetURL,
+                    identity: identity,
+                    fingerprint: payload.fingerprint
+                )
+            }
+            return .decoded(change)
+        } catch {
+            return .undecodable
+        }
     }
 
     private func resolveFlushWaitersIfPossible() {
@@ -1042,8 +1296,30 @@ final class DocumentSyncCoordinator: ObservableObject {
         }
     }
 
+    private func resolveRecoveryStartupWaitersIfPossible() {
+        guard case .loading = reducerState.recoveryAccess else {
+            let waiters = recoveryStartupWaiters
+            recoveryStartupWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume(returning: reducerState.recoveryAccess)
+            }
+            return
+        }
+    }
+
+    private func resolveRecoveryOperationWaiters(for token: SyncEffectToken) {
+        let waiters = recoveryOperationWaiters.removeValue(forKey: token) ?? []
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
     private var isFullySynchronized: Bool {
         guard case .clean(let revision) = reducerState.local,
+              case .ready = reducerState.recoveryAccess,
+              case .clear = reducerState.recovery,
+              reducerState.recoveryMutationBarrier == nil,
+              reducerState.recoveryCleanup == nil,
               revision == reducerState.source,
               reducerState.durableBaseline?.sourceRevision == revision,
               reducerState.durableBaseline?.snapshot == reducerState.snapshot,
@@ -1057,6 +1333,7 @@ final class DocumentSyncCoordinator: ObservableObject {
 
     private func tearDown() {
         isTornDown = true
+        resolvePendingVerifiedExternalRead(throwing: .verificationInterrupted)
         attachmentTask?.cancel()
         attachmentTask = nil
         attachmentRequestID = nil
@@ -1076,6 +1353,19 @@ final class DocumentSyncCoordinator: ObservableObject {
         }
         sourceObservation = nil
         resolveFlushWaiters(succeeded: false)
+        let recoveryWaiters = recoveryStartupWaiters
+        recoveryStartupWaiters.removeAll()
+        for waiter in recoveryWaiters {
+            waiter.resume(returning: .failed(.recovery))
+        }
+        let pendingRecoveryOperationWaiters = recoveryOperationWaiters.values
+        self.recoveryOperationWaiters.removeAll()
+        for waiters in pendingRecoveryOperationWaiters {
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+        resolveInitialAttachmentWaiters(didAttach: false)
     }
 
     private func replaceSource(_ text: String, origin: DocumentChangeOrigin) {
@@ -1084,57 +1374,167 @@ final class DocumentSyncCoordinator: ObservableObject {
         isApplyingReducerSource = false
     }
 
-    private func makeBaseline(
-        data: Data,
-        targetURL: URL,
-        identity: DocumentIdentity,
-        sourceRevision: SourceRevision
-    ) -> DocumentSyncDurableBaseline? {
-        guard let snapshot = try? TextFileCodec.decode(data) else {
-            return nil
-        }
-        guard let fingerprint = try? SafeFileCommitter.fingerprint(
-            for: targetURL,
-            data: data
-        ) else {
-            return nil
-        }
-        let baselineSourceRevision: SourceRevision
-        if snapshot == DocumentSnapshot(
-            text: sourceRevision.text,
-            format: reducerState.format
-        ) {
-            baselineSourceRevision = sourceRevision
-        } else {
-            // A baseline must never claim a newer local source revision was
-            // persisted simply because it was current when the file read
-            // completed. Keep the same revision number only as an ordering
-            // anchor; the differing text makes the state unambiguously dirty.
-            baselineSourceRevision = SourceRevision(
-                number: sourceRevision.number,
-                text: snapshot.text
+    private nonisolated static func inspectAttachment(
+        at targetURL: URL,
+        knownData: Data?,
+        sourceRevision: SourceRevision,
+        sourceFormat: TextFileFormat,
+        baselineSourceRevision: SourceRevision,
+        commitGeneration: UInt64,
+        expectedSaveAsData: Data? = nil
+    ) -> CoordinatorAttachmentInspection {
+        let target = attachmentTarget(
+            at: targetURL,
+            sourceRevision: sourceRevision
+        )
+        do {
+            let data = try knownData ?? Data(
+                contentsOf: targetURL,
+                options: [.mappedIfSafe]
             )
+            return .verified(
+                try verifiedAttachment(
+                    target: target,
+                    data: data,
+                    sourceFormat: sourceFormat,
+                    baselineSourceRevision: baselineSourceRevision,
+                    commitGeneration: commitGeneration,
+                    expectedSaveAsData: expectedSaveAsData
+                )
+            )
+        } catch {
+            return .unavailable(target)
         }
-        return try? TextFileCodec.durableBaseline(
-            data: data,
+    }
+
+    private nonisolated static func inspectSaveAsAttachment(
+        at targetURL: URL,
+        expectedData: Data,
+        expectedSnapshot: DocumentSnapshot,
+        sourceRevision: SourceRevision,
+        sourceFormat: TextFileFormat,
+        baselineSourceRevision: SourceRevision,
+        commitGeneration: UInt64
+    ) throws -> CoordinatorAttachmentInspection {
+        guard try TextFileCodec.decode(expectedData) == expectedSnapshot else {
+            throw DocumentSyncCoordinatorAttachmentError.invalidSaveAsEvidence
+        }
+        let target = attachmentTarget(
+            at: targetURL,
+            sourceRevision: sourceRevision
+        )
+        do {
+            // Save As owns the immutable bytes passed by NSDocument. Use those
+            // bytes for the initial durable baseline, then separately verify
+            // the current target bytes before this async API returns.
+            let expected = try verifiedAttachment(
+                target: target,
+                data: expectedData,
+                sourceFormat: sourceFormat,
+                baselineSourceRevision: baselineSourceRevision,
+                commitGeneration: commitGeneration,
+                expectedSaveAsData: nil
+            )
+            let currentData = try Data(
+                contentsOf: targetURL,
+                options: [.mappedIfSafe]
+            )
+            let currentFingerprint = try SafeFileCommitter.fingerprint(
+                for: targetURL,
+                data: currentData
+            )
+            let dataMatchesExpectedSaveAs = currentData == expectedData
+            let verifiedExternalChange = dataMatchesExpectedSaveAs
+                ? nil
+                : try? TextFileCodec.decodeExternalChange(
+                    data: currentData,
+                    targetURL: targetURL,
+                    identity: target.identity,
+                    fingerprint: currentFingerprint
+                )
+            return .verified(
+                VerifiedCoordinatorAttachment(
+                    targetURL: target.targetURL,
+                    identity: target.identity,
+                    sourceRevision: target.sourceRevision,
+                    durableBaseline: expected.durableBaseline,
+                    dataMatchesExpectedSaveAs: dataMatchesExpectedSaveAs,
+                    verifiedExternalChange: verifiedExternalChange
+                )
+            )
+        } catch {
+            return .unavailable(target)
+        }
+    }
+
+    private nonisolated static func attachmentTarget(
+        at targetURL: URL,
+        sourceRevision: SourceRevision
+    ) -> UnverifiedCoordinatorAttachment {
+        UnverifiedCoordinatorAttachment(
             targetURL: targetURL,
-            fingerprint: fingerprint,
-            documentIdentity: identity,
-            sourceRevision: baselineSourceRevision,
-            commitGeneration: reducerState.durableBaseline?.commitGeneration ?? 0
+            identity: DocumentIdentity.make(url: targetURL),
+            sourceRevision: sourceRevision
         )
     }
 
-    private nonisolated static func readAttachment(
-        at targetURL: URL,
-        sourceRevision: SourceRevision
+    private nonisolated static func verifiedAttachment(
+        target: UnverifiedCoordinatorAttachment,
+        data: Data,
+        sourceFormat: TextFileFormat,
+        baselineSourceRevision: SourceRevision,
+        commitGeneration: UInt64,
+        expectedSaveAsData: Data?
     ) throws -> VerifiedCoordinatorAttachment {
-        let data = try Data(contentsOf: targetURL, options: [.mappedIfSafe])
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: target.targetURL,
+            data: data
+        )
+        let snapshot = try? TextFileCodec.decode(data)
+        let stampedSourceRevision: SourceRevision?
+        if let snapshot {
+            stampedSourceRevision = snapshot == DocumentSnapshot(
+                text: baselineSourceRevision.text,
+                format: sourceFormat
+            )
+                ? baselineSourceRevision
+                : SourceRevision(
+                    number: baselineSourceRevision.number,
+                    text: snapshot.text
+                )
+        } else {
+            stampedSourceRevision = nil
+        }
+        let durableBaseline = stampedSourceRevision.flatMap { revision in
+            try? TextFileCodec.durableBaseline(
+                data: data,
+                targetURL: target.targetURL,
+                fingerprint: fingerprint,
+                documentIdentity: target.identity,
+                sourceRevision: revision,
+                commitGeneration: commitGeneration
+            )
+        }
+        let dataMatchesExpectedSaveAs = expectedSaveAsData.map { $0 == data }
+            ?? true
+        let verifiedExternalChange: DocumentSyncExternalChange?
+        if !dataMatchesExpectedSaveAs {
+            verifiedExternalChange = try? TextFileCodec.decodeExternalChange(
+                data: data,
+                targetURL: target.targetURL,
+                identity: target.identity,
+                fingerprint: fingerprint
+            )
+        } else {
+            verifiedExternalChange = nil
+        }
         return VerifiedCoordinatorAttachment(
-            targetURL: targetURL,
-            identity: DocumentIdentity.make(url: targetURL),
-            data: data,
-            sourceRevision: sourceRevision
+            targetURL: target.targetURL,
+            identity: target.identity,
+            sourceRevision: target.sourceRevision,
+            durableBaseline: durableBaseline,
+            dataMatchesExpectedSaveAs: dataMatchesExpectedSaveAs,
+            verifiedExternalChange: verifiedExternalChange
         )
     }
 

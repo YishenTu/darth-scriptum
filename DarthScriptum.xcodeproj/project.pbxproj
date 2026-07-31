@@ -21,12 +21,13 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		C00000000000000000000004 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (info.plist,); target = B00000000000000000000001 /* DarthScriptum */; };
+		C00000000000000000000004 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (app/AGENTS.md, app/CLAUDE.md, core/AGENTS.md, core/CLAUDE.md, document/AGENTS.md, document/CLAUDE.md, editor/AGENTS.md, editor/CLAUDE.md, info.plist, resources/AGENTS.md, resources/CLAUDE.md, workspace/AGENTS.md, workspace/CLAUDE.md,); target = B00000000000000000000001 /* DarthScriptum */; };
+		C00000000000000000000005 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (AGENTS.md, CLAUDE.md,); target = B00000000000000000000002 /* DarthScriptumTests */; };
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		C00000000000000000000001 /* src */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (C00000000000000000000004,); path = src; sourceTree = "<group>"; };
-		C00000000000000000000002 /* tests */ = {isa = PBXFileSystemSynchronizedRootGroup; path = tests; sourceTree = "<group>"; };
+		C00000000000000000000002 /* tests */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (C00000000000000000000005,); path = tests; sourceTree = "<group>"; };
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */

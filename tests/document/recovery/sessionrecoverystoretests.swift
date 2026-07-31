@@ -4,7 +4,7 @@ import XCTest
 
 @MainActor
 final class SessionRecoveryStoreTests: XCTestCase {
-    func testSnapshotRecoverySurvivesStoreRecreation() throws {
+    func testSnapshotRecoverySurvivesStoreRecreation() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let identity = DocumentIdentity(stableKey: "path:/tmp/persistent.md")
@@ -20,24 +20,24 @@ final class SessionRecoveryStoreTests: XCTestCase {
         let firstStore = SessionRecoveryStore(
             persistenceDirectory: directory
         )
-        try firstStore.add(snapshot: snapshot, for: identity)
+        _ = try await firstStore.add(snapshot: snapshot, for: identity)
 
         let reopenedStore = SessionRecoveryStore(
             persistenceDirectory: directory
         )
-        let recovered = try XCTUnwrap(reopenedStore.latest(for: identity))
+        let recoveredValue = try await reopenedStore.latest(for: identity)
+        let recovered = try XCTUnwrap(recoveredValue)
         XCTAssertEqual(recovered.snapshot, snapshot)
 
-        reopenedStore.remove(recovered)
-        XCTAssertNil(
-            SessionRecoveryStore(
-                persistenceDirectory: directory
-            ).latest(for: identity)
-        )
+        try await reopenedStore.remove(recovered)
+        let afterRemoval = try await SessionRecoveryStore(
+            persistenceDirectory: directory
+        ).latest(for: identity)
+        XCTAssertNil(afterRemoval)
     }
 
     func testFreshConflictReceiptUsesStoreGenerationAndDurablyRemovesExactEntry()
-        throws {
+        async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let identity = DocumentIdentity(stableKey: "path:/tmp/exact-id.md")
@@ -48,8 +48,8 @@ final class SessionRecoveryStoreTests: XCTestCase {
         let entryID = UUID()
         let store = SessionRecoveryStore(persistenceDirectory: directory)
 
-        XCTAssertThrowsError(
-            try store.persistFreshDecodedConflict(
+        await XCTAssertThrowsErrorAsync(
+            try await store.persistFreshDecodedConflict(
                 id: entryID,
                 snapshot: snapshot,
                 for: identity,
@@ -57,7 +57,7 @@ final class SessionRecoveryStoreTests: XCTestCase {
             )
         )
 
-        let persisted = try store.persistFreshDecodedConflict(
+        let persisted = try await store.persistFreshDecodedConflict(
             id: entryID,
             snapshot: snapshot,
             for: identity,
@@ -70,9 +70,10 @@ final class SessionRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(entry.id, entryID)
         XCTAssertEqual(persisted.decodedEntries, [entry])
         XCTAssertTrue(persisted.rawEntries.isEmpty)
-        XCTAssertEqual(store.latest(for: identity), entry)
+        let latest = try await store.latest(for: identity)
+        XCTAssertEqual(latest, entry)
 
-        let discarded = try store.discardExactDecodedConflict(
+        let discarded = try await store.discardExactDecodedConflict(
             entry,
             for: identity,
             expectedGeneration: persisted.generation
@@ -82,12 +83,16 @@ final class SessionRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(discarded.generation, 2)
         XCTAssertTrue(discarded.decodedEntries.isEmpty)
         XCTAssertTrue(discarded.rawEntries.isEmpty)
-        XCTAssertNil(store.latest(for: identity))
-        XCTAssertNil(SessionRecoveryStore(persistenceDirectory: directory).latest(for: identity))
+        let removed = try await store.latest(for: identity)
+        XCTAssertNil(removed)
+        let reopened = try await SessionRecoveryStore(
+            persistenceDirectory: directory
+        ).latest(for: identity)
+        XCTAssertNil(reopened)
     }
 
     func testEmptyMigrationAdvancesTheDestinationGenerationForFreshConflict()
-        throws {
+        async throws {
         let source = DocumentIdentity(stableKey: "path:/tmp/empty-source.md")
         let destination = DocumentIdentity(
             stableKey: "path:/tmp/empty-destination.md"
@@ -98,7 +103,7 @@ final class SessionRecoveryStoreTests: XCTestCase {
         )
         let store = SessionRecoveryStore()
 
-        let migration = try store.advanceEmptyRecoveryMigration(
+        let migration = try await store.advanceEmptyRecoveryMigration(
             from: source,
             to: destination,
             expectedGeneration: 0
@@ -109,7 +114,7 @@ final class SessionRecoveryStoreTests: XCTestCase {
         XCTAssertTrue(migration.decodedEntries.isEmpty)
         XCTAssertTrue(migration.rawEntries.isEmpty)
 
-        let persisted = try store.persistFreshDecodedConflict(
+        let persisted = try await store.persistFreshDecodedConflict(
             id: UUID(),
             snapshot: snapshot,
             for: destination,
@@ -121,19 +126,101 @@ final class SessionRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(persisted.decodedEntries.first?.snapshot, snapshot)
     }
 
+    func testMigrationNeverRegressesAnEmptyDestinationGeneration() async throws {
+        let source = DocumentIdentity(stableKey: "path:/tmp/fresh-source.md")
+        let destination = DocumentIdentity(
+            stableKey: "path:/tmp/advanced-destination.md"
+        )
+        let snapshot = DocumentSnapshot(
+            text: "generation evidence\n",
+            format: .newDocument
+        )
+        let store = SessionRecoveryStore()
+        var destinationGeneration: UInt64 = 0
+
+        for _ in 0 ..< 4 {
+            let persisted = try await store.persistFreshDecodedConflict(
+                id: UUID(),
+                snapshot: snapshot,
+                for: destination,
+                expectedGeneration: destinationGeneration
+            )
+            let entry = try XCTUnwrap(persisted.decodedEntries.first)
+            let discarded = try await store.discardExactDecodedConflict(
+                entry,
+                for: destination,
+                expectedGeneration: persisted.generation
+            )
+            destinationGeneration = discarded.generation
+        }
+
+        XCTAssertEqual(destinationGeneration, 8)
+        let migration = try await store.advanceEmptyRecoveryMigration(
+            from: source,
+            to: destination,
+            expectedGeneration: 0
+        )
+
+        XCTAssertEqual(migration.previousGeneration, 0)
+        XCTAssertEqual(migration.generation, 9)
+        await XCTAssertThrowsErrorAsync(
+            try await store.persistFreshDecodedConflict(
+                id: UUID(),
+                snapshot: snapshot,
+                for: destination,
+                expectedGeneration: destinationGeneration
+            )
+        )
+    }
+
+    func testMigrationAdvancesTheSourceTombstoneToRejectStaleSourceMutation()
+        async throws {
+        let source = DocumentIdentity(stableKey: "path:/tmp/stale-source.md")
+        let destination = DocumentIdentity(
+            stableKey: "path:/tmp/stale-destination.md"
+        )
+        let snapshot = DocumentSnapshot(
+            text: "stale source mutation\n",
+            format: .newDocument
+        )
+        let store = SessionRecoveryStore()
+
+        _ = try await store.advanceEmptyRecoveryMigration(
+            from: source,
+            to: destination,
+            expectedGeneration: 0
+        )
+
+        let sourceGeneration = try await store.typedMutationGeneration(for: source)
+        XCTAssertEqual(sourceGeneration, 1)
+        await XCTAssertThrowsErrorAsync(
+            try await store.persistFreshDecodedConflict(
+                id: UUID(),
+                snapshot: snapshot,
+                for: source,
+                expectedGeneration: 0
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SessionRecoveryStoreError,
+                .unexpectedMutationGeneration
+            )
+        }
+    }
+
     func testTypedConflictGenerationsAreIndependentPerDocumentIdentity()
-        throws {
+        async throws {
         let firstIdentity = DocumentIdentity(stableKey: "path:/tmp/first.md")
         let secondIdentity = DocumentIdentity(stableKey: "path:/tmp/second.md")
         let store = SessionRecoveryStore()
 
-        let first = try store.persistFreshDecodedConflict(
+        let first = try await store.persistFreshDecodedConflict(
             id: UUID(),
             snapshot: DocumentSnapshot(text: "first\n", format: .newDocument),
             for: firstIdentity,
             expectedGeneration: 0
         )
-        let second = try store.persistFreshDecodedConflict(
+        let second = try await store.persistFreshDecodedConflict(
             id: UUID(),
             snapshot: DocumentSnapshot(text: "second\n", format: .newDocument),
             for: secondIdentity,
@@ -146,7 +233,7 @@ final class SessionRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(second.generation, 1)
     }
 
-    func testRawRecoverySurvivesStoreRecreationWithoutDecoding() throws {
+    func testRawRecoverySurvivesStoreRecreationWithoutDecoding() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let identity = DocumentIdentity(stableKey: "path:/tmp/invalid.md")
@@ -155,7 +242,7 @@ final class SessionRecoveryStoreTests: XCTestCase {
             persistenceDirectory: directory
         )
 
-        let entry = try firstStore.addRawData(
+        let entry = try await firstStore.addRawData(
             invalidBytes,
             for: identity
         )
@@ -164,13 +251,95 @@ final class SessionRecoveryStoreTests: XCTestCase {
         let reopened = SessionRecoveryStore(
             persistenceDirectory: directory
         )
-        XCTAssertEqual(
-            reopened.rawRecoveryEntries(for: identity).first?.data,
-            invalidBytes
+        let reopenedRawEntries = try await reopened.rawRecoveryEntries(
+            for: identity
+        )
+        let reopenedEntry = try XCTUnwrap(reopenedRawEntries.first)
+        let reopenedData = try await reopenedEntry.loadData()
+        XCTAssertEqual(reopenedData, invalidBytes)
+    }
+
+    func testRawAcknowledgementMetadataFailureLeavesJournalReplayable()
+        async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let documentURL = directory.appendingPathComponent("managed.md")
+        let original = Data("base\n".utf8)
+        let local = Data("local\n".utf8)
+        let displaced = Data([0xFF, 0x00, 0xC0])
+        try original.write(to: documentURL)
+        let interruptedStore = SessionRecoveryStore(
+            persistenceDirectory: directory,
+            rawPersistenceHook: { phase in
+                guard phase == .beforeAcknowledgementMetadata else { return }
+                throw InjectedRawPersistenceError.interrupted
+            }
+        )
+        _ = try await interruptedStore.start()
+        let token = PendingSaveToken(
+            generation: 2,
+            sourceRevision: SourceRevision(number: 2, text: "local\n"),
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: TextFileCodec.decode(local)
+            ),
+            expectedDurableState: DurableFileState(
+                snapshot: try TextFileCodec.decode(original),
+                fingerprint: try SafeFileCommitter.fingerprint(
+                    for: documentURL,
+                    data: original
+                ),
+                generation: 1
+            ),
+            targetURL: documentURL
+        )
+        let result = try SafeFileCommitter(
+            recoveryDirectory: directory,
+            beforeAtomicSwap: {
+                try displaced.write(to: documentURL)
+            }
+        ).commit(token)
+        let artifact = try XCTUnwrap(result.recoveryArtifact)
+        let rawData = try XCTUnwrap(result.displacedPreimage?.data)
+        let identity = DocumentIdentity.make(url: documentURL)
+
+        await XCTAssertThrowsErrorAsync(
+            try await interruptedStore.persistRawData(
+                rawData,
+                for: identity,
+                id: artifact.id,
+                expectedRecords: nil,
+                expectedGeneration: nil,
+                recoveryArtifact: artifact
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SessionRecoveryStoreError,
+                .unavailable
+            )
+        }
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: artifact.journalURL.path)
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(
+                    "\(artifact.id.uuidString.lowercased()).raw"
+                ).path
+            )
+        )
+
+        let reopened = SessionRecoveryStore(persistenceDirectory: directory)
+        let rawEntries = try await reopened.rawRecoveryEntries(for: identity)
+        let entry = try XCTUnwrap(rawEntries.first)
+        let reopenedData = try await entry.loadData()
+        XCTAssertEqual(reopenedData, displaced)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: artifact.journalURL.path)
         )
     }
 
-    func testReopenedRawRecoveryRemainsURLBackedUntilRead() throws {
+    func testReopenedRawRecoveryRemainsURLBackedUntilRead() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let identity = DocumentIdentity(
@@ -180,22 +349,22 @@ final class SessionRecoveryStoreTests: XCTestCase {
         let store = SessionRecoveryStore(
             persistenceDirectory: directory
         )
-        try store.addRawData(rawData, for: identity)
+        _ = try await store.addRawData(rawData, for: identity)
 
         let reopened = SessionRecoveryStore(
             persistenceDirectory: directory
         )
-        let entry = try XCTUnwrap(
-            reopened.rawRecoveryEntries(for: identity).first
-        )
+        let rawEntries = try await reopened.rawRecoveryEntries(for: identity)
+        let entry = try XCTUnwrap(rawEntries.first)
 
         XCTAssertFalse(entry.isDataResident)
         XCTAssertEqual(entry.byteCount, rawData.count)
-        XCTAssertEqual(entry.data, rawData)
+        let loadedRawData = try await entry.loadData()
+        XCTAssertEqual(loadedRawData, rawData)
         XCTAssertFalse(entry.isDataResident)
     }
 
-    func testNewestRecoveryIsPinnedOutsideTheHistoricalByteLimit() throws {
+    func testNewestRecoveryIsPinnedOutsideTheHistoricalByteLimit() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let identity = DocumentIdentity(stableKey: "path:/tmp/large.md")
@@ -208,294 +377,15 @@ final class SessionRecoveryStoreTests: XCTestCase {
             format: .newDocument
         )
 
-        try store.add(snapshot: snapshot, for: identity)
+        _ = try await store.add(snapshot: snapshot, for: identity)
 
-        XCTAssertEqual(store.latest(for: identity)?.snapshot, snapshot)
-        XCTAssertEqual(
-            SessionRecoveryStore(
-                persistenceDirectory: directory,
-                totalByteLimit: 8
-            ).latest(for: identity)?.snapshot,
-            snapshot
-        )
-    }
-
-    func testFailedMoveKeepsEntriesUnderTheOriginalIdentity() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let oldIdentity = DocumentIdentity(
-            stableKey: "path:/tmp/move-source.md"
-        )
-        let newIdentity = DocumentIdentity(
-            stableKey: "path:/tmp/move-destination.md"
-        )
-        let snapshot = DocumentSnapshot(
-            text: "recover me\n",
-            format: .newDocument
-        )
-        let rawData = Data([0xFF, 0x00])
-        let store = SessionRecoveryStore(
-            persistenceDirectory: directory
-        )
-        try store.add(snapshot: snapshot, for: oldIdentity)
-        try store.addRawData(rawData, for: oldIdentity)
-        try FileManager.default.removeItem(at: directory)
-        try Data("not a directory".utf8).write(to: directory)
-
-        XCTAssertThrowsError(
-            try store.moveEntries(
-                from: oldIdentity,
-                to: newIdentity
-            )
-        )
-        XCTAssertEqual(store.latest(for: oldIdentity)?.snapshot, snapshot)
-        XCTAssertEqual(
-            store.rawRecoveryEntries(for: oldIdentity).first?.data,
-            rawData
-        )
-        XCTAssertNil(store.latest(for: newIdentity))
-        XCTAssertTrue(store.rawRecoveryEntries(for: newIdentity).isEmpty)
-    }
-
-    func testInterruptedMoveRecoversOneIdentityAfterReopening() throws {
-        let directory = try makeTemporaryDirectory()
-        defer {
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: directory.path
-            )
-            try? FileManager.default.removeItem(at: directory)
-        }
-        let oldIdentity = DocumentIdentity(
-            stableKey: "path:/tmp/interrupted-source.md"
-        )
-        let newIdentity = DocumentIdentity(
-            stableKey: "path:/tmp/interrupted-destination.md"
-        )
-        let snapshot = DocumentSnapshot(
-            text: "recover after interruption\n",
-            format: .newDocument
-        )
-        let rawData = Data([0xFF, 0x01])
-        let store = SessionRecoveryStore(
+        let latest = try await store.latest(for: identity)
+        XCTAssertEqual(latest?.snapshot, snapshot)
+        let reopenedLatest = try await SessionRecoveryStore(
             persistenceDirectory: directory,
-            migrationWriteHook: { completedWriteCount in
-                guard completedWriteCount == 1 else { return }
-                try FileManager.default.setAttributes(
-                    [.posixPermissions: 0o500],
-                    ofItemAtPath: directory.path
-                )
-                throw InjectedMigrationError.interrupted
-            }
-        )
-        try store.add(snapshot: snapshot, for: oldIdentity)
-        try store.addRawData(rawData, for: oldIdentity)
-
-        XCTAssertThrowsError(
-            try store.moveEntries(
-                from: oldIdentity,
-                to: newIdentity
-            )
-        )
-
-        let readOnlyReopen = SessionRecoveryStore(
-            persistenceDirectory: directory
-        )
-        XCTAssertEqual(
-            readOnlyReopen.latest(for: oldIdentity)?.snapshot,
-            snapshot
-        )
-        XCTAssertEqual(
-            readOnlyReopen.rawRecoveryEntries(for: oldIdentity).first?.data,
-            rawData
-        )
-        XCTAssertNil(readOnlyReopen.latest(for: newIdentity))
-        XCTAssertTrue(
-            readOnlyReopen.rawRecoveryEntries(for: newIdentity).isEmpty
-        )
-
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: directory.path
-        )
-        let repairedReopen = SessionRecoveryStore(
-            persistenceDirectory: directory
-        )
-        XCTAssertEqual(
-            repairedReopen.latest(for: oldIdentity)?.snapshot,
-            snapshot
-        )
-        XCTAssertNil(repairedReopen.latest(for: newIdentity))
-        XCTAssertFalse(
-            FileManager.default.fileExists(
-                atPath: directory
-                    .appendingPathComponent("migration.json")
-                    .path
-            )
-        )
-    }
-
-    func testSuccessfulMoveIsCommittedForTheNextStoreInstance() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let oldIdentity = DocumentIdentity(
-            stableKey: "path:/tmp/committed-source.md"
-        )
-        let newIdentity = DocumentIdentity(
-            stableKey: "path:/tmp/committed-destination.md"
-        )
-        let snapshot = DocumentSnapshot(
-            text: "committed recovery\n",
-            format: .newDocument
-        )
-        let rawData = Data([0xFF, 0x02])
-        let store = SessionRecoveryStore(
-            persistenceDirectory: directory
-        )
-        try store.add(snapshot: snapshot, for: oldIdentity)
-        try store.addRawData(rawData, for: oldIdentity)
-
-        try store.moveEntries(
-            from: oldIdentity,
-            to: newIdentity
-        )
-
-        let reopened = SessionRecoveryStore(
-            persistenceDirectory: directory
-        )
-        XCTAssertNil(reopened.latest(for: oldIdentity))
-        XCTAssertTrue(
-            reopened.rawRecoveryEntries(for: oldIdentity).isEmpty
-        )
-        XCTAssertEqual(
-            reopened.latest(for: newIdentity)?.snapshot,
-            snapshot
-        )
-        XCTAssertEqual(
-            reopened.rawRecoveryEntries(for: newIdentity).first?.data,
-            rawData
-        )
-    }
-
-    func testAnotherMoveRepairsAnInterruptedJournalBeforeStarting() throws {
-        let directory = try makeTemporaryDirectory()
-        defer {
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o700],
-                ofItemAtPath: directory.path
-            )
-            try? FileManager.default.removeItem(at: directory)
-        }
-        let firstSource = DocumentIdentity(
-            stableKey: "path:/tmp/first-source.md"
-        )
-        let firstDestination = DocumentIdentity(
-            stableKey: "path:/tmp/first-destination.md"
-        )
-        let secondSource = DocumentIdentity(
-            stableKey: "path:/tmp/second-source.md"
-        )
-        let secondDestination = DocumentIdentity(
-            stableKey: "path:/tmp/second-destination.md"
-        )
-        let firstSnapshot = DocumentSnapshot(
-            text: "first\n",
-            format: .newDocument
-        )
-        let secondSnapshot = DocumentSnapshot(
-            text: "second\n",
-            format: .newDocument
-        )
-        var shouldInterrupt = true
-        let store = SessionRecoveryStore(
-            persistenceDirectory: directory,
-            migrationWriteHook: { _ in
-                guard shouldInterrupt else { return }
-                shouldInterrupt = false
-                try FileManager.default.setAttributes(
-                    [.posixPermissions: 0o500],
-                    ofItemAtPath: directory.path
-                )
-                throw InjectedMigrationError.interrupted
-            }
-        )
-        try store.add(snapshot: firstSnapshot, for: firstSource)
-        try store.add(snapshot: secondSnapshot, for: secondSource)
-
-        XCTAssertThrowsError(
-            try store.moveEntries(
-                from: firstSource,
-                to: firstDestination
-            )
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: directory.path
-        )
-
-        try store.moveEntries(
-            from: secondSource,
-            to: secondDestination
-        )
-
-        let reopened = SessionRecoveryStore(
-            persistenceDirectory: directory
-        )
-        XCTAssertEqual(
-            reopened.latest(for: firstSource)?.snapshot,
-            firstSnapshot
-        )
-        XCTAssertNil(reopened.latest(for: firstDestination))
-        XCTAssertNil(reopened.latest(for: secondSource))
-        XCTAssertEqual(
-            reopened.latest(for: secondDestination)?.snapshot,
-            secondSnapshot
-        )
-    }
-
-    func testMalformedMigrationJournalBlocksAnotherMove() throws {
-        let directory = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let oldIdentity = DocumentIdentity(
-            stableKey: "path:/tmp/malformed-source.md"
-        )
-        let newIdentity = DocumentIdentity(
-            stableKey: "path:/tmp/malformed-destination.md"
-        )
-        let snapshot = DocumentSnapshot(
-            text: "do not strand me\n",
-            format: .newDocument
-        )
-        let store = SessionRecoveryStore(
-            persistenceDirectory: directory
-        )
-        try store.add(snapshot: snapshot, for: oldIdentity)
-        try Data("{not valid json".utf8).write(
-            to: directory.appendingPathComponent("migration.json")
-        )
-
-        XCTAssertThrowsError(
-            try store.moveEntries(
-                from: oldIdentity,
-                to: newIdentity
-            )
-        ) { error in
-            XCTAssertEqual(
-                error as? SessionRecoveryStoreError,
-                .unreadableMigrationJournal
-            )
-        }
-        XCTAssertEqual(store.latest(for: oldIdentity)?.snapshot, snapshot)
-        XCTAssertNil(store.latest(for: newIdentity))
-        XCTAssertEqual(
-            try String(
-                contentsOf: directory.appendingPathComponent(
-                    "migration.json"
-                ),
-                encoding: .utf8
-            ),
-            "{not valid json"
-        )
+            totalByteLimit: 8
+        ).latest(for: identity)
+        XCTAssertEqual(reopenedLatest?.snapshot, snapshot)
     }
 
     private func makeTemporaryDirectory() throws -> URL {
@@ -508,7 +398,19 @@ final class SessionRecoveryStoreTests: XCTestCase {
         return directory
     }
 }
-
-private enum InjectedMigrationError: Error {
+private enum InjectedRawPersistenceError: Error, Equatable {
     case interrupted
+}
+
+@MainActor
+private func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T,
+    _ handler: @MainActor (Error) -> Void = { _ in }
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("Expected an error, but the operation succeeded.")
+    } catch {
+        handler(error)
+    }
 }

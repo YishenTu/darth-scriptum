@@ -95,6 +95,77 @@ final class DocumentCloseCharacterizationTests: XCTestCase {
         XCTAssertTrue(controller.documents.contains { $0 === document })
     }
 
+    func testCloseAllDocumentsClosesCleanDocumentAndReportsOneManagedRefusal()
+        async throws {
+        let cleanFixture = try CloseCharacterizationMarkdownFile(
+            contents: "clean\n"
+        )
+        let refusalFixture = try CloseCharacterizationMarkdownFile(
+            contents: "base\n"
+        )
+        defer {
+            cleanFixture.remove()
+            refusalFixture.remove()
+        }
+
+        let cleanDocument = MarkdownDocument()
+        cleanDocument.fileURL = cleanFixture.url
+        try cleanDocument.read(
+            from: Data("clean\n".utf8),
+            ofType: "net.daringfireball.markdown"
+        )
+        let cleanDidAttach = await cleanDocument.syncCoordinator
+            .waitForInitialAttachment()
+        XCTAssertTrue(cleanDidAttach)
+        _ = await cleanDocument.syncCoordinator.waitForRecoveryStartup()
+
+        let refusalDocument = MarkdownDocument()
+        refusalDocument.fileURL = refusalFixture.url
+        try refusalDocument.read(
+            from: Data("base\n".utf8),
+            ofType: "net.daringfireball.markdown"
+        )
+        let refusalDidAttach = await refusalDocument.syncCoordinator
+            .waitForInitialAttachment()
+        XCTAssertTrue(refusalDidAttach)
+        _ = await refusalDocument.syncCoordinator.waitForRecoveryStartup()
+        refusalDocument.syncCoordinator.sourceBuffer.replace(
+            with: "edited\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        try FileManager.default.removeItem(at: refusalFixture.url)
+
+        let controller = NSDocumentController.shared
+        controller.addDocument(refusalDocument)
+        controller.addDocument(cleanDocument)
+        defer {
+            if controller.documents.contains(where: { $0 === cleanDocument }) {
+                controller.removeDocument(cleanDocument)
+            }
+            if controller.documents.contains(where: { $0 === refusalDocument }) {
+                controller.removeDocument(refusalDocument)
+            }
+            cleanDocument.syncCoordinator.close()
+            refusalDocument.syncCoordinator.close()
+        }
+        let recorder = CloseAllDecisionRecorder()
+        controller.closeAllDocuments(
+            withDelegate: recorder,
+            didCloseAllSelector: #selector(
+                CloseAllDecisionRecorder.documentController(
+                    _:didCloseAll:contextInfo:
+                )
+            ),
+            contextInfo: nil
+        )
+
+        let didCloseAll = await recorder.waitForDecision()
+        XCTAssertFalse(didCloseAll)
+        XCTAssertEqual(recorder.decisions, [false])
+        XCTAssertFalse(controller.documents.contains { $0 === cleanDocument })
+        XCTAssertTrue(controller.documents.contains { $0 === refusalDocument })
+    }
+
     func testQuitRoutesThroughNativeTerminationWithoutAnAppLevelForceClose() {
         let originalMenu = NSApp.mainMenu
         defer { NSApp.mainMenu = originalMenu }
@@ -148,6 +219,7 @@ private final class CloseDecisionRecorder: NSObject {
 @MainActor
 private final class CloseAllDecisionRecorder: NSObject {
     private(set) var decisions: [Bool] = []
+    private var waiters: [CheckedContinuation<Bool, Never>] = []
 
     @objc func documentController(
         _ documentController: NSDocumentController,
@@ -155,6 +227,22 @@ private final class CloseAllDecisionRecorder: NSObject {
         contextInfo: UnsafeMutableRawPointer?
     ) {
         decisions.append(didCloseAll)
+        let pendingWaiters = waiters
+        waiters.removeAll()
+        for waiter in pendingWaiters {
+            waiter.resume(returning: didCloseAll)
+        }
+    }
+
+    func waitForDecision() async -> Bool {
+        if let decision = decisions.first { return decision }
+        return await withCheckedContinuation { continuation in
+            if let decision = decisions.first {
+                continuation.resume(returning: decision)
+            } else {
+                waiters.append(continuation)
+            }
+        }
     }
 }
 

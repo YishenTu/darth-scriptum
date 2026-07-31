@@ -161,9 +161,10 @@ struct SafeFileCommitter: Sendable {
                 contentsOf: candidateURL,
                 options: [.mappedIfSafe]
             )
-            let displacedFingerprint = FileFingerprint.make(
+            let verifiedDisplacedPreimage = VerifiedFilePayload(
                 data: displacedPreimage
             )
+            let displacedFingerprint = verifiedDisplacedPreimage.fingerprint
             let hasUnexpectedPreimage =
                 displacedFingerprint.contentDigest
                     != expectedPreimageFingerprint.contentDigest
@@ -179,7 +180,7 @@ struct SafeFileCommitter: Sendable {
                     for: targetURL,
                     data: token.encodedData
                 ),
-                displacedPreimage: displacedPreimage,
+                verifiedDisplacedPreimage: verifiedDisplacedPreimage,
                 safety: .atomicSwap,
                 recoveryArtifact: retainedRecoveryArtifact
             )

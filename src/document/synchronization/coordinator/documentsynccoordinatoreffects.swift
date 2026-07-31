@@ -60,9 +60,14 @@ final class DocumentSyncDefaultEffectExecutor:
         completion: @escaping @MainActor (DocumentSyncExternalReadExecution) -> Void
     ) {
         Task {
-            let result = await Task.detached(priority: .utility) {
-                Self.readExternal(request)
-            }.value
+            let result: DocumentSyncExternalReadExecution
+            do {
+                result = try await DocumentFileAccess.perform {
+                    Self.readExternal(request)
+                }
+            } catch {
+                result = .failed(.externalRead)
+            }
             completion(result)
         }
     }
@@ -86,9 +91,14 @@ final class DocumentSyncDefaultEffectExecutor:
         completion: @escaping @MainActor (DocumentSyncCommitReconciliationResult) -> Void
     ) {
         Task {
-            let result = await Task.detached(priority: .utility) {
-                Self.reconcileCommit(request)
-            }.value
+            let result: DocumentSyncCommitReconciliationResult
+            do {
+                result = try await DocumentFileAccess.perform {
+                    Self.reconcileCommit(request)
+                }
+            } catch {
+                result = .unresolved
+            }
             completion(result)
         }
     }

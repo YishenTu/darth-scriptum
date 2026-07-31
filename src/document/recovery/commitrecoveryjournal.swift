@@ -12,6 +12,8 @@ enum CommitRecoveryJournalStore {
     enum JournalError: Error, Equatable {
         case invalidArtifactPath
         case unownedReplacementDirectory
+        case malformedJournal
+        case unsupportedSchema
     }
 
     static let defaultRecoveryDirectory: URL = {
@@ -95,28 +97,42 @@ enum CommitRecoveryJournalStore {
         )
     }
 
+    /// Reads pending durable commit evidence without modifying it. A malformed
+    /// or newer journal is recovery evidence, not disposable cache data; the
+    /// async recovery actor reports it and leaves its bytes untouched for
+    /// Retry or a newer application version.
     static func pendingRecoveries(
         in recoveryDirectory: URL
-    ) -> [PendingCommitRecovery] {
+    ) throws -> [PendingCommitRecovery] {
         let journalDirectory = recoveryDirectory.appendingPathComponent(
             "commit-journals",
             isDirectory: true
         )
-        guard let journalURLs = try? FileManager.default.contentsOfDirectory(
-            at: journalDirectory,
-            includingPropertiesForKeys: nil
-        ) else {
+        guard FileManager.default.fileExists(atPath: journalDirectory.path) else {
             return []
         }
-        return journalURLs.compactMap { journalURL in
-            guard journalURL.lastPathComponent.hasSuffix(".commit.json"),
-                  let encoded = try? Data(contentsOf: journalURL),
-                  let journal = try? JSONDecoder().decode(
+        let journalURLs = try FileManager.default.contentsOfDirectory(
+            at: journalDirectory,
+            includingPropertiesForKeys: nil
+        )
+        var pending: [PendingCommitRecovery] = []
+        for journalURL in journalURLs {
+            guard journalURL.lastPathComponent.hasSuffix(".commit.json") else {
+                continue
+            }
+            let encoded = try Data(contentsOf: journalURL, options: [.mappedIfSafe])
+            let journal: PersistedCommitRecoveryJournal
+            do {
+                journal = try JSONDecoder().decode(
                     PersistedCommitRecoveryJournal.self,
                     from: encoded
-                  ) else {
-                quarantine(journalURL, in: journalDirectory)
-                return nil
+                )
+            } catch {
+                throw JournalError.malformedJournal
+            }
+            if let schemaVersion = journal.schemaVersion,
+               schemaVersion > PersistedCommitRecoveryJournal.currentSchemaVersion {
+                throw JournalError.unsupportedSchema
             }
             let candidateURL = URL(fileURLWithPath: journal.candidatePath)
             let targetURL = URL(fileURLWithPath: journal.targetPath)
@@ -124,16 +140,15 @@ enum CommitRecoveryJournalStore {
                 fileURLWithPath: journal.replacementDirectoryPath,
                 isDirectory: true
             )
-            guard candidateURL.deletingLastPathComponent().standardizedFileURL
+            guard DocumentIdentity.make(url: targetURL).stableKey
+                    == journal.documentStableKey,
+                  candidateURL.deletingLastPathComponent().standardizedFileURL
                     == replacementDirectoryURL.standardizedFileURL,
-                  let directoryIdentifier =
-                    try? DurableFileIO.resourceIdentifier(
-                        for: replacementDirectoryURL
-                    ),
-                  directoryIdentifier
-                    == journal.replacementDirectoryResourceIdentifier else {
-                quarantine(journalURL, in: journalDirectory)
-                return nil
+                  let directoryIdentifier = try? DurableFileIO.resourceIdentifier(
+                    for: replacementDirectoryURL
+                  ),
+                  directoryIdentifier == journal.replacementDirectoryResourceIdentifier else {
+                throw JournalError.invalidArtifactPath
             }
             let candidateIdentifier =
                 try? DurableFileIO.resourceIdentifier(for: candidateURL)
@@ -172,7 +187,7 @@ enum CommitRecoveryJournalStore {
             } else {
                 binding = nil
             }
-            return PendingCommitRecovery(
+            pending.append(PendingCommitRecovery(
                 artifact: CommitRecoveryArtifact(
                     id: journal.id,
                     journalURL: journalURL,
@@ -187,8 +202,9 @@ enum CommitRecoveryJournalStore {
                 ),
                 expectedContentDigest: journal.expectedContentDigest,
                 swapCompleted: swapCompleted
-            )
+            ))
         }
+        return pending
     }
 
     static func acknowledge(_ artifact: CommitRecoveryArtifact) throws {
@@ -242,36 +258,12 @@ enum CommitRecoveryJournalStore {
         }
     }
 
-    private static func quarantine(
-        _ journalURL: URL,
-        in journalDirectory: URL
-    ) {
-        guard FileManager.default.fileExists(atPath: journalURL.path) else {
-            return
-        }
-        let quarantineDirectory = journalDirectory.appendingPathComponent(
-            "quarantine",
-            isDirectory: true
-        )
-        do {
-            try DurableFileIO.createDirectory(at: quarantineDirectory)
-            let destination = quarantineDirectory.appendingPathComponent(
-                "\(journalURL.deletingPathExtension().lastPathComponent)-"
-                    + "\(UUID().uuidString.lowercased()).invalid.json"
-            )
-            try FileManager.default.moveItem(
-                at: journalURL,
-                to: destination
-            )
-            try DurableFileIO.synchronizeDirectory(journalDirectory)
-            try DurableFileIO.synchronizeDirectory(quarantineDirectory)
-        } catch {
-            return
-        }
-    }
 }
 
 private struct PersistedCommitRecoveryJournal: Codable {
+    static let currentSchemaVersion = 2
+
+    let schemaVersion: Int?
     let id: UUID
     let documentStableKey: String
     let expectedContentDigest: String
@@ -284,4 +276,33 @@ private struct PersistedCommitRecoveryJournal: Codable {
     let targetPath: String
     let candidatePath: String
     let replacementDirectoryPath: String
+
+    init(
+        id: UUID,
+        documentStableKey: String,
+        expectedContentDigest: String,
+        expectedPreimageByteCount: Int?,
+        expectedPreimageResourceIdentifier: String?,
+        committedPayloadByteCount: Int?,
+        committedPayloadContentDigest: String?,
+        preparedCandidateResourceIdentifier: String,
+        replacementDirectoryResourceIdentifier: String,
+        targetPath: String,
+        candidatePath: String,
+        replacementDirectoryPath: String
+    ) {
+        schemaVersion = Self.currentSchemaVersion
+        self.id = id
+        self.documentStableKey = documentStableKey
+        self.expectedContentDigest = expectedContentDigest
+        self.expectedPreimageByteCount = expectedPreimageByteCount
+        self.expectedPreimageResourceIdentifier = expectedPreimageResourceIdentifier
+        self.committedPayloadByteCount = committedPayloadByteCount
+        self.committedPayloadContentDigest = committedPayloadContentDigest
+        self.preparedCandidateResourceIdentifier = preparedCandidateResourceIdentifier
+        self.replacementDirectoryResourceIdentifier = replacementDirectoryResourceIdentifier
+        self.targetPath = targetPath
+        self.candidatePath = candidatePath
+        self.replacementDirectoryPath = replacementDirectoryPath
+    }
 }

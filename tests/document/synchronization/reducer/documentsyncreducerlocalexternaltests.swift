@@ -585,7 +585,10 @@ extension DocumentSyncReducerTests {
         )
         let persistence = try XCTUnwrap(recoveryPersistRequest(in: conflicting.effects))
         let persistedSnapshot = try XCTUnwrap(persistence.snapshot)
-        let newerRevision = SourceRevision(number: 9, text: "newer local edit")
+        let newerRevision = SourceRevision(
+            number: conflicting.state.source.number + 1,
+            text: "newer local edit"
+        )
         let edited = DocumentSyncReducer.reduce(
             conflicting.state,
             event: .sourceChanged(newerRevision, format: .newDocument)
@@ -594,6 +597,12 @@ extension DocumentSyncReducerTests {
         XCTAssertTrue(edited.state.local.isDirty)
         XCTAssertEqual(edited.state.pendingConflict?.snapshot, persistence.snapshot)
 
+        let persistedEntry = RecoveryEntry(
+            id: persistence.entryID,
+            documentIdentity: identity(),
+            snapshot: persistedSnapshot,
+            createdAt: Date(timeIntervalSinceReferenceDate: 8)
+        )
         let persisted = DocumentSyncReducer.reduce(
             edited.state,
             event: .recoveryFinished(
@@ -603,12 +612,7 @@ extension DocumentSyncReducerTests {
                         previousGeneration: persistence.expectedStoreGeneration,
                         generation: persistence.expectedStoreGeneration + 1,
                         records: DocumentSyncRecoveryRecords(
-                            decoded: RecoveryEntry(
-                                id: persistence.entryID,
-                                documentIdentity: identity(),
-                                snapshot: persistedSnapshot,
-                                createdAt: Date(timeIntervalSinceReferenceDate: 8)
-                            ),
+                            decoded: persistedEntry,
                             raw: nil
                         )
                     )
@@ -617,7 +621,66 @@ extension DocumentSyncReducerTests {
         )
         XCTAssertNil(persisted.state.pendingConflict)
         XCTAssertEqual(persisted.state.source, newerRevision)
-        XCTAssertNotNil(deadline(in: persisted.effects, kind: .localSave))
+        XCTAssertNotNil(persisted.state.recoveryCleanup)
+        XCTAssertFalse(persisted.state.externalSignalPending)
+        let saveDeadline = try XCTUnwrap(
+            deadline(in: persisted.effects, kind: .localSave)
+        )
+        let preparing = DocumentSyncReducer.reduce(
+            persisted.state,
+            event: .deadlineFired(saveDeadline)
+        )
+        let preparation = try XCTUnwrap(prepareRequest(in: preparing.effects))
+        let pending = PendingSaveToken(
+            generation: preparation.commitGeneration,
+            sourceRevision: preparation.sourceRevision,
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: preparation.snapshot
+            ),
+            expectedDurableState: preparation.expectedBaseline?
+                .asDurableFileState,
+            targetURL: preparation.targetURL
+        )
+        let writing = DocumentSyncReducer.reduce(
+            preparing.state,
+            event: .savePrepared(token: preparation.token, pendingSave: pending)
+        )
+        let commit = try XCTUnwrap(commitRequest(in: writing.effects))
+        let saved = DocumentSyncReducer.reduce(
+            writing.state,
+            event: .saveFinished(
+                token: commit.token,
+                completion: saveCompletion(
+                    FileCommitResult(
+                        generation: commit.commitGeneration,
+                        committedFingerprint: fingerprint(
+                            preparation.snapshot.text,
+                            resource: "newer-conflict-edit"
+                        ),
+                        displacedPreimage: nil,
+                        safety: .atomicSwap
+                    )
+                )
+            )
+        )
+        let discard = try XCTUnwrap(recoveryDiscardRequest(in: saved.effects))
+        XCTAssertEqual(discard.target, .decoded(persistedEntry))
+
+        let cleaned = DocumentSyncReducer.reduce(
+            saved.state,
+            event: .recoveryFinished(
+                token: discard.token,
+                result: .discarded(
+                    DocumentSyncRecoveryMutationResult(
+                        previousGeneration: discard.expectedStoreGeneration,
+                        generation: discard.expectedStoreGeneration + 1,
+                        records: .empty
+                    )
+                )
+            )
+        )
+        XCTAssertEqual(cleaned.state.recovery, .clear)
+        XCTAssertNil(cleaned.state.recoveryCleanup)
     }
 
     func testAtomicSwapUnavailableRequiresSaveAsWithoutRetryingCommit() throws {

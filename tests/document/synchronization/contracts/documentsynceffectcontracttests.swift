@@ -319,6 +319,7 @@ final class DocumentSyncEffectContractTests: XCTestCase {
                         ),
                         identity: identity,
                         target: .records(records),
+                        expectedRecords: records,
                         expectedStoreGeneration: 9
                     )
                 )

@@ -188,10 +188,8 @@ extension DocumentSyncReducer {
                 originIdentity: attempt.identity,
                 originAttachmentEpoch: token.attachmentEpoch,
                 rawPayload: DocumentSyncRawRecoveryPayload(
-                    data: displacedPreimage.data,
+                    verifiedPayload: displacedPreimage,
                     targetURL: attempt.targetURL,
-                    resourceIdentifier:
-                        displacedPreimage.fingerprint.resourceIdentifier,
                     recoveryArtifact: result.recoveryArtifact
                 ),
                 mergeBase: attempt.expectedBaseline?.snapshot
@@ -552,7 +550,8 @@ extension DocumentSyncReducer {
             let scope = recoveryLoadScope(for: updated)
             let effect = startRecoveryLoad(
                 &updated,
-                scope: scope
+                scope: scope,
+                retriesStartup: true
             )
             return transition(updated, effects: [effect])
         }

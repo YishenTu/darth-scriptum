@@ -111,7 +111,7 @@ extension DocumentSyncReducer {
         var updated = state
         let token = makeToken(&updated, operation: .close)
 
-        guard updated.fileAttachment != nil else {
+        guard updated.attachment.isManagedFile else {
             updated.lifecycle = .closing(
                 DocumentSyncCloseAttempt(
                     token: token,
@@ -534,6 +534,12 @@ extension DocumentSyncReducer {
             return false
         }
         guard state.uncertainCommit == nil else { return false }
+        // A queued monitor observation is not advisory: committing before it
+        // is reconciled could overwrite bytes that were verified after a
+        // Save As target was selected. Keep the document editable, but defer
+        // every automatic write until that observation has a terminal result.
+        guard !state.externalSignalPending else { return false }
+        guard !recoveryBlocksAutomation(state) else { return false }
         guard case .ready = state.recoveryAccess else { return false }
         guard state.recoveryMutationBarrier == nil else { return false }
         guard state.pendingConflict == nil else { return false }
@@ -565,7 +571,16 @@ extension DocumentSyncReducer {
         guard state.pendingConflict == nil else { return false }
         guard state.pendingDisplacedPreimage == nil else { return false }
         guard state.unresolvedDisplacedPreimage == nil else { return false }
-        guard case .clear = state.recovery, state.recoveryCleanup == nil else {
+        switch state.recovery {
+        case .clear:
+            guard state.recoveryCleanup == nil else { return false }
+        case .available(let records):
+            guard let cleanup = state.recoveryCleanup,
+                  cleanup.records == records,
+                  recordsAfterDiscard(cleanup.target, from: records) != nil else {
+                return false
+            }
+        case .persisting, .migrationPending:
             return false
         }
         return true
