@@ -34,9 +34,15 @@ enum DocumentSyncReducer {
                 url: url,
                 durableBaseline: durableBaseline
             )
-        case .fileMoved(let identity, let url, let durableBaseline),
-             .saveAsAttached(let identity, let url, let durableBaseline):
+        case .fileMoved(let identity, let url, let durableBaseline):
             return relocate(
+                state,
+                identity: identity,
+                url: url,
+                durableBaseline: durableBaseline
+            )
+        case .saveAsAttached(let identity, let url, let durableBaseline):
+            return saveAsAttached(
                 state,
                 identity: identity,
                 url: url,

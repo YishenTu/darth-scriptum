@@ -470,6 +470,133 @@ extension DocumentSyncReducerTests {
         XCTAssertEqual(retryRequest.targetURL, write.commit.targetURL)
     }
 
+    func testVerifiedSaveAsSupersedesAnUncertainManagedCommitAndAllowsClose()
+        throws {
+        let write = try recoveryArtifactValidationWrite()
+        let uncertain = DocumentSyncReducer.reduce(
+            write.writing.state,
+            event: .operationFailed(
+                token: write.commit.token,
+                failure: .localSave
+            )
+        )
+        let reconciliation = try XCTUnwrap(
+            commitReconciliationRequest(in: uncertain.effects)
+        )
+        let unresolved = DocumentSyncReducer.reduce(
+            uncertain.state,
+            event: .commitReconciliationFinished(
+                token: reconciliation.token,
+                result: .unresolved
+            )
+        )
+        XCTAssertEqual(
+            unresolved.state.statusProjection.presentedState,
+            .synchronizationPaused
+        )
+        XCTAssertEqual(
+            closeResolution(
+                in: DocumentSyncReducer.reduce(
+                    unresolved.state,
+                    event: .requestClose
+                ).effects
+            )?.disposition,
+            .refuseManagedClose
+        )
+
+        let destinationURL = URL(
+            fileURLWithPath: "/tmp/verified-save-as-after-failure.md"
+        )
+        let destination = DocumentIdentity.make(url: destinationURL)
+        let destinationBaseline = durableBaseline(
+            for: write.commit.pendingSave.snapshot,
+            targetURL: destinationURL,
+            identity: destination,
+            sourceRevision: write.commit.pendingSave.sourceRevision,
+            resource: "verified-save-as-after-failure",
+            commitGeneration: write.commit.commitGeneration
+        )
+
+        let moved = DocumentSyncReducer.reduce(
+            unresolved.state,
+            event: .fileMoved(
+                identity: destination,
+                url: destinationURL,
+                durableBaseline: destinationBaseline
+            )
+        )
+        XCTAssertNotNil(moved.state.uncertainCommit)
+        XCTAssertEqual(moved.state.fileAttachment?.identity, identity())
+        XCTAssertNotNil(moved.state.pendingAttachmentTransition)
+
+        let unverifiedSaveAs = DocumentSyncReducer.reduce(
+            moved.state,
+            event: .saveAsAttached(
+                identity: destination,
+                url: destinationURL,
+                durableBaseline: nil
+            )
+        )
+        XCTAssertNotNil(unverifiedSaveAs.state.uncertainCommit)
+        XCTAssertEqual(
+            unverifiedSaveAs.state.fileAttachment?.identity,
+            identity()
+        )
+        XCTAssertNotNil(unverifiedSaveAs.state.pendingAttachmentTransition)
+
+        let savedAs = DocumentSyncReducer.reduce(
+            unverifiedSaveAs.state,
+            event: .saveAsAttached(
+                identity: destination,
+                url: destinationURL,
+                durableBaseline: destinationBaseline
+            )
+        )
+        XCTAssertNil(savedAs.state.uncertainCommit)
+        XCTAssertNil(savedAs.state.pendingAttachmentTransition)
+        XCTAssertEqual(savedAs.state.fileAttachment?.identity, destination)
+        XCTAssertEqual(savedAs.state.durableBaseline, destinationBaseline)
+        XCTAssertNil(savedAs.state.issue)
+
+        let staleCompletion = DocumentSyncReducer.reduce(
+            savedAs.state,
+            event: .commitReconciliationFinished(
+                token: reconciliation.token,
+                result: .unresolved
+            )
+        )
+        XCTAssertEqual(staleCompletion.state, savedAs.state)
+        XCTAssertTrue(staleCompletion.effects.isEmpty)
+
+        let migration = try XCTUnwrap(
+            recoveryMigrationRequest(in: savedAs.effects)
+        )
+        let settled = DocumentSyncReducer.reduce(
+            staleCompletion.state,
+            event: .recoveryFinished(
+                token: migration.token,
+                result: .migrated(
+                    DocumentSyncRecoveryMutationResult(
+                        previousGeneration: migration.expectedStoreGeneration,
+                        generation: migration.expectedStoreGeneration + 1,
+                        records: .empty
+                    )
+                )
+            )
+        )
+        XCTAssertNil(settled.state.statusProjection.presentedState)
+        XCTAssertEqual(settled.state.local, .clean(settled.state.source))
+
+        let closing = DocumentSyncReducer.reduce(
+            settled.state,
+            event: .requestClose
+        )
+        XCTAssertEqual(
+            closeResolution(in: closing.effects)?.disposition,
+            .allowManagedClose
+        )
+    }
+
     func testQueuedAttachmentAppliesAfterMalformedCommitResultIsRecovered() throws {
         let write = try recoveryArtifactValidationWrite()
         let destinationURL = URL(fileURLWithPath: "/tmp/recovered-queued-attach.md")

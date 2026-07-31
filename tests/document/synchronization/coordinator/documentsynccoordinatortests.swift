@@ -205,6 +205,119 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         )
     }
 
+    func testVerifiedSaveAsAfterManagedSaveFailureRestoresPresentationAndClose()
+        async throws {
+        let original = try TemporaryMarkdownFile(contents: "base\n")
+        let destination = try TemporaryMarkdownFile(contents: "local\n")
+        defer {
+            original.remove()
+            destination.remove()
+        }
+        let initialData = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(initialData)
+        let fixture = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
+            data: initialData,
+            url: original.url
+        )
+        defer { fixture.coordinator.close() }
+        await assertInitialAttachment(fixture)
+
+        fixture.coordinator.sourceBuffer.replace(
+            with: "local\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        let savedRevision = fixture.coordinator.sourceBuffer.revision
+        let savedSnapshot = fixture.coordinator.currentSnapshot
+        let savedData = try TextFileCodec.encode(savedSnapshot)
+        try savedData.write(to: destination.url)
+        fixture.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            fixture.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            fixture.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let commit = try XCTUnwrap(fixture.host.saveRequests.last)
+        _ = fixture.coordinator.handleSaveCompletion(
+            token: commit.token,
+            error: CocoaError(.fileWriteUnknown)
+        )
+        let staleReconciliation = try XCTUnwrap(
+            fixture.executor.reconciliationRequests.last
+        )
+        XCTAssertEqual(
+            fixture.coordinator.presentedState,
+            .synchronizationPaused
+        )
+        fixture.coordinator.requestClose()
+        XCTAssertEqual(
+            fixture.host.closeResolutions.last?.disposition,
+            .refuseManagedClose
+        )
+
+        let didObserveMove = await fixture.coordinator.noteFileMovedAndWait(
+            to: destination.url,
+            knownData: savedData
+        )
+        XCTAssertTrue(didObserveMove)
+        XCTAssertEqual(
+            fixture.coordinator.fileURL,
+            original.url.standardizedFileURL
+        )
+        XCTAssertNotNil(
+            fixture.coordinator.reducerState.pendingAttachmentTransition
+        )
+
+        try await fixture.coordinator.attachAfterSaveAs(
+            to: destination.url,
+            expectedData: savedData,
+            expectedSnapshot: savedSnapshot,
+            expectedSourceRevision: savedRevision
+        )
+        await fixture.coordinator.waitForCurrentRecoveryOperation()
+
+        XCTAssertEqual(
+            try Data(contentsOf: destination.url),
+            savedData
+        )
+        XCTAssertEqual(
+            fixture.coordinator.fileURL,
+            destination.url.standardizedFileURL
+        )
+        XCTAssertEqual(
+            fixture.coordinator.durableState?.snapshot,
+            savedSnapshot
+        )
+        XCTAssertNil(fixture.coordinator.reducerState.uncertainCommit)
+        XCTAssertNil(
+            fixture.coordinator.reducerState.pendingAttachmentTransition
+        )
+        XCTAssertNil(fixture.coordinator.presentedState)
+        XCTAssertEqual(fixture.coordinator.state, .idle)
+
+        XCTAssertTrue(
+            fixture.executor.finishReconciliation(
+                staleReconciliation.token,
+                with: .unresolved
+            )
+        )
+        XCTAssertEqual(
+            fixture.coordinator.fileURL,
+            destination.url.standardizedFileURL
+        )
+        XCTAssertNil(fixture.coordinator.presentedState)
+
+        fixture.coordinator.requestClose()
+        XCTAssertEqual(
+            fixture.host.closeResolutions.last?.disposition,
+            .allowManagedClose
+        )
+    }
+
     func testRoutineSynchronizationDoesNotInvalidateCoordinatorUI() throws {
         let fixture = try TemporaryMarkdownFile(contents: "base")
         defer { fixture.remove() }

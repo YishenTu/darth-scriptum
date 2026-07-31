@@ -257,6 +257,48 @@ extension DocumentSyncReducer {
         return transition(updated, effects: effects)
     }
 
+    static func saveAsAttached(
+        _ state: DocumentSyncState,
+        identity: DocumentIdentity,
+        url: URL,
+        durableBaseline: DocumentSyncDurableBaseline?
+    ) -> DocumentSyncTransition {
+        guard state.uncertainCommit != nil else {
+            return relocate(
+                state,
+                identity: identity,
+                url: url,
+                durableBaseline: durableBaseline
+            )
+        }
+        guard let durableBaseline,
+              identity.matches(url: url),
+              durableBaseline.documentIdentity == identity else {
+            // An unavailable or mismatched destination is only an attachment
+            // observation. It cannot supersede an unknown managed commit.
+            return relocate(
+                state,
+                identity: identity,
+                url: url,
+                durableBaseline: durableBaseline
+            )
+        }
+
+        // Native Save As has already written and verified the immutable
+        // snapshot at a new identity. That durable fact supersedes uncertainty
+        // about the old in-place commit. A file-move observation lacks this
+        // authority and continues to queue behind reconciliation.
+        var updated = state
+        updated.uncertainCommit = nil
+        updated.pendingAttachmentTransition = nil
+        return relocate(
+            updated,
+            identity: identity,
+            url: url,
+            durableBaseline: durableBaseline
+        )
+    }
+
     static func detach(_ state: DocumentSyncState) -> DocumentSyncTransition {
         guard state.lifecycle == .active else {
             return unchanged(state)
