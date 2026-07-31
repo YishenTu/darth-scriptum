@@ -24,7 +24,7 @@ private struct VerifiedCoordinatorAttachment: Sendable {
     let identity: DocumentIdentity
     let sourceRevision: SourceRevision
     let durableBaseline: DocumentSyncDurableBaseline?
-    let dataMatchesExpectedSaveAs: Bool
+    let dataMatchesExpectedBytes: Bool
     let verifiedExternalChange: DocumentSyncExternalChange?
 }
 
@@ -43,7 +43,12 @@ private struct PendingVerifiedExternalRead {
     let identity: DocumentIdentity
     let targetURL: URL
     let outcome: PendingVerifiedExternalReadOutcome
-    let continuation: CheckedContinuation<Void, Error>
+    let continuation: CheckedContinuation<Void, Error>?
+}
+
+private struct PendingInitialPresenterSignal {
+    let requestID: UUID
+    let attachmentEpoch: UInt64
 }
 
 private enum CoordinatorAttachmentInspection: Sendable {
@@ -112,6 +117,8 @@ final class DocumentSyncCoordinator: ObservableObject {
     private let manualScheduler: ManualSyncScheduler?
     private let savePreparationHook: (@MainActor () async -> Void)?
     private let externalReadHook: (@MainActor (UInt64) async -> Void)?
+    private let initialAttachmentFreshReadCompletedHook:
+        (@MainActor () -> Void)?
     private let monitorStartHook: (@Sendable () throws -> Void)?
     private let monitorDescriptorClosedHook: (@Sendable (Bool) -> Void)?
     private lazy var scheduler = SyncScheduler { [weak self] deadline in
@@ -125,11 +132,15 @@ final class DocumentSyncCoordinator: ObservableObject {
     private var initialAttachmentPending = false
     private var initialAttachmentResult: Bool?
     private var initialAttachmentWaiters: [CheckedContinuation<Bool, Never>] = []
+    private var pendingInitialPresenterSignal: PendingInitialPresenterSignal?
     private var pendingVerifiedExternalRead: PendingVerifiedExternalRead?
     private var recoveryStartupWaiters: [
         CheckedContinuation<DocumentSyncRecoveryAccess, Never>
     ] = []
     private var recoveryOperationWaiters: [
+        SyncEffectToken: [CheckedContinuation<Void, Never>]
+    ] = [:]
+    private var commitReconciliationWaiters: [
         SyncEffectToken: [CheckedContinuation<Void, Never>]
     ] = [:]
     private var monitors: [SyncEffectToken: DirectoryFileMonitor] = [:]
@@ -147,9 +158,10 @@ final class DocumentSyncCoordinator: ObservableObject {
         fileMonitoringEnabled: Bool = true,
         savePreparationHook: (@MainActor () async -> Void)? = nil,
         externalReadHook: (@MainActor (UInt64) async -> Void)? = nil,
-        effectExecutor: DocumentSyncCoordinatorEffectExecuting =
-            DocumentSyncDefaultEffectExecutor(),
+        effectExecutor: DocumentSyncCoordinatorEffectExecuting? = nil,
         manualScheduler: ManualSyncScheduler? = nil,
+        initialAttachmentFreshReadCompletedHook:
+            (@MainActor () -> Void)? = nil,
         monitorStartHook: (@Sendable () throws -> Void)? = nil,
         monitorDescriptorClosedHook: (@Sendable (Bool) -> Void)? = nil
     ) {
@@ -161,9 +173,12 @@ final class DocumentSyncCoordinator: ObservableObject {
         self.recoveryStore = recoveryStore
         self.fileMonitoringEnabled = fileMonitoringEnabled
         self.effectExecutor = effectExecutor
+            ?? DocumentSyncDefaultEffectExecutor(recoveryStore: recoveryStore)
         self.manualScheduler = manualScheduler
         self.savePreparationHook = savePreparationHook
         self.externalReadHook = externalReadHook
+        self.initialAttachmentFreshReadCompletedHook =
+            initialAttachmentFreshReadCompletedHook
         self.monitorStartHook = monitorStartHook
         self.monitorDescriptorClosedHook = monitorDescriptorClosedHook
         reducerState = DocumentSyncState(
@@ -232,6 +247,15 @@ final class DocumentSyncCoordinator: ObservableObject {
             if case .recoveryFinished(let token, _) = nextEvent {
                 resolveRecoveryOperationWaiters(for: token)
             }
+            switch nextEvent {
+            case .commitReconciliationFinished(let token, _):
+                resolveCommitReconciliationWaiters(for: token)
+            case .operationFailed(let token, _)
+                where token.operation == .commitReconciliation:
+                resolveCommitReconciliationWaiters(for: token)
+            default:
+                break
+            }
             resolveFlushWaitersIfPossible()
         }
         resolveRecoveryStartupWaitersIfPossible()
@@ -267,7 +291,8 @@ final class DocumentSyncCoordinator: ObservableObject {
             sourceRevision: capturedSource,
             sourceFormat: snapshot.format,
             baselineSourceRevision: capturedSource,
-            initialFormat: snapshot.format
+            initialFormat: snapshot.format,
+            requiresFreshTargetObservation: true
         )
     }
 
@@ -331,6 +356,21 @@ final class DocumentSyncCoordinator: ObservableObject {
                 return
             }
             recoveryOperationWaiters[token, default: []].append(continuation)
+        }
+    }
+
+    /// Awaits the exact uncertain-commit reconciliation active at call time.
+    /// The token check prevents a retry from satisfying an older waiter.
+    func waitForCurrentCommitReconciliation() async {
+        guard let token = reducerState.activeTokens[.commitReconciliation] else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            guard reducerState.activeTokens[.commitReconciliation] == token else {
+                continuation.resume()
+                return
+            }
+            commitReconciliationWaiters[token, default: []].append(continuation)
         }
     }
 
@@ -428,7 +468,7 @@ final class DocumentSyncCoordinator: ObservableObject {
             inspection: verification
         )
         guard case .verified(let attachment) = verification,
-              !attachment.dataMatchesExpectedSaveAs else { return }
+              !attachment.dataMatchesExpectedBytes else { return }
         try await applyVerifiedSaveAsReplacement(attachment.verifiedExternalChange)
     }
 
@@ -472,6 +512,16 @@ final class DocumentSyncCoordinator: ObservableObject {
 
     func noteCoordinatedExternalChange() {
         guard let monitorToken = reducerState.activeTokens[.monitor] else {
+            guard initialAttachmentPending,
+                  let requestID = attachmentRequestID,
+                  case .provisional(let attachment) = reducerState.attachment
+            else {
+                return
+            }
+            pendingInitialPresenterSignal = PendingInitialPresenterSignal(
+                requestID: requestID,
+                attachmentEpoch: attachment.epoch
+            )
             return
         }
         dispatch(.monitorSignaled(monitorToken))
@@ -529,7 +579,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                             disposition: .destinationRequiresSaveAs
                         )
                     )
-                case .invalidPreparedPayload:
+                case .atomicSwapFailed, .invalidPreparedPayload:
                     dispatch(.commitFailed(token: token, disposition: .notStarted))
                 case .targetMissingBeforeCommit:
                     dispatch(.commitFailed(token: token, disposition: .notStarted))
@@ -603,7 +653,8 @@ final class DocumentSyncCoordinator: ObservableObject {
     private func installInitialAttachment(
         target: UnverifiedCoordinatorAttachment,
         durableBaseline: DocumentSyncDurableBaseline?,
-        initialFormat: TextFileFormat? = nil
+        initialFormat: TextFileFormat? = nil,
+        requiresExternalVerification: Bool = false
     ) {
         let previous = reducerState
         // A source edit can occur while the file queue verifies the initial
@@ -620,8 +671,9 @@ final class DocumentSyncCoordinator: ObservableObject {
         } else {
             attachmentEpoch = previous.attachmentEpoch + 1
         }
-        let requiresExternalVerification = durableBaseline?.snapshot
-            != DocumentSnapshot(text: source.text, format: format)
+        let mustVerifyExternalState = requiresExternalVerification
+            || durableBaseline?.snapshot
+                != DocumentSnapshot(text: source.text, format: format)
         reducerState = DocumentSyncState(
             lifetime: previous.lifetime,
             source: source,
@@ -641,12 +693,12 @@ final class DocumentSyncCoordinator: ObservableObject {
             nextAttempt: previous.nextAttempt,
             nextCommitGeneration: previous.nextCommitGeneration,
             activeTokens: previous.activeTokens,
-            externalSignalPending: requiresExternalVerification
+            externalSignalPending: mustVerifyExternalState
         )
         unattachedDurableState = nil
         publishCompatibility(from: previous, event: nil)
         dispatch(.started)
-        guard requiresExternalVerification,
+        guard mustVerifyExternalState,
               let monitorToken = reducerState.activeTokens[.monitor] else {
             return
         }
@@ -671,6 +723,9 @@ final class DocumentSyncCoordinator: ObservableObject {
         attachmentTask = nil
         if let requestID = attachmentRequestID {
             attachmentCompletions.removeValue(forKey: requestID)?(false)
+            if pendingInitialPresenterSignal?.requestID == requestID {
+                pendingInitialPresenterSignal = nil
+            }
         }
         attachmentRequestID = nil
     }
@@ -683,7 +738,8 @@ final class DocumentSyncCoordinator: ObservableObject {
         sourceRevision: SourceRevision,
         sourceFormat: TextFileFormat,
         baselineSourceRevision: SourceRevision,
-        initialFormat: TextFileFormat? = nil
+        initialFormat: TextFileFormat? = nil,
+        requiresFreshTargetObservation: Bool = false
     ) {
         let commitGeneration = reducerState.durableBaseline?.commitGeneration ?? 0
         attachmentTask = Task { [weak self] in
@@ -696,13 +752,18 @@ final class DocumentSyncCoordinator: ObservableObject {
                         sourceRevision: sourceRevision,
                         sourceFormat: sourceFormat,
                         baselineSourceRevision: baselineSourceRevision,
-                        commitGeneration: commitGeneration
+                        commitGeneration: commitGeneration,
+                        requiresFreshTargetObservation:
+                            requiresFreshTargetObservation
                     )
                 }
             } catch {
                 return
             }
             guard !Task.isCancelled, let self else { return }
+            if requiresFreshTargetObservation {
+                self.initialAttachmentFreshReadCompletedHook?()
+            }
             self.completeAttachment(
                 requestID: requestID,
                 event: event,
@@ -723,6 +784,14 @@ final class DocumentSyncCoordinator: ObservableObject {
         attachmentRequestID = nil
         let target = inspection.target
         let baseline = inspection.durableBaseline
+        let pendingPresenterSignal = pendingInitialPresenterSignal
+        let replaysPresenterSignal =
+            pendingPresenterSignal?.requestID == requestID
+            && pendingPresenterSignal?.attachmentEpoch
+                == reducerState.attachmentEpoch
+        if pendingPresenterSignal?.requestID == requestID {
+            pendingInitialPresenterSignal = nil
+        }
 
         if case .attach = event,
            reducerState.fileAttachment == nil,
@@ -730,10 +799,14 @@ final class DocumentSyncCoordinator: ObservableObject {
             // Initial document attachment is construction, not a relocation.
             // It keeps ordinary editing usable while P1 replaces the legacy
             // recovery store with exact typed receipts.
+            let requiresFreshTargetObservation =
+                queueFreshInitialTargetObservation(from: inspection)
             installInitialAttachment(
                 target: target,
                 durableBaseline: baseline,
-                initialFormat: initialFormat
+                initialFormat: initialFormat,
+                requiresExternalVerification:
+                    requiresFreshTargetObservation || replaysPresenterSignal
             )
             finishAttachmentRequest(requestID, didAttach: inspection.didReadData)
             if !inspection.didReadData {
@@ -802,10 +875,36 @@ final class DocumentSyncCoordinator: ObservableObject {
         guard let pending = pendingVerifiedExternalRead else { return }
         pendingVerifiedExternalRead = nil
         if let error {
-            pending.continuation.resume(throwing: error)
+            pending.continuation?.resume(throwing: error)
         } else {
-            pending.continuation.resume()
+            pending.continuation?.resume()
         }
+    }
+
+    /// The NSDocument read is immutable source input, not proof that the
+    /// target still contains those bytes. Queue the separate observation
+    /// captured by initial inspection so recovery readiness and the monitor
+    /// token gate it ahead of every local save.
+    private func queueFreshInitialTargetObservation(
+        from inspection: CoordinatorAttachmentInspection
+    ) -> Bool {
+        guard case .verified(let attachment) = inspection,
+              !attachment.dataMatchesExpectedBytes else {
+            return false
+        }
+        let outcome: PendingVerifiedExternalReadOutcome =
+            if let change = attachment.verifiedExternalChange {
+                .result(.changed(change))
+            } else {
+                .failure
+            }
+        pendingVerifiedExternalRead = PendingVerifiedExternalRead(
+            identity: attachment.identity,
+            targetURL: attachment.targetURL,
+            outcome: outcome,
+            continuation: nil
+        )
+        return true
     }
 
     private func resolvePendingVerifiedExternalReadIfBlocked() {
@@ -1023,10 +1122,10 @@ final class DocumentSyncCoordinator: ObservableObject {
             switch pending.outcome {
             case .result(let result):
                 dispatch(.externalReadFinished(token: request.token, result: result))
-                pending.continuation.resume()
+                pending.continuation?.resume()
             case .failure:
                 dispatch(.operationFailed(token: request.token, failure: .externalRead))
-                pending.continuation.resume(
+                pending.continuation?.resume(
                     throwing: DocumentSyncCoordinatorAttachmentError
                         .verificationUnavailable
                 )
@@ -1314,6 +1413,16 @@ final class DocumentSyncCoordinator: ObservableObject {
         }
     }
 
+    private func resolveCommitReconciliationWaiters(
+        for token: SyncEffectToken
+    ) {
+        let waiters = commitReconciliationWaiters.removeValue(forKey: token)
+            ?? []
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
     private var isFullySynchronized: Bool {
         guard case .clean(let revision) = reducerState.local,
               case .ready = reducerState.recoveryAccess,
@@ -1333,6 +1442,7 @@ final class DocumentSyncCoordinator: ObservableObject {
 
     private func tearDown() {
         isTornDown = true
+        pendingInitialPresenterSignal = nil
         resolvePendingVerifiedExternalRead(throwing: .verificationInterrupted)
         attachmentTask?.cancel()
         attachmentTask = nil
@@ -1365,6 +1475,14 @@ final class DocumentSyncCoordinator: ObservableObject {
                 waiter.resume()
             }
         }
+        let pendingCommitReconciliationWaiters =
+            commitReconciliationWaiters.values
+        commitReconciliationWaiters.removeAll()
+        for waiters in pendingCommitReconciliationWaiters {
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
         resolveInitialAttachmentWaiters(didAttach: false)
     }
 
@@ -1381,13 +1499,24 @@ final class DocumentSyncCoordinator: ObservableObject {
         sourceFormat: TextFileFormat,
         baselineSourceRevision: SourceRevision,
         commitGeneration: UInt64,
-        expectedSaveAsData: Data? = nil
+        requiresFreshTargetObservation: Bool = false
     ) -> CoordinatorAttachmentInspection {
         let target = attachmentTarget(
             at: targetURL,
             sourceRevision: sourceRevision
         )
         do {
+            if requiresFreshTargetObservation, let knownData {
+                return .verified(
+                    try verifiedInitialAttachment(
+                        target: target,
+                        knownData: knownData,
+                        sourceFormat: sourceFormat,
+                        baselineSourceRevision: baselineSourceRevision,
+                        commitGeneration: commitGeneration
+                    )
+                )
+            }
             let data = try knownData ?? Data(
                 contentsOf: targetURL,
                 options: [.mappedIfSafe]
@@ -1398,13 +1527,66 @@ final class DocumentSyncCoordinator: ObservableObject {
                     data: data,
                     sourceFormat: sourceFormat,
                     baselineSourceRevision: baselineSourceRevision,
-                    commitGeneration: commitGeneration,
-                    expectedSaveAsData: expectedSaveAsData
+                    commitGeneration: commitGeneration
                 )
             )
         } catch {
             return .unavailable(target)
         }
+    }
+
+    private nonisolated static func verifiedInitialAttachment(
+        target: UnverifiedCoordinatorAttachment,
+        knownData: Data,
+        sourceFormat: TextFileFormat,
+        baselineSourceRevision: SourceRevision,
+        commitGeneration: UInt64
+    ) throws -> VerifiedCoordinatorAttachment {
+        let currentData = try Data(
+            contentsOf: target.targetURL,
+            options: [.mappedIfSafe]
+        )
+        let currentFingerprint = try SafeFileCommitter.fingerprint(
+            for: target.targetURL,
+            data: currentData
+        )
+        if currentData == knownData {
+            return try verifiedAttachment(
+                target: target,
+                data: currentData,
+                fingerprint: currentFingerprint,
+                sourceFormat: sourceFormat,
+                baselineSourceRevision: baselineSourceRevision,
+                commitGeneration: commitGeneration
+            )
+        }
+
+        // The captured bytes predate this inspection, so they cannot safely
+        // inherit the target's current resource identifier. Keep their
+        // intrinsic fingerprint as the provisional baseline and carry the
+        // current target as a separate immutable external observation.
+        let expected = try verifiedAttachment(
+            target: target,
+            data: knownData,
+            fingerprint: FileFingerprint.make(data: knownData),
+            sourceFormat: sourceFormat,
+            baselineSourceRevision: baselineSourceRevision,
+            commitGeneration: commitGeneration
+        )
+        let currentChange = try? TextFileCodec.decodeExternalChange(
+            data: currentData,
+            targetURL: target.targetURL,
+            identity: target.identity,
+            fingerprint: currentFingerprint
+        )
+        return VerifiedCoordinatorAttachment(
+            targetURL: target.targetURL,
+            identity: target.identity,
+            sourceRevision: target.sourceRevision,
+            durableBaseline: expected.durableBaseline,
+            dataMatchesExpectedBytes: false,
+            verifiedExternalChange: currentChange
+        )
     }
 
     private nonisolated static func inspectSaveAsAttachment(
@@ -1432,8 +1614,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                 data: expectedData,
                 sourceFormat: sourceFormat,
                 baselineSourceRevision: baselineSourceRevision,
-                commitGeneration: commitGeneration,
-                expectedSaveAsData: nil
+                commitGeneration: commitGeneration
             )
             let currentData = try Data(
                 contentsOf: targetURL,
@@ -1443,8 +1624,8 @@ final class DocumentSyncCoordinator: ObservableObject {
                 for: targetURL,
                 data: currentData
             )
-            let dataMatchesExpectedSaveAs = currentData == expectedData
-            let verifiedExternalChange = dataMatchesExpectedSaveAs
+            let dataMatchesExpectedBytes = currentData == expectedData
+            let verifiedExternalChange = dataMatchesExpectedBytes
                 ? nil
                 : try? TextFileCodec.decodeExternalChange(
                     data: currentData,
@@ -1458,7 +1639,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                     identity: target.identity,
                     sourceRevision: target.sourceRevision,
                     durableBaseline: expected.durableBaseline,
-                    dataMatchesExpectedSaveAs: dataMatchesExpectedSaveAs,
+                    dataMatchesExpectedBytes: dataMatchesExpectedBytes,
                     verifiedExternalChange: verifiedExternalChange
                 )
             )
@@ -1481,15 +1662,20 @@ final class DocumentSyncCoordinator: ObservableObject {
     private nonisolated static func verifiedAttachment(
         target: UnverifiedCoordinatorAttachment,
         data: Data,
+        fingerprint: FileFingerprint? = nil,
         sourceFormat: TextFileFormat,
         baselineSourceRevision: SourceRevision,
-        commitGeneration: UInt64,
-        expectedSaveAsData: Data?
+        commitGeneration: UInt64
     ) throws -> VerifiedCoordinatorAttachment {
-        let fingerprint = try SafeFileCommitter.fingerprint(
-            for: target.targetURL,
-            data: data
-        )
+        let verifiedFingerprint: FileFingerprint
+        if let fingerprint {
+            verifiedFingerprint = fingerprint
+        } else {
+            verifiedFingerprint = try SafeFileCommitter.fingerprint(
+                for: target.targetURL,
+                data: data
+            )
+        }
         let snapshot = try? TextFileCodec.decode(data)
         let stampedSourceRevision: SourceRevision?
         if let snapshot {
@@ -1509,32 +1695,19 @@ final class DocumentSyncCoordinator: ObservableObject {
             try? TextFileCodec.durableBaseline(
                 data: data,
                 targetURL: target.targetURL,
-                fingerprint: fingerprint,
+                fingerprint: verifiedFingerprint,
                 documentIdentity: target.identity,
                 sourceRevision: revision,
                 commitGeneration: commitGeneration
             )
-        }
-        let dataMatchesExpectedSaveAs = expectedSaveAsData.map { $0 == data }
-            ?? true
-        let verifiedExternalChange: DocumentSyncExternalChange?
-        if !dataMatchesExpectedSaveAs {
-            verifiedExternalChange = try? TextFileCodec.decodeExternalChange(
-                data: data,
-                targetURL: target.targetURL,
-                identity: target.identity,
-                fingerprint: fingerprint
-            )
-        } else {
-            verifiedExternalChange = nil
         }
         return VerifiedCoordinatorAttachment(
             targetURL: target.targetURL,
             identity: target.identity,
             sourceRevision: target.sourceRevision,
             durableBaseline: durableBaseline,
-            dataMatchesExpectedSaveAs: dataMatchesExpectedSaveAs,
-            verifiedExternalChange: verifiedExternalChange
+            dataMatchesExpectedBytes: true,
+            verifiedExternalChange: nil
         )
     }
 

@@ -3,9 +3,18 @@ import XCTest
 @testable import DarthScriptum
 
 extension DocumentSyncReducerTests {
-    func testRestoringDecodedAndRawRecoveryUsesAnExactSelectedCleanupTarget() throws {
+    func testRestoringDecodedRecoveryPreservesRawRecordsUntilExplicitDiscard() throws {
         var recoverable = makeState()
-        let entry = RecoveryEntry(
+        let olderEntry = RecoveryEntry(
+            id: UUID(),
+            documentIdentity: identity(),
+            snapshot: DocumentSnapshot(
+                text: "older-decoded-recovery",
+                format: .newDocument
+            ),
+            createdAt: Date(timeIntervalSinceReferenceDate: 44)
+        )
+        let latestEntry = RecoveryEntry(
             id: UUID(),
             documentIdentity: identity(),
             snapshot: DocumentSnapshot(
@@ -14,14 +23,19 @@ extension DocumentSyncReducerTests {
             ),
             createdAt: Date(timeIntervalSinceReferenceDate: 45)
         )
-        let raw = rawRecoveryReference(
+        let firstRaw = rawRecoveryReference(
             id: UUID(),
             identity: identity(),
-            data: Data("restore-raw".utf8)
+            data: Data("first-unrelated-raw".utf8)
+        )
+        let secondRaw = rawRecoveryReference(
+            id: UUID(),
+            identity: identity(),
+            data: Data("second-unrelated-raw".utf8)
         )
         let records = DocumentSyncRecoveryRecords(
-            decoded: [entry],
-            raw: [raw]
+            decoded: [latestEntry, olderEntry],
+            raw: [firstRaw, secondRaw]
         )
         recoverable.recovery = .available(records)
 
@@ -29,7 +43,11 @@ extension DocumentSyncReducerTests {
             recoverable,
             event: .restoreLocalRecovery
         )
-        XCTAssertEqual(restored.state.recoveryCleanup?.target, .selected(records))
+        XCTAssertEqual(restored.state.snapshot, latestEntry.snapshot)
+        XCTAssertEqual(
+            restored.state.recoveryCleanup?.target,
+            .decoded(latestEntry)
+        )
         let deadline = try XCTUnwrap(
             deadline(in: restored.effects, kind: .localSave)
         )
@@ -70,7 +88,11 @@ extension DocumentSyncReducerTests {
             )
         )
         let discard = try XCTUnwrap(recoveryDiscardRequest(in: saved.effects))
-        XCTAssertEqual(discard.target, .selected(records))
+        XCTAssertEqual(discard.target, .decoded(latestEntry))
+        let recordsAfterRestoreCleanup = DocumentSyncRecoveryRecords(
+            decoded: [olderEntry],
+            raw: [firstRaw, secondRaw]
+        )
         let cleaned = DocumentSyncReducer.reduce(
             saved.state,
             event: .recoveryFinished(
@@ -79,16 +101,51 @@ extension DocumentSyncReducerTests {
                     DocumentSyncRecoveryMutationResult(
                         previousGeneration: discard.expectedStoreGeneration,
                         generation: discard.expectedStoreGeneration + 1,
-                        records: .empty
+                        records: recordsAfterRestoreCleanup
                     )
                 )
             )
         )
         XCTAssertNil(cleaned.state.recoveryCleanup)
-        XCTAssertEqual(cleaned.state.recovery, .clear)
+        XCTAssertEqual(
+            cleaned.state.recovery,
+            .available(recordsAfterRestoreCleanup)
+        )
+
+        let rawDiscarding = DocumentSyncReducer.reduce(
+            cleaned.state,
+            event: .discardRawRecovery
+        )
+        let rawDiscard = try XCTUnwrap(
+            recoveryDiscardRequest(in: rawDiscarding.effects)
+        )
+        XCTAssertEqual(rawDiscard.target, .raw([firstRaw, secondRaw]))
+        let explicitlyDiscarded = DocumentSyncReducer.reduce(
+            rawDiscarding.state,
+            event: .recoveryFinished(
+                token: rawDiscard.token,
+                result: .discarded(
+                    DocumentSyncRecoveryMutationResult(
+                        previousGeneration: rawDiscard.expectedStoreGeneration,
+                        generation: rawDiscard.expectedStoreGeneration + 1,
+                        records: DocumentSyncRecoveryRecords(
+                            decoded: [olderEntry],
+                            raw: []
+                        )
+                    )
+                )
+            )
+        )
+        XCTAssertEqual(
+            explicitlyDiscarded.state.recovery,
+            .available(DocumentSyncRecoveryRecords(
+                decoded: [olderEntry],
+                raw: []
+            ))
+        )
     }
 
-    func testSelectedCleanupRetainsNewRawRecoveryAfterDirectPersistence() throws {
+    func testDecodedCleanupRetainsRawRecoveryAfterDirectPersistence() throws {
         let scenario = try restoredRecoveryWithUnexpectedRawPersistence()
         let newRaw = rawRecoveryReference(
             id: scenario.request.entryID,
@@ -119,7 +176,7 @@ extension DocumentSyncReducerTests {
         )
         XCTAssertEqual(
             persisted.state.recoveryCleanup?.target,
-            .selected(scenario.originalRecords)
+            .decoded(scenario.entry)
         )
         XCTAssertEqual(
             persisted.state.recoveryCleanup?.records,
@@ -128,7 +185,7 @@ extension DocumentSyncReducerTests {
         let cleanupDiscard = try XCTUnwrap(
             recoveryDiscardRequest(in: persisted.effects)
         )
-        XCTAssertEqual(cleanupDiscard.target, .selected(scenario.originalRecords))
+        XCTAssertEqual(cleanupDiscard.target, .decoded(scenario.entry))
         let afterCleanup = DocumentSyncReducer.reduce(
             persisted.state,
             event: .recoveryFinished(
@@ -139,7 +196,7 @@ extension DocumentSyncReducerTests {
                         generation: cleanupDiscard.expectedStoreGeneration + 1,
                         records: DocumentSyncRecoveryRecords(
                             decoded: [],
-                            raw: [newRaw]
+                            raw: [scenario.oldRaw, newRaw]
                         )
                     )
                 )
@@ -157,7 +214,7 @@ extension DocumentSyncReducerTests {
         let rawDiscard = try XCTUnwrap(
             recoveryDiscardRequest(in: rawDiscarding.effects)
         )
-        XCTAssertEqual(rawDiscard.target, .raw([newRaw]))
+        XCTAssertEqual(rawDiscard.target, .raw([scenario.oldRaw, newRaw]))
         let cleared = DocumentSyncReducer.reduce(
             rawDiscarding.state,
             event: .recoveryFinished(
@@ -175,7 +232,7 @@ extension DocumentSyncReducerTests {
         XCTAssertNil(cleared.state.unresolvedDisplacedPreimage)
     }
 
-    func testSelectedCleanupRetainsNewRawRecoveryAfterReconciliation() throws {
+    func testDecodedCleanupRetainsRawRecoveryAfterReconciliation() throws {
         let scenario = try restoredRecoveryWithUnexpectedRawPersistence()
         let failed = DocumentSyncReducer.reduce(
             scenario.persisting.state,
@@ -213,7 +270,7 @@ extension DocumentSyncReducerTests {
         )
         XCTAssertEqual(
             reconciled.state.recoveryCleanup?.target,
-            .selected(scenario.originalRecords)
+            .decoded(scenario.entry)
         )
         XCTAssertEqual(
             reconciled.state.recoveryCleanup?.records,
@@ -222,7 +279,7 @@ extension DocumentSyncReducerTests {
         let cleanupDiscard = try XCTUnwrap(
             recoveryDiscardRequest(in: reconciled.effects)
         )
-        XCTAssertEqual(cleanupDiscard.target, .selected(scenario.originalRecords))
+        XCTAssertEqual(cleanupDiscard.target, .decoded(scenario.entry))
         let afterCleanup = DocumentSyncReducer.reduce(
             reconciled.state,
             event: .recoveryFinished(
@@ -233,7 +290,7 @@ extension DocumentSyncReducerTests {
                         generation: cleanupDiscard.expectedStoreGeneration + 1,
                         records: DocumentSyncRecoveryRecords(
                             decoded: [],
-                            raw: [newRaw]
+                            raw: [scenario.oldRaw, newRaw]
                         )
                     )
                 )
@@ -246,7 +303,7 @@ extension DocumentSyncReducerTests {
         ).effects))
     }
 
-    func testSelectedCleanupMigratesWithoutSelectingNewRawRecovery() throws {
+    func testDecodedCleanupMigratesWithoutSelectingRawRecovery() throws {
         let scenario = try restoredRecoveryWithUnexpectedRawPersistence()
         let destinationURL = URL(fileURLWithPath: "/tmp/selected-cleanup-moved.md")
         let destination = DocumentIdentity.make(url: destinationURL)
@@ -309,20 +366,20 @@ extension DocumentSyncReducerTests {
                 )
             )
         )
-        let migratedSelection = migratedRecoveryRecords(
+        let migratedOriginalRecords = migratedRecoveryRecords(
             scenario.originalRecords,
             to: destination
         )
+        let migratedEntry = try XCTUnwrap(migratedOriginalRecords.decoded.first)
         XCTAssertEqual(
             migrated.state.recoveryCleanup?.target,
-            .selected(migratedSelection)
+            .decoded(migratedEntry)
         )
         let cleanupDiscard = try XCTUnwrap(
             recoveryDiscardRequest(in: migrated.effects)
         )
         XCTAssertEqual(cleanupDiscard.identity, destination)
-        XCTAssertEqual(cleanupDiscard.target, .selected(migratedSelection))
-        let newRawAtDestination = try XCTUnwrap(migratedRecords.raw.last)
+        XCTAssertEqual(cleanupDiscard.target, .decoded(migratedEntry))
         let afterCleanup = DocumentSyncReducer.reduce(
             migrated.state,
             event: .recoveryFinished(
@@ -333,7 +390,7 @@ extension DocumentSyncReducerTests {
                         generation: cleanupDiscard.expectedStoreGeneration + 1,
                         records: DocumentSyncRecoveryRecords(
                             decoded: [],
-                            raw: [newRawAtDestination]
+                            raw: migratedRecords.raw
                         )
                     )
                 )
@@ -344,7 +401,7 @@ extension DocumentSyncReducerTests {
             afterCleanup.state.recovery,
             .available(DocumentSyncRecoveryRecords(
                 decoded: [],
-                raw: [newRawAtDestination]
+                raw: migratedRecords.raw
             ))
         )
     }

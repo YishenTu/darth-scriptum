@@ -374,6 +374,7 @@ extension DocumentSyncReducerTests {
             reconciled.state.local,
             .clean(write.commit.pendingSave.sourceRevision)
         )
+        XCTAssertNil(reconciled.state.issue)
     }
 
     func testAttachmentRejectsBaselineWhenIdentityDoesNotMatchTargetURL() {

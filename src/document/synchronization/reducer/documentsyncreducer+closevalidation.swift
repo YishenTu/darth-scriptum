@@ -554,9 +554,28 @@ extension DocumentSyncReducer {
                     state.recoveryCleanup,
                     in: records
                 )
+                || recoveryCleanupAuthorizesDecodedRestore(
+                    state.recoveryCleanup,
+                    in: records
+                )
         case .persisting, .migrationPending:
             return false
         }
+    }
+
+    private static func recoveryCleanupAuthorizesDecodedRestore(
+        _ cleanup: DocumentSyncRecoveryCleanup?,
+        in records: DocumentSyncRecoveryRecords
+    ) -> Bool {
+        guard let cleanup,
+              cleanup.discardPurpose == .discardRestoredRecords,
+              cleanup.records == records,
+              case .decoded(let restoredEntry) = cleanup.target,
+              records.decoded.contains(restoredEntry),
+              recordsAfterDiscard(cleanup.target, from: records) != nil else {
+            return false
+        }
+        return true
     }
 
     static func canScheduleExternalRead(_ state: DocumentSyncState) -> Bool {

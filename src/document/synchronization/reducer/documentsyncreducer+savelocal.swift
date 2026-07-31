@@ -500,6 +500,9 @@ extension DocumentSyncReducer {
                 pendingRevision: uncertainCommit.pendingRevision
             )
             updated.activeTokens[.saveCommit] = uncertainCommit.attempt.token
+            // This authoritative journal-backed result resolves the recovery
+            // issue that was created solely by the uncertain commit outcome.
+            updated.issue = nil
             return saveFinished(
                 updated,
                 token: uncertainCommit.attempt.token,

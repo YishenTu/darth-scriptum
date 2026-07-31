@@ -4,6 +4,728 @@ import XCTest
 
 @MainActor
 final class SessionRecoveryStoreAsyncTests: XCTestCase {
+    func testSameSessionCommitReconciliationAcknowledgesExactCompletedSwap()
+        async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let store = SessionRecoveryStore(
+            persistenceDirectory: fixture.recoveryDirectory
+        )
+        _ = try await store.start()
+
+        XCTAssertThrowsError(
+            try fixture.committer(
+                afterAtomicSwap: {
+                    throw ReconciliationInjectedError.afterAtomicSwap
+                }
+            ).commit(fixture.pendingSave)
+        )
+
+        let pendingArtifact = try XCTUnwrap(
+            CommitRecoveryJournalStore.pendingRecoveries(
+                in: fixture.recoveryDirectory
+            ).first?.artifact
+        )
+        let result = await store.reconcileCommit(fixture.request())
+
+        guard case .committed(let completion, let observation) = result else {
+            return XCTFail("Expected an authoritative committed result")
+        }
+        XCTAssertEqual(observation.identity, fixture.identity)
+        XCTAssertEqual(
+            observation.targetURL.standardizedFileURL,
+            fixture.targetURL.standardizedFileURL
+        )
+        XCTAssertEqual(completion.result.generation, fixture.pendingSave.generation)
+        XCTAssertEqual(completion.result.safety, .atomicSwap)
+        XCTAssertEqual(completion.result.displacedPreimage?.data, fixture.original)
+        XCTAssertNil(completion.result.recoveryArtifact)
+        XCTAssertEqual(
+            completion.result.committedFingerprint,
+            observation.fingerprint
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: pendingArtifact.journalURL.path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: pendingArtifact.candidateURL.path
+            )
+        )
+    }
+
+    func testCompletedSwapReturnsUnexpectedPreimageWithBoundJournal()
+        async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let store = SessionRecoveryStore(
+            persistenceDirectory: fixture.recoveryDirectory
+        )
+        _ = try await store.start()
+        let unexpected = Data("external\n".utf8)
+
+        XCTAssertThrowsError(
+            try fixture.committer(
+                beforeAtomicSwap: {
+                    try unexpected.write(to: fixture.targetURL)
+                },
+                afterAtomicSwap: {
+                    throw ReconciliationInjectedError.afterAtomicSwap
+                }
+            ).commit(fixture.pendingSave)
+        )
+
+        let result = await store.reconcileCommit(fixture.request())
+
+        guard case .committed(let completion, _) = result else {
+            return XCTFail("Expected an authoritative committed result")
+        }
+        let artifact = try XCTUnwrap(completion.result.recoveryArtifact)
+        defer {
+            try? CommitRecoveryJournalStore.acknowledge(artifact)
+        }
+        XCTAssertEqual(completion.result.displacedPreimage?.data, unexpected)
+        XCTAssertEqual(artifact.binding?.documentIdentity, fixture.identity)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: artifact.journalURL.path)
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: artifact.candidateURL.path)
+        )
+        let records = try await store.records(for: fixture.identity)
+        XCTAssertTrue(records.raw.isEmpty)
+    }
+
+    func testProvenUnswappedCommitAcknowledgesBeforeReturningNotCommitted()
+        async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let store = SessionRecoveryStore(
+            persistenceDirectory: fixture.recoveryDirectory
+        )
+        _ = try await store.start()
+        let artifact = try fixture.prepareUnswappedJournal()
+
+        let result = await store.reconcileCommit(fixture.request())
+
+        guard case .notCommitted(let observation) = result else {
+            return XCTFail("Expected a proven not-committed result")
+        }
+        XCTAssertEqual(observation?.fingerprint, fixture.baseline.fingerprint)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: artifact.journalURL.path)
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: artifact.candidateURL.path)
+        )
+    }
+
+    func testCompletedSwapAcknowledgementInterruptionRetriesFromTerminalJournal()
+        async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let store = SessionRecoveryStore(
+            persistenceDirectory: fixture.recoveryDirectory
+        )
+        _ = try await store.start()
+        XCTAssertThrowsError(
+            try fixture.committer(
+                afterAtomicSwap: {
+                    throw ReconciliationInjectedError.afterAtomicSwap
+                }
+            ).commit(fixture.pendingSave)
+        )
+        let request = fixture.request()
+
+        let interrupted = await reconcileCommit(
+            request,
+            in: fixture.recoveryDirectory,
+            acknowledgementHook: { phase in
+                guard phase
+                        == .afterArtifactCleanupBeforeJournalRemoval else {
+                    return
+                }
+                throw ReconciliationInjectedError.acknowledgementInterrupted
+            }
+        )
+
+        XCTAssertEqual(interrupted, .unresolved)
+        let terminal = try XCTUnwrap(
+            CommitRecoveryJournalStore.pendingRecoveries(
+                in: fixture.recoveryDirectory
+            ).first
+        )
+        XCTAssertEqual(terminal.terminalState, .committed)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: terminal.artifact.journalURL.path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: terminal.artifact.candidateURL.path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: terminal.artifact.replacementDirectoryURL.path
+            )
+        )
+
+        let retried = await store.reconcileCommit(request)
+
+        guard case .committed(let completion, _) = retried else {
+            return XCTFail("Expected terminal committed reconciliation")
+        }
+        XCTAssertEqual(
+            completion.result.committedFingerprint.contentDigest,
+            fixture.pendingSave.contentFingerprint.contentDigest
+        )
+        XCTAssertNil(completion.result.displacedPreimage)
+        XCTAssertNil(completion.result.recoveryArtifact)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: terminal.artifact.journalURL.path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: terminal.artifact.replacementDirectoryURL.path
+            )
+        )
+    }
+
+    func testUnswappedAcknowledgementInterruptionRetriesFromTerminalJournal()
+        async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let store = SessionRecoveryStore(
+            persistenceDirectory: fixture.recoveryDirectory
+        )
+        _ = try await store.start()
+        let artifact = try fixture.prepareUnswappedJournal()
+        let request = fixture.request()
+
+        let interrupted = await reconcileCommit(
+            request,
+            in: fixture.recoveryDirectory,
+            acknowledgementHook: { phase in
+                guard phase
+                        == .afterArtifactCleanupBeforeJournalRemoval else {
+                    return
+                }
+                throw ReconciliationInjectedError.acknowledgementInterrupted
+            }
+        )
+
+        XCTAssertEqual(interrupted, .unresolved)
+        let terminal = try XCTUnwrap(
+            CommitRecoveryJournalStore.pendingRecoveries(
+                in: fixture.recoveryDirectory
+            ).first
+        )
+        XCTAssertEqual(terminal.terminalState, .notCommitted)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: artifact.journalURL.path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: artifact.candidateURL.path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: artifact.replacementDirectoryURL.path
+            )
+        )
+
+        let retried = await store.reconcileCommit(request)
+
+        guard case .notCommitted(let observation) = retried else {
+            return XCTFail("Expected terminal not-committed reconciliation")
+        }
+        XCTAssertEqual(observation?.fingerprint, fixture.baseline.fingerprint)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: artifact.journalURL.path)
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: artifact.replacementDirectoryURL.path
+            )
+        )
+    }
+
+    func testCompletedSwapRemainsAuthoritativeAfterJournalUnlinkSyncFailure()
+        async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        XCTAssertThrowsError(
+            try fixture.committer(
+                afterAtomicSwap: {
+                    throw ReconciliationInjectedError.afterAtomicSwap
+                }
+            ).commit(fixture.pendingSave)
+        )
+        let artifact = try XCTUnwrap(
+            CommitRecoveryJournalStore.pendingRecoveries(
+                in: fixture.recoveryDirectory
+            ).first?.artifact
+        )
+
+        let result = await reconcileCommit(
+            fixture.request(),
+            in: fixture.recoveryDirectory,
+            acknowledgementHook: { phase in
+                guard phase
+                        == .afterJournalUnlinkBeforeDirectorySync else {
+                    return
+                }
+                throw ReconciliationInjectedError.acknowledgementInterrupted
+            }
+        )
+
+        guard case .committed(let completion, _) = result else {
+            return XCTFail("Journal unlink must preserve committed authority")
+        }
+        XCTAssertEqual(
+            completion.result.committedFingerprint.contentDigest,
+            fixture.pendingSave.contentFingerprint.contentDigest
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: artifact.journalURL.path)
+        )
+    }
+
+    func testUnswappedRemainsAuthoritativeAfterJournalUnlinkSyncFailure()
+        async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let artifact = try fixture.prepareUnswappedJournal()
+
+        let result = await reconcileCommit(
+            fixture.request(),
+            in: fixture.recoveryDirectory,
+            acknowledgementHook: { phase in
+                guard phase
+                        == .afterJournalUnlinkBeforeDirectorySync else {
+                    return
+                }
+                throw ReconciliationInjectedError.acknowledgementInterrupted
+            }
+        )
+
+        guard case .notCommitted(let observation) = result else {
+            return XCTFail("Journal unlink must preserve not-committed authority")
+        }
+        XCTAssertEqual(observation?.fingerprint, fixture.baseline.fingerprint)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: artifact.journalURL.path)
+        )
+    }
+
+    func testGenericAcknowledgementCompletesAfterJournalUnlinkSyncFailure()
+        throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let artifact = try fixture.prepareUnswappedJournal()
+
+        XCTAssertNoThrow(
+            try CommitRecoveryJournalStore.acknowledge(
+                artifact,
+                acknowledgementHook: { phase in
+                    guard phase
+                            == .afterJournalUnlinkBeforeDirectorySync else {
+                        return
+                    }
+                    throw ReconciliationInjectedError
+                        .acknowledgementInterrupted
+                }
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: artifact.journalURL.path)
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: artifact.replacementDirectoryURL.path
+            )
+        )
+    }
+
+    func testSchema1AcknowledgementInterruptionUpgradesToCleanupTombstone()
+        async throws {
+        try await assertLegacyAcknowledgementInterruptionIsRetrySafe(
+            schemaVersion: nil
+        )
+    }
+
+    func testSchema2AcknowledgementInterruptionUpgradesToCleanupTombstone()
+        async throws {
+        try await assertLegacyAcknowledgementInterruptionIsRetrySafe(
+            schemaVersion: 2
+        )
+    }
+
+    private func assertLegacyAcknowledgementInterruptionIsRetrySafe(
+        schemaVersion: Int?
+    ) async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let artifact = try fixture.prepareUnswappedJournal()
+        try rewriteCommitJournal(at: artifact.journalURL) { journal in
+            if let schemaVersion {
+                journal["schemaVersion"] = schemaVersion
+            } else {
+                journal.removeValue(forKey: "schemaVersion")
+                journal.removeValue(
+                    forKey: "expectedPreimageByteCount"
+                )
+                journal.removeValue(
+                    forKey: "expectedPreimageResourceIdentifier"
+                )
+                journal.removeValue(
+                    forKey: "committedPayloadByteCount"
+                )
+                journal.removeValue(
+                    forKey: "committedPayloadContentDigest"
+                )
+            }
+            journal.removeValue(forKey: "commitGeneration")
+            journal.removeValue(forKey: "requestedTargetPath")
+            journal.removeValue(forKey: "terminalState")
+        }
+        let legacyPending = try XCTUnwrap(
+            CommitRecoveryJournalStore.pendingRecoveries(
+                in: fixture.recoveryDirectory
+            ).first
+        )
+        XCTAssertEqual(legacyPending.terminalState, .prepared)
+        XCTAssertNil(legacyPending.commitGeneration)
+
+        XCTAssertThrowsError(
+            try CommitRecoveryJournalStore.acknowledge(
+                artifact,
+                acknowledgementHook: { phase in
+                    guard phase
+                            == .afterArtifactCleanupBeforeJournalRemoval else {
+                        return
+                    }
+                    throw ReconciliationInjectedError
+                        .acknowledgementInterrupted
+                }
+            )
+        )
+
+        let upgraded = try commitJournalObject(
+            at: artifact.journalURL
+        )
+        XCTAssertEqual(upgraded["schemaVersion"] as? Int, 3)
+        XCTAssertEqual(
+            upgraded["terminalState"] as? String,
+            CommitRecoveryTerminalState.cleanupAuthorized.rawValue
+        )
+        XCTAssertNil(upgraded["commitGeneration"])
+        XCTAssertNil(upgraded["requestedTargetPath"])
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: artifact.candidateURL.path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: artifact.replacementDirectoryURL.path
+            )
+        )
+        let pending = try XCTUnwrap(
+            CommitRecoveryJournalStore.pendingRecoveries(
+                in: fixture.recoveryDirectory
+            ).first
+        )
+        XCTAssertEqual(pending.terminalState, .cleanupAuthorized)
+        XCTAssertNil(pending.commitGeneration)
+        let sameSessionResult = await reconcileCommit(
+            fixture.request(),
+            in: fixture.recoveryDirectory,
+            acknowledgementHook: { _ in }
+        )
+        XCTAssertEqual(
+            sameSessionResult,
+            .unresolved
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: artifact.journalURL.path
+            )
+        )
+
+        let reopened = SessionRecoveryStore(
+            persistenceDirectory: fixture.recoveryDirectory
+        )
+        _ = try await reopened.start()
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: artifact.journalURL.path
+            )
+        )
+    }
+
+    func testCommitReconciliationMismatchesAndUnboundNewFilesRemainUnresolved()
+        async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let store = SessionRecoveryStore(
+            persistenceDirectory: fixture.recoveryDirectory
+        )
+        _ = try await store.start()
+        let artifact = try fixture.prepareUnswappedJournal()
+
+        let mismatchedGenerationResult = await store.reconcileCommit(
+            fixture.request(
+                commitGeneration: fixture.pendingSave.generation + 1
+            )
+        )
+        XCTAssertEqual(mismatchedGenerationResult, .unresolved)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: artifact.journalURL.path)
+        )
+
+        let newTarget = fixture.directory.appendingPathComponent("new.md")
+        let newSnapshot = DocumentSnapshot(
+            text: "new\n",
+            format: .newDocument
+        )
+        let newPendingSave = PendingSaveToken(
+            generation: 1,
+            sourceRevision: SourceRevision(number: 1, text: "new\n"),
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: newSnapshot
+            ),
+            expectedDurableState: nil,
+            targetURL: newTarget
+        )
+        let newIdentity = DocumentIdentity.make(url: newTarget)
+        let unboundNewFileResult = await store.reconcileCommit(
+            DocumentSyncCommitReconciliationRequest(
+                token: fixture.effectToken(attempt: 3),
+                originalCommitToken: fixture.commitToken,
+                pendingSave: newPendingSave,
+                targetURL: newTarget,
+                identity: newIdentity,
+                attachmentEpoch: 1,
+                expectedBaseline: nil,
+                commitGeneration: 1
+            )
+        )
+        XCTAssertEqual(unboundNewFileResult, .unresolved)
+    }
+
+    func testCurrentPreparedJournalMissingExactBindingFailsClosed() throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let artifact = try fixture.prepareUnswappedJournal()
+        try rewriteCommitJournal(at: artifact.journalURL) { journal in
+            journal.removeValue(forKey: "commitGeneration")
+            journal.removeValue(forKey: "committedPayloadContentDigest")
+            journal.removeValue(forKey: "requestedTargetPath")
+        }
+        let malformedBytes = try Data(contentsOf: artifact.journalURL)
+
+        XCTAssertThrowsError(
+            try CommitRecoveryJournalStore.pendingRecoveries(
+                in: fixture.recoveryDirectory
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? CommitRecoveryJournalStore.JournalError,
+                .malformedJournal
+            )
+        }
+        XCTAssertEqual(
+            try Data(contentsOf: artifact.journalURL),
+            malformedBytes
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: artifact.candidateURL.path)
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: artifact.replacementDirectoryURL.path
+            )
+        )
+    }
+
+    func testCommitReconciliationRequiresEveryExactJournalBindingField()
+        async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let store = SessionRecoveryStore(
+            persistenceDirectory: fixture.recoveryDirectory
+        )
+        _ = try await store.start()
+        let artifact = try fixture.prepareUnswappedJournal()
+        let differentTarget = fixture.directory.appendingPathComponent(
+            "different.md"
+        )
+        let differentIdentity = DocumentIdentity.make(url: differentTarget)
+        let differentPayload = PendingSaveToken(
+            generation: fixture.pendingSave.generation,
+            sourceRevision: SourceRevision(number: 2, text: "other\n"),
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: TextFileCodec.decode(Data("other\n".utf8))
+            ),
+            expectedDurableState: fixture.baseline.asDurableFileState,
+            targetURL: fixture.targetURL
+        )
+        let differentPreimage = Data("different baseline\n".utf8)
+        let differentBaseline = try TextFileCodec.durableBaseline(
+            data: differentPreimage,
+            targetURL: fixture.targetURL,
+            fingerprint: FileFingerprint.make(
+                data: differentPreimage,
+                resourceIdentifier:
+                    fixture.baseline.fingerprint.resourceIdentifier
+            ),
+            documentIdentity: fixture.identity,
+            sourceRevision: fixture.baseline.sourceRevision,
+            commitGeneration: fixture.baseline.commitGeneration
+        )
+        let differentBaselinePendingSave = PendingSaveToken(
+            generation: fixture.pendingSave.generation,
+            sourceRevision: fixture.pendingSave.sourceRevision,
+            preparedPayload: fixture.pendingSave.preparedPayload,
+            expectedDurableState: differentBaseline.asDurableFileState,
+            targetURL: fixture.targetURL
+        )
+
+        let mismatches = [
+            fixture.request(
+                commitGeneration: fixture.pendingSave.generation + 1
+            ),
+            fixture.request(
+                identity: differentIdentity,
+                targetURL: differentTarget
+            ),
+            fixture.request(pendingSave: differentPayload),
+            fixture.request(
+                pendingSave: differentBaselinePendingSave,
+                expectedBaseline: differentBaseline
+            ),
+            fixture.request(
+                token: SyncEffectToken(
+                    lifetime: UUID(),
+                    attachmentEpoch: 1,
+                    operation: .commitReconciliation,
+                    attempt: 2
+                )
+            )
+        ]
+        for request in mismatches {
+            let result = await store.reconcileCommit(request)
+            XCTAssertEqual(result, .unresolved)
+            XCTAssertTrue(
+                FileManager.default.fileExists(
+                    atPath: artifact.journalURL.path
+                )
+            )
+        }
+    }
+
+    func testCommitReconciliationWaitsBehindTheActorWideFIFO() async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let migrationGate = BlockingRecoveryIOGate()
+        let commandRecorder = RecoveryCommandEnqueueRecorder()
+        let store = SessionRecoveryStore(
+            persistenceDirectory: fixture.recoveryDirectory,
+            migrationWriteHook: { writeCount in
+                guard writeCount == 1 else { return }
+                migrationGate.blockUntilReleased()
+            },
+            commandEnqueueHook: { kind in
+                commandRecorder.record(kind)
+            }
+        )
+        defer { migrationGate.release() }
+        _ = try await store.start()
+        _ = try fixture.prepareUnswappedJournal()
+        let source = DocumentIdentity(
+            stableKey: "path:/tmp/reconciliation-fifo-source.md"
+        )
+        let destination = DocumentIdentity(
+            stableKey: "path:/tmp/reconciliation-fifo-destination.md"
+        )
+        let persisted = try await store.add(
+            snapshot: DocumentSnapshot(
+                text: "recovery\n",
+                format: .newDocument
+            ),
+            for: source
+        )
+        let sourceEntry = try XCTUnwrap(persisted.decodedEntries.first)
+        let migration = Task {
+            try await store.moveEntries(
+                from: source,
+                to: destination,
+                expectedRecords: DocumentSyncRecoveryRecords(
+                    decoded: [sourceEntry],
+                    raw: []
+                ),
+                expectedGeneration: persisted.generation
+            )
+        }
+        await migrationGate.waitUntilBlocked()
+
+        let completion = RecoveryTaskCompletionProbe()
+        let reconciliation = Task {
+            defer { completion.markCompleted() }
+            return await store.reconcileCommit(fixture.request())
+        }
+        await commandRecorder.waitForCount(
+            of: .reconcileCommit,
+            atLeast: 1
+        )
+        XCTAssertFalse(completion.isCompleted)
+
+        migrationGate.release()
+        _ = try await migration.value
+        let result = await reconciliation.value
+        guard case .notCommitted = result else {
+            return XCTFail("Expected reconciliation after FIFO migration")
+        }
+    }
+
+    func testCommitReconciliationStartupFailureReturnsUnresolvedAndKeepsJournal()
+        async throws {
+        let fixture = try ReconciliationFixture()
+        defer { fixture.remove() }
+        let artifact = try fixture.prepareUnswappedJournal()
+        try Data("{ malformed migration".utf8).write(
+            to: fixture.recoveryDirectory.appendingPathComponent(
+                "migration.json"
+            )
+        )
+        let store = SessionRecoveryStore(
+            persistenceDirectory: fixture.recoveryDirectory
+        )
+
+        let result = await store.reconcileCommit(fixture.request())
+
+        XCTAssertEqual(result, .unresolved)
+        let status = await store.status()
+        XCTAssertEqual(status, .failed(.malformedData))
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: artifact.journalURL.path)
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: artifact.candidateURL.path)
+        )
+    }
+
     func testStartupImportsExistingRecoveryAndTransitionsFromLoadingToReady()
         async throws {
         let directory = try makeTemporaryDirectory()
@@ -282,6 +1004,181 @@ final class SessionRecoveryStoreAsyncTests: XCTestCase {
             withIntermediateDirectories: true
         )
         return directory
+    }
+}
+
+private enum ReconciliationInjectedError: Error {
+    case afterAtomicSwap
+    case acknowledgementInterrupted
+}
+
+@MainActor
+private func reconcileCommit(
+    _ request: DocumentSyncCommitReconciliationRequest,
+    in recoveryDirectory: URL,
+    acknowledgementHook: @escaping @Sendable (
+        CommitRecoveryAcknowledgementPhase
+    ) throws -> Void
+) async -> DocumentSyncCommitReconciliationResult {
+    do {
+        return try await DocumentFileAccess.perform {
+            try CommitRecoveryJournalStore.reconcileCommit(
+                request,
+                in: recoveryDirectory,
+                acknowledgementHook: acknowledgementHook
+            )
+        }
+    } catch {
+        return .unresolved
+    }
+}
+
+private func rewriteCommitJournal(
+    at url: URL,
+    mutate: (inout [String: Any]) -> Void
+) throws {
+    var journal = try commitJournalObject(at: url)
+    mutate(&journal)
+    let data = try JSONSerialization.data(
+        withJSONObject: journal,
+        options: [.sortedKeys]
+    )
+    try data.write(to: url)
+}
+
+private func commitJournalObject(at url: URL) throws -> [String: Any] {
+    try XCTUnwrap(
+        JSONSerialization.jsonObject(
+            with: Data(contentsOf: url)
+        ) as? [String: Any]
+    )
+}
+
+private struct ReconciliationFixture {
+    let directory: URL
+    let recoveryDirectory: URL
+    let targetURL: URL
+    let original: Data
+    let updated: Data
+    let identity: DocumentIdentity
+    let baseline: DocumentSyncDurableBaseline
+    let pendingSave: PendingSaveToken
+    let commitToken: SyncEffectToken
+
+    init() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        recoveryDirectory = directory.appendingPathComponent(
+            "recovery",
+            isDirectory: true
+        )
+        targetURL = directory.appendingPathComponent("managed.md")
+        original = Data("base\n".utf8)
+        updated = Data("local\n".utf8)
+        identity = DocumentIdentity.make(url: targetURL)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        try original.write(to: targetURL)
+        let sourceRevision = SourceRevision(number: 1, text: "base\n")
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: targetURL,
+            data: original
+        )
+        baseline = try TextFileCodec.durableBaseline(
+            data: original,
+            targetURL: targetURL,
+            fingerprint: fingerprint,
+            documentIdentity: identity,
+            sourceRevision: sourceRevision,
+            commitGeneration: 1
+        )
+        pendingSave = PendingSaveToken(
+            generation: 2,
+            sourceRevision: SourceRevision(number: 2, text: "local\n"),
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: TextFileCodec.decode(updated)
+            ),
+            expectedDurableState: baseline.asDurableFileState,
+            targetURL: targetURL
+        )
+        commitToken = SyncEffectToken(
+            lifetime: UUID(),
+            attachmentEpoch: 1,
+            operation: .saveCommit,
+            attempt: 1
+        )
+    }
+
+    func committer(
+        beforeAtomicSwap: (@Sendable () throws -> Void)? = nil,
+        afterAtomicSwap: (@Sendable () throws -> Void)? = nil
+    ) -> SafeFileCommitter {
+        SafeFileCommitter(
+            recoveryDirectory: recoveryDirectory,
+            beforeAtomicSwap: beforeAtomicSwap,
+            afterAtomicSwap: afterAtomicSwap
+        )
+    }
+
+    func prepareUnswappedJournal() throws -> CommitRecoveryArtifact {
+        let replacementDirectory = directory.appendingPathComponent(
+            "replacement",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: replacementDirectory,
+            withIntermediateDirectories: true
+        )
+        let candidateURL = replacementDirectory.appendingPathComponent(
+            "candidate"
+        )
+        try updated.write(to: candidateURL)
+        return try CommitRecoveryJournalStore.prepare(
+            candidateURL: candidateURL,
+            replacementDirectoryURL: replacementDirectory,
+            targetURL: targetURL,
+            requestedTargetURL: targetURL,
+            documentIdentity: identity,
+            commitGeneration: pendingSave.generation,
+            expectedPreimageFingerprint: baseline.fingerprint,
+            committedPayloadFingerprint: pendingSave.contentFingerprint,
+            recoveryDirectory: recoveryDirectory
+        )
+    }
+
+    func request(
+        identity requestedIdentity: DocumentIdentity? = nil,
+        targetURL requestedTargetURL: URL? = nil,
+        commitGeneration: UInt64? = nil,
+        pendingSave requestedPendingSave: PendingSaveToken? = nil,
+        expectedBaseline requestedBaseline: DocumentSyncDurableBaseline? = nil,
+        token requestedToken: SyncEffectToken? = nil
+    ) -> DocumentSyncCommitReconciliationRequest {
+        DocumentSyncCommitReconciliationRequest(
+            token: requestedToken ?? effectToken(attempt: 2),
+            originalCommitToken: commitToken,
+            pendingSave: requestedPendingSave ?? pendingSave,
+            targetURL: requestedTargetURL ?? targetURL,
+            identity: requestedIdentity ?? identity,
+            attachmentEpoch: 1,
+            expectedBaseline: requestedBaseline ?? baseline,
+            commitGeneration: commitGeneration ?? pendingSave.generation
+        )
+    }
+
+    func effectToken(attempt: UInt64) -> SyncEffectToken {
+        SyncEffectToken(
+            lifetime: commitToken.lifetime,
+            attachmentEpoch: 1,
+            operation: .commitReconciliation,
+            attempt: attempt
+        )
+    }
+
+    func remove() {
+        try? FileManager.default.removeItem(at: directory)
     }
 }
 

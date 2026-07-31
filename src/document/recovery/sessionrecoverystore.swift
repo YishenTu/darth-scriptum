@@ -68,6 +68,7 @@ enum SessionRecoveryStoreCommandKind: Sendable, Equatable {
     case migrate
     case discard
     case reconcile
+    case reconcileCommit
 }
 
 /// Test-observable fault boundaries around the durable acknowledgement that
@@ -604,6 +605,22 @@ actor SessionRecoveryStore {
         try await enqueueReconciliation(intent)
     }
 
+    /// Reconciles one uncertain commit through the recovery owner's FIFO.
+    /// The result is authoritative only when the bound durable journal proves
+    /// the request's exact commit identity and irreversible swap state.
+    func reconcileCommit(
+        _ request: DocumentSyncCommitReconciliationRequest
+    ) async -> DocumentSyncCommitReconciliationResult {
+        if case .failed = startupStatus {
+            return .unresolved
+        }
+        return await withCheckedContinuation { continuation in
+            enqueueStartupForPendingMutationIfNeeded()
+            appendCommand(.reconcileCommit(request, continuation))
+            beginDrainUnlessStartupFailed()
+        }
+    }
+
     private enum Command {
         case startup(CheckedContinuation<SessionRecoveryStoreSnapshot, Error>?)
         case waitForStartup(CheckedContinuation<SessionRecoveryStoreSnapshot, Error>)
@@ -631,6 +648,10 @@ actor SessionRecoveryStore {
             DocumentSyncRecoveryReconciliationIntent,
             CheckedContinuation<SessionRecoveryStoreReconciliationReceipt, Error>
         )
+        case reconcileCommit(
+            DocumentSyncCommitReconciliationRequest,
+            CheckedContinuation<DocumentSyncCommitReconciliationResult, Never>
+        )
 
         var kind: SessionRecoveryStoreCommandKind {
             switch self {
@@ -650,6 +671,8 @@ actor SessionRecoveryStore {
                 .discard
             case .reconcile:
                 .reconcile
+            case .reconcileCommit:
+                .reconcileCommit
             }
         }
     }
@@ -769,6 +792,14 @@ actor SessionRecoveryStore {
                 await resume(continuation) {
                     try await self.reconcileFromDisk(intent)
                 }
+            case .reconcileCommit(let request, let continuation):
+                do {
+                    continuation.resume(
+                        returning: try await reconcileCommitFromDisk(request)
+                    )
+                } catch {
+                    continuation.resume(returning: .unresolved)
+                }
             }
         }
         isDraining = false
@@ -795,6 +826,8 @@ actor SessionRecoveryStore {
                 continuation.resume(throwing: issue)
             case .startup(let continuation):
                 continuation?.resume(throwing: issue)
+            case .reconcileCommit(_, let continuation):
+                continuation.resume(returning: .unresolved)
             case .persistSnapshot, .persistRaw, .migrate, .discard, .reconcile:
                 retained.append(command)
             }
@@ -1261,6 +1294,21 @@ actor SessionRecoveryStore {
             for: intent,
             acknowledgedArtifact: acknowledgedArtifact
         )
+    }
+
+    private func reconcileCommitFromDisk(
+        _ request: DocumentSyncCommitReconciliationRequest
+    ) async throws -> DocumentSyncCommitReconciliationResult {
+        try requireReady()
+        guard let persistenceDirectory else {
+            return .unresolved
+        }
+        return try await DocumentFileAccess.perform {
+            try CommitRecoveryJournalStore.reconcileCommit(
+                request,
+                in: persistenceDirectory
+            )
+        }
     }
 
     /// A failed migration or deletion can leave its journal and partially

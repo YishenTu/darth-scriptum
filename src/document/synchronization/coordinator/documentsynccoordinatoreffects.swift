@@ -43,6 +43,12 @@ protocol DocumentSyncCoordinatorEffectExecuting: AnyObject {
 @MainActor
 final class DocumentSyncDefaultEffectExecutor:
     DocumentSyncCoordinatorEffectExecuting {
+    private let recoveryStore: SessionRecoveryStore
+
+    init(recoveryStore: SessionRecoveryStore) {
+        self.recoveryStore = recoveryStore
+    }
+
     func prepareSave(
         _ request: DocumentSyncSavePreparationRequest,
         completion: @escaping @MainActor (DocumentSyncSavePreparationExecution) -> Void
@@ -91,14 +97,7 @@ final class DocumentSyncDefaultEffectExecutor:
         completion: @escaping @MainActor (DocumentSyncCommitReconciliationResult) -> Void
     ) {
         Task {
-            let result: DocumentSyncCommitReconciliationResult
-            do {
-                result = try await DocumentFileAccess.perform {
-                    Self.reconcileCommit(request)
-                }
-            } catch {
-                result = .unresolved
-            }
+            let result = await recoveryStore.reconcileCommit(request)
             completion(result)
         }
     }
@@ -166,43 +165,4 @@ final class DocumentSyncDefaultEffectExecutor:
         }
     }
 
-    private nonisolated static func reconcileCommit(
-        _ request: DocumentSyncCommitReconciliationRequest
-    ) -> DocumentSyncCommitReconciliationResult {
-        do {
-            let data = try Data(
-                contentsOf: request.targetURL,
-                options: [.mappedIfSafe]
-            )
-            let fingerprint = try SafeFileCommitter.fingerprint(
-                for: request.targetURL,
-                data: data
-            )
-            guard fingerprint.contentDigest
-                    == request.pendingSave.contentFingerprint.contentDigest,
-                  fingerprint.byteCount
-                    == request.pendingSave.contentFingerprint.byteCount else {
-                return .notCommitted(
-                    try TextFileCodec.externalReadObservation(
-                        data: data,
-                        targetURL: request.targetURL,
-                        identity: request.identity,
-                        fingerprint: fingerprint
-                    )
-                )
-            }
-
-            // A recovered byte match proves only the payload. The legacy
-            // committer does not retain sufficient immutable evidence to
-            // recreate an authoritative FileCommitResult safety receipt.
-            // P1 supplies that durable reconciliation boundary.
-            return .unresolved
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return request.expectedBaseline == nil
-                ? .notCommitted(nil)
-                : .unresolved
-        } catch {
-            return .unresolved
-        }
-    }
 }

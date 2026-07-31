@@ -528,20 +528,9 @@ extension DocumentSyncReducer {
                 scheduledToken: nil
             )
         )
-        let cleanupTarget: DocumentSyncRecoveryDiscardTarget
-        if records.raw.isEmpty {
-            cleanupTarget = .decoded(entry)
-        } else {
-            cleanupTarget = .selected(
-                DocumentSyncRecoveryRecords(
-                    decoded: [entry],
-                    raw: records.raw
-                )
-            )
-        }
         updated.recoveryCleanup = DocumentSyncRecoveryCleanup(
             records: records,
-            target: cleanupTarget,
+            target: .decoded(entry),
             minimumSourceRevision: updated.source
         )
         updated.issue = nil

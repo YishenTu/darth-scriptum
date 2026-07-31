@@ -56,6 +56,173 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         )
     }
 
+    func testInitialAttachmentObservesCurrentTargetBeforeStartingALocalSave()
+        async throws {
+        let fixture = try TemporaryMarkdownFile(contents: "alpha\nbeta\n")
+        defer { fixture.remove() }
+        let capturedData = Data("alpha\nbeta\n".utf8)
+        let capturedSnapshot = try TextFileCodec.decode(capturedData)
+        let inspectionGate = BlockingRecoveryIOGate()
+        let blockedFileAccess = Task {
+            try await DocumentFileAccess.perform {
+                inspectionGate.blockUntilReleased()
+            }
+        }
+        await inspectionGate.waitUntilBlocked()
+
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: DocumentSnapshot(text: "", format: .newDocument),
+            recoveryStore: SessionRecoveryStore(),
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler
+        )
+        defer {
+            inspectionGate.release()
+            coordinator.close()
+        }
+        coordinator.loadInitial(
+            capturedSnapshot,
+            data: capturedData,
+            from: fixture.url
+        )
+
+        let externalData = Data("ALPHA\nbeta\n".utf8)
+        try externalData.write(to: fixture.url)
+        inspectionGate.release()
+        try await blockedFileAccess.value
+        await assertInitialAttachment(coordinator)
+        _ = await coordinator.waitForRecoveryStartup()
+
+        guard case .debouncing = coordinator.reducerState.external else {
+            return XCTFail(
+                "Fresh initial target bytes must be queued before local saving."
+            )
+        }
+        XCTAssertEqual(coordinator.currentSnapshot, capturedSnapshot)
+        XCTAssertEqual(
+            coordinator.durableState?.snapshot,
+            capturedSnapshot
+        )
+
+        coordinator.sourceBuffer.replace(
+            with: "alpha\nBETA\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        coordinator.advanceScheduledWork(by: .milliseconds(100))
+
+        XCTAssertTrue(executor.savePreparationRequests.isEmpty)
+        XCTAssertTrue(executor.externalReadRequests.isEmpty)
+        let merge = try XCTUnwrap(executor.mergeRequests.last)
+        XCTAssertEqual(merge.base, capturedSnapshot)
+        XCTAssertEqual(merge.local.text, "alpha\nBETA\n")
+        XCTAssertEqual(merge.external.text, "ALPHA\nbeta\n")
+        XCTAssertTrue(
+            executor.finishMerge(
+                merge.token,
+                with: .finished(ThreeWayTextMerger().result(for: merge))
+            )
+        )
+
+        XCTAssertEqual(coordinator.currentSnapshot.text, "ALPHA\nBETA\n")
+        XCTAssertEqual(
+            coordinator.durableState?.snapshot.text,
+            "ALPHA\nbeta\n"
+        )
+        XCTAssertEqual(
+            coordinator.reducerState.fileAttachment?.identity,
+            DocumentIdentity.make(url: fixture.url)
+        )
+        XCTAssertEqual(
+            coordinator.durableState?.fingerprint.contentDigest,
+            FileFingerprint.make(data: externalData).contentDigest
+        )
+        XCTAssertTrue(executor.savePreparationRequests.isEmpty)
+
+        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        let preparation = try XCTUnwrap(executor.savePreparationRequests.last)
+        XCTAssertEqual(preparation.snapshot.text, "ALPHA\nBETA\n")
+        XCTAssertEqual(
+            preparation.expectedBaseline?.snapshot.text,
+            "ALPHA\nbeta\n"
+        )
+    }
+
+    func testInitialAttachmentReplaysPresenterSignalAfterFreshReadBeforeMonitor()
+        async throws {
+        let fixture = try TemporaryMarkdownFile(contents: "captured\n")
+        defer { fixture.remove() }
+        let capturedData = Data("captured\n".utf8)
+        let capturedSnapshot = try TextFileCodec.decode(capturedData)
+        let externalData = Data("external\n".utf8)
+        let scheduler = ManualSyncScheduler()
+        let executor = ControllableCoordinatorEffectExecutor()
+        weak var weakCoordinator: DocumentSyncCoordinator?
+        var freshReadCompletionCount = 0
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: DocumentSnapshot(text: "", format: .newDocument),
+            recoveryStore: SessionRecoveryStore(),
+            fileMonitoringEnabled: false,
+            effectExecutor: executor,
+            manualScheduler: scheduler,
+            initialAttachmentFreshReadCompletedHook: {
+                freshReadCompletionCount += 1
+                do {
+                    try externalData.write(to: fixture.url)
+                } catch {
+                    XCTFail("The external write failed: \(error)")
+                }
+                weakCoordinator?.noteCoordinatedExternalChange()
+            }
+        )
+        weakCoordinator = coordinator
+        defer { coordinator.close() }
+
+        coordinator.loadInitial(
+            capturedSnapshot,
+            data: capturedData,
+            from: fixture.url
+        )
+        await assertInitialAttachment(coordinator)
+        _ = await coordinator.waitForRecoveryStartup()
+
+        XCTAssertEqual(freshReadCompletionCount, 1)
+        XCTAssertEqual(coordinator.currentSnapshot, capturedSnapshot)
+        guard case .debouncing = coordinator.reducerState.external else {
+            return XCTFail(
+                "The pre-monitor presenter signal must schedule a fresh read."
+            )
+        }
+        XCTAssertTrue(executor.externalReadRequests.isEmpty)
+
+        coordinator.advanceScheduledWork(by: .milliseconds(0))
+        let read = try XCTUnwrap(executor.externalReadRequests.last)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: fixture.url,
+            data: externalData
+        )
+        let change = try TextFileCodec.decodeExternalChange(
+            data: externalData,
+            targetURL: fixture.url,
+            identity: DocumentIdentity.make(url: fixture.url),
+            fingerprint: fingerprint
+        )
+        XCTAssertTrue(
+            executor.finishExternalRead(
+                read.token,
+                with: .finished(.changed(change))
+            )
+        )
+
+        XCTAssertEqual(coordinator.currentSnapshot.text, "external\n")
+        XCTAssertEqual(
+            coordinator.durableState?.fingerprint.contentDigest,
+            FileFingerprint.make(data: externalData).contentDigest
+        )
+    }
+
     func testDocumentReadSerializesLoadedSnapshotBeforeAttachmentVerification()
         throws {
         let fixture = try TemporaryMarkdownFile(contents: "placeholder\n")
@@ -315,6 +482,127 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(
             fixture.host.closeResolutions.last?.disposition,
             .allowManagedClose
+        )
+    }
+
+    func testDefaultExecutorReconcilesPostSwapFailureAndAllowsManagedClose()
+        async throws {
+        let fixture = try TemporaryMarkdownFile(contents: "base\n")
+        defer { fixture.remove() }
+        let recoveryDirectory = fixture.directory.appendingPathComponent(
+            "recovery",
+            isDirectory: true
+        )
+        let recoveryStore = SessionRecoveryStore(
+            persistenceDirectory: recoveryDirectory
+        )
+        let scheduler = ManualSyncScheduler()
+        let initialData = Data("base\n".utf8)
+        let initialSnapshot = try TextFileCodec.decode(initialData)
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: DocumentSnapshot(text: "", format: .newDocument),
+            recoveryStore: recoveryStore,
+            fileMonitoringEnabled: false,
+            manualScheduler: scheduler
+        )
+        defer { coordinator.close() }
+        let host = AwaitingCoordinatorTestHost(fileURL: fixture.url)
+        coordinator.delegate = host
+        coordinator.loadInitial(
+            initialSnapshot,
+            data: initialData,
+            from: fixture.url
+        )
+        await assertInitialAttachment(coordinator)
+        guard case .ready = await coordinator.waitForRecoveryStartup() else {
+            return XCTFail("Recovery must be ready before the commit fault.")
+        }
+
+        coordinator.sourceBuffer.replace(
+            with: "local\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        coordinator.requestClose()
+        coordinator.advanceScheduledWork(by: .seconds(1))
+        let request = await host.nextSaveRequest()
+
+        let injectedError: Error
+        do {
+            _ = try await DocumentFileAccess.perform {
+                try SafeFileCommitter(
+                    recoveryDirectory: recoveryDirectory,
+                    afterAtomicSwap: {
+                        throw CoordinatorPostSwapError.injected
+                    }
+                ).commit(request.pendingSave)
+            }
+            return XCTFail("The post-swap fault must interrupt completion.")
+        } catch {
+            injectedError = error
+        }
+        XCTAssertEqual(try Data(contentsOf: fixture.url), Data("local\n".utf8))
+        let duplicateReplacementDirectory =
+            fixture.directory.appendingPathComponent(
+                "duplicate-replacement",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: duplicateReplacementDirectory,
+            withIntermediateDirectories: true
+        )
+        let duplicateCandidate = duplicateReplacementDirectory
+            .appendingPathComponent("candidate")
+        try request.pendingSave.encodedData.write(to: duplicateCandidate)
+        let duplicateArtifact = try CommitRecoveryJournalStore.prepare(
+            candidateURL: duplicateCandidate,
+            replacementDirectoryURL: duplicateReplacementDirectory,
+            targetURL: request.targetURL.resolvingSymlinksInPath(),
+            requestedTargetURL: request.targetURL,
+            documentIdentity: request.identity,
+            commitGeneration: request.commitGeneration,
+            expectedPreimageFingerprint: try XCTUnwrap(
+                request.expectedBaseline
+            ).fingerprint,
+            committedPayloadFingerprint:
+                request.pendingSave.contentFingerprint,
+            recoveryDirectory: recoveryDirectory
+        )
+        XCTAssertFalse(
+            coordinator.handleSaveCompletion(
+                token: request.token,
+                error: injectedError
+            )
+        )
+        let refused = await host.nextCloseResolution()
+        XCTAssertEqual(refused.disposition, .refuseManagedClose)
+
+        await coordinator.waitForCurrentCommitReconciliation()
+        XCTAssertNotNil(coordinator.reducerState.uncertainCommit)
+        XCTAssertEqual(coordinator.presentedState, .synchronizationPaused)
+
+        try CommitRecoveryJournalStore.acknowledge(duplicateArtifact)
+        coordinator.retrySynchronization()
+        await coordinator.waitForCurrentCommitReconciliation()
+        XCTAssertNil(coordinator.reducerState.uncertainCommit)
+        XCTAssertNil(coordinator.presentedState)
+        XCTAssertFalse(coordinator.hasLocalChanges)
+        XCTAssertEqual(
+            coordinator.durableState?.snapshot.text,
+            "local\n"
+        )
+        coordinator.requestClose()
+        let resolution = await host.nextCloseResolution()
+
+        XCTAssertEqual(resolution.disposition, .allowManagedClose)
+        XCTAssertEqual(coordinator.state, .idle)
+        XCTAssertEqual(
+            try Data(contentsOf: fixture.url),
+            Data("local\n".utf8)
+        )
+        XCTAssertTrue(
+            try CommitRecoveryJournalStore.pendingRecoveries(
+                in: recoveryDirectory
+            ).isEmpty
         )
     }
 
@@ -894,6 +1182,52 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             // Expected.
         } else {
             XCTFail("The unsupported destination should remain failed.")
+        }
+    }
+
+    func testFailedAtomicSwapIsProvenNotStartedWithoutReconciliation()
+        async throws {
+        let fixture = try TemporaryMarkdownFile(contents: "base\n")
+        defer { fixture.remove() }
+        let originalData = Data("base\n".utf8)
+        let snapshot = try TextFileCodec.decode(originalData)
+        let harness = DeterministicCoordinatorFixture(
+            snapshot: snapshot,
+            data: originalData,
+            url: fixture.url
+        )
+        defer { harness.coordinator.close() }
+        await assertInitialAttachment(harness)
+
+        harness.coordinator.sourceBuffer.replace(
+            with: "local\n",
+            origin: .localEditor(paneID: UUID())
+        )
+        harness.fireLocalSave()
+        let preparation = try XCTUnwrap(
+            harness.executor.savePreparationRequests.last
+        )
+        XCTAssertTrue(
+            harness.executor.finishSavePreparation(
+                preparation.token,
+                with: .prepared(try makePendingSave(from: preparation))
+            )
+        )
+        let request = try XCTUnwrap(harness.host.saveRequests.last)
+
+        _ = harness.coordinator.handleSaveCompletion(
+            token: request.token,
+            error: SafeFileCommitter.CommitError.atomicSwapFailed
+        )
+
+        XCTAssertNil(harness.coordinator.reducerState.uncertainCommit)
+        XCTAssertTrue(harness.executor.reconciliationRequests.isEmpty)
+        XCTAssertFalse(harness.coordinator.failureRequiresSaveAs)
+        XCTAssertTrue(harness.coordinator.hasLocalChanges)
+        if case .failed = harness.coordinator.presentedState {
+            // Expected.
+        } else {
+            XCTFail("The proven failed swap should surface a local-save issue.")
         }
     }
 
@@ -2652,6 +2986,75 @@ private final class TypedCoordinatorTestHost: DocumentSyncCoordinatorHost {
         hasLocalChanges: Bool
     ) {
         acceptedExternalChangeCount += 1
+    }
+}
+
+private enum CoordinatorPostSwapError: Error {
+    case injected
+}
+
+@MainActor
+private final class AwaitingCoordinatorTestHost: DocumentSyncCoordinatorHost {
+    let synchronizationFileURL: URL?
+    private var queuedSaveRequests: [DocumentSyncSaveCommitRequest] = []
+    private var saveWaiters: [
+        CheckedContinuation<DocumentSyncSaveCommitRequest, Never>
+    ] = []
+    private var queuedCloseResolutions: [DocumentSyncCloseResolution] = []
+    private var closeWaiters: [
+        CheckedContinuation<DocumentSyncCloseResolution, Never>
+    ] = []
+
+    init(fileURL: URL?) {
+        synchronizationFileURL = fileURL
+    }
+
+    func syncCoordinator(
+        _ coordinator: DocumentSyncCoordinator,
+        requestSave request: DocumentSyncSaveCommitRequest
+    ) {
+        if let waiter = saveWaiters.first {
+            saveWaiters.removeFirst()
+            waiter.resume(returning: request)
+        } else {
+            queuedSaveRequests.append(request)
+        }
+    }
+
+    func syncCoordinator(
+        _ coordinator: DocumentSyncCoordinator,
+        resolveClose resolution: DocumentSyncCloseResolution
+    ) {
+        if let waiter = closeWaiters.first {
+            closeWaiters.removeFirst()
+            waiter.resume(returning: resolution)
+        } else {
+            queuedCloseResolutions.append(resolution)
+        }
+    }
+
+    func syncCoordinator(
+        _ coordinator: DocumentSyncCoordinator,
+        acceptedExternalFileAt url: URL,
+        hasLocalChanges: Bool
+    ) {}
+
+    func nextSaveRequest() async -> DocumentSyncSaveCommitRequest {
+        if !queuedSaveRequests.isEmpty {
+            return queuedSaveRequests.removeFirst()
+        }
+        return await withCheckedContinuation { continuation in
+            saveWaiters.append(continuation)
+        }
+    }
+
+    func nextCloseResolution() async -> DocumentSyncCloseResolution {
+        if !queuedCloseResolutions.isEmpty {
+            return queuedCloseResolutions.removeFirst()
+        }
+        return await withCheckedContinuation { continuation in
+            closeWaiters.append(continuation)
+        }
     }
 }
 

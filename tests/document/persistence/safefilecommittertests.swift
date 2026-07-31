@@ -3,6 +3,122 @@ import XCTest
 @testable import DarthScriptum
 
 final class SafeFileCommitterTests: XCTestCase {
+    func testPostSwapFailureLeavesBoundJournalForAuthoritativeReconciliation()
+        throws {
+        let fixture = try CommitFixture(original: "base\n")
+        defer { fixture.remove() }
+        let recoveryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: recoveryDirectory) }
+        let token = try fixture.token(updated: "local\n")
+
+        XCTAssertThrowsError(
+            try SafeFileCommitter(
+                recoveryDirectory: recoveryDirectory,
+                afterAtomicSwap: {
+                    throw InjectedCommitError.afterAtomicSwap
+                }
+            ).commit(token)
+        ) { error in
+            XCTAssertEqual(error as? InjectedCommitError, .afterAtomicSwap)
+        }
+
+        XCTAssertEqual(
+            try Data(contentsOf: fixture.url),
+            Data("local\n".utf8)
+        )
+        let pending = try XCTUnwrap(
+            CommitRecoveryJournalStore.pendingRecoveries(
+                in: recoveryDirectory
+            ).only
+        )
+        defer {
+            try? CommitRecoveryJournalStore.acknowledge(pending.artifact)
+        }
+        XCTAssertTrue(pending.swapCompleted)
+        XCTAssertEqual(pending.commitGeneration, token.generation)
+        XCTAssertEqual(
+            pending.artifact.binding?.documentIdentity,
+            .make(url: fixture.url)
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: pending.artifact.journalURL.path
+            )
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: pending.artifact.candidateURL.path
+            )
+        )
+    }
+
+    func testPostSwapJournalBindsTheRequestedSymlinkTarget() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let recoveryDirectory = directory.appendingPathComponent(
+            "recovery",
+            isDirectory: true
+        )
+        let referent = directory.appendingPathComponent("referent.md")
+        let link = directory.appendingPathComponent("linked.md")
+        let original = Data("base\n".utf8)
+        let updated = Data("local\n".utf8)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        try original.write(to: referent)
+        try FileManager.default.createSymbolicLink(
+            at: link,
+            withDestinationURL: referent
+        )
+        let token = PendingSaveToken(
+            generation: 2,
+            sourceRevision: SourceRevision(number: 2, text: "local\n"),
+            preparedPayload: try TextFileCodec.prepareSavePayload(
+                for: TextFileCodec.decode(updated)
+            ),
+            expectedDurableState: DurableFileState(
+                snapshot: try TextFileCodec.decode(original),
+                fingerprint: try SafeFileCommitter.fingerprint(
+                    for: link,
+                    data: original
+                ),
+                generation: 1
+            ),
+            targetURL: link
+        )
+
+        XCTAssertThrowsError(
+            try SafeFileCommitter(
+                recoveryDirectory: recoveryDirectory,
+                afterAtomicSwap: {
+                    throw InjectedCommitError.afterAtomicSwap
+                }
+            ).commit(token)
+        )
+
+        let pending = try XCTUnwrap(
+            CommitRecoveryJournalStore.pendingRecoveries(
+                in: recoveryDirectory
+            ).only
+        )
+        defer {
+            try? CommitRecoveryJournalStore.acknowledge(pending.artifact)
+        }
+        XCTAssertEqual(
+            pending.artifact.binding?.targetURL.standardizedFileURL,
+            link.standardizedFileURL
+        )
+        XCTAssertNotEqual(
+            pending.artifact.binding?.targetURL.standardizedFileURL,
+            referent.standardizedFileURL
+        )
+        XCTAssertEqual(pending.swapEvidence, .targetOwnsPreparedCandidate)
+    }
+
     func testCommitPreservesExactPreimageAndReplacesContents() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -81,6 +197,120 @@ final class SafeFileCommitterTests: XCTestCase {
         XCTAssertEqual(
             try String(contentsOf: fixture.url, encoding: .utf8),
             "base\n"
+        )
+    }
+
+    func testFailedSwapAcknowledgementFailureRetainsRetryableJournal()
+        throws {
+        let fixture = try CommitFixture(original: "base\n")
+        defer { fixture.remove() }
+        let recoveryDirectory = fixture.directory.appendingPathComponent(
+            "recovery",
+            isDirectory: true
+        )
+        let pendingSave = try fixture.token(updated: "local\n")
+
+        XCTAssertThrowsError(
+            try SafeFileCommitter(
+                strategy: .coordinatedReplacementOnly,
+                recoveryDirectory: recoveryDirectory,
+                beforeRecoveryAcknowledgement: {
+                    throw InjectedCommitError.beforeRecoveryAcknowledgement
+                }
+            ).commit(pendingSave)
+        ) { error in
+            XCTAssertEqual(
+                error as? InjectedCommitError,
+                .beforeRecoveryAcknowledgement
+            )
+        }
+
+        XCTAssertEqual(try Data(contentsOf: fixture.url), fixture.original)
+        let pending = try XCTUnwrap(
+            CommitRecoveryJournalStore.pendingRecoveries(
+                in: recoveryDirectory
+            ).only
+        )
+        XCTAssertEqual(pending.terminalState, .prepared)
+        XCTAssertEqual(pending.swapEvidence, .preparedCandidateRemains)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: pending.artifact.journalURL.path
+            )
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: pending.artifact.candidateURL.path
+            )
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: pending.artifact.replacementDirectoryURL.path
+            )
+        )
+
+        let reconciliation = try CommitRecoveryJournalStore.reconcileCommit(
+            fixture.reconciliationRequest(for: pendingSave),
+            in: recoveryDirectory
+        )
+
+        guard case .notCommitted(let observation) = reconciliation else {
+            return XCTFail("Expected exact retained evidence to prove no swap")
+        }
+        XCTAssertEqual(
+            observation?.fingerprint,
+            pendingSave.expectedDurableState?.fingerprint
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: pending.artifact.journalURL.path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: pending.artifact.replacementDirectoryURL.path
+            )
+        )
+    }
+
+    func testUnclassifiedFailedSwapThrowsTypedNotStartedError() throws {
+        let fixture = try CommitFixture(original: "base\n")
+        defer { fixture.remove() }
+        let recoveryDirectory = fixture.directory.appendingPathComponent(
+            "recovery",
+            isDirectory: true
+        )
+
+        XCTAssertThrowsError(
+            try SafeFileCommitter(
+                recoveryDirectory: recoveryDirectory,
+                beforeAtomicSwap: {
+                    let pending = try XCTUnwrap(
+                        CommitRecoveryJournalStore.pendingRecoveries(
+                            in: recoveryDirectory
+                        ).only
+                    )
+                    try FileManager.default.removeItem(
+                        at: pending.artifact.candidateURL
+                    )
+                }
+            ).commit(fixture.token(updated: "local\n"))
+        ) { error in
+            XCTAssertEqual(
+                error as? SafeFileCommitter.CommitError,
+                .atomicSwapFailed
+            )
+            XCTAssertEqual(
+                error.localizedDescription,
+                "The atomic file replacement failed before changing the destination."
+            )
+        }
+
+        XCTAssertEqual(try Data(contentsOf: fixture.url), fixture.original)
+        XCTAssertTrue(
+            try CommitRecoveryJournalStore.pendingRecoveries(
+                in: recoveryDirectory
+            ).isEmpty
         )
     }
 
@@ -311,7 +541,9 @@ final class SafeFileCommitterTests: XCTestCase {
             candidateURL: candidateURL,
             replacementDirectoryURL: replacementDirectory,
             targetURL: fixture.url,
+            requestedTargetURL: fixture.url,
             documentIdentity: .make(url: fixture.url),
+            commitGeneration: 2,
             expectedPreimageFingerprint: try SafeFileCommitter.fingerprint(
                 for: fixture.url,
                 data: fixture.original
@@ -366,7 +598,9 @@ final class SafeFileCommitterTests: XCTestCase {
             candidateURL: candidateURL,
             replacementDirectoryURL: replacementDirectory,
             targetURL: fixture.url,
+            requestedTargetURL: fixture.url,
             documentIdentity: .make(url: fixture.url),
+            commitGeneration: 2,
             expectedPreimageFingerprint: try SafeFileCommitter.fingerprint(
                 for: fixture.url,
                 data: fixture.original
@@ -401,6 +635,17 @@ final class SafeFileCommitterTests: XCTestCase {
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: artifact.journalURL.path)
         )
+    }
+}
+
+private enum InjectedCommitError: Error, Equatable {
+    case afterAtomicSwap
+    case beforeRecoveryAcknowledgement
+}
+
+private extension Array {
+    var only: Element? {
+        count == 1 ? self[0] : nil
     }
 }
 
@@ -439,6 +684,49 @@ private struct CommitFixture {
             ),
             expectedDurableState: state,
             targetURL: url
+        )
+    }
+
+    func reconciliationRequest(
+        for pendingSave: PendingSaveToken
+    ) throws -> DocumentSyncCommitReconciliationRequest {
+        let identity = DocumentIdentity.make(url: url)
+        let fingerprint = try SafeFileCommitter.fingerprint(
+            for: url,
+            data: original
+        )
+        let originalSnapshot = try TextFileCodec.decode(original)
+        let baseline = try TextFileCodec.durableBaseline(
+            data: original,
+            targetURL: url,
+            fingerprint: fingerprint,
+            documentIdentity: identity,
+            sourceRevision: SourceRevision(
+                number: 1,
+                text: originalSnapshot.text
+            ),
+            commitGeneration: 1
+        )
+        let lifetime = UUID()
+        return DocumentSyncCommitReconciliationRequest(
+            token: SyncEffectToken(
+                lifetime: lifetime,
+                attachmentEpoch: 1,
+                operation: .commitReconciliation,
+                attempt: 2
+            ),
+            originalCommitToken: SyncEffectToken(
+                lifetime: lifetime,
+                attachmentEpoch: 1,
+                operation: .saveCommit,
+                attempt: 1
+            ),
+            pendingSave: pendingSave,
+            targetURL: url,
+            identity: identity,
+            attachmentEpoch: 1,
+            expectedBaseline: baseline,
+            commitGeneration: pendingSave.generation
         )
     }
 

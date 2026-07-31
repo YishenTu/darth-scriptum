@@ -10,6 +10,7 @@ struct SafeFileCommitter: Sendable {
     enum CommitError: LocalizedError, Equatable {
         case invalidPreparedPayload
         case atomicSwapUnavailable
+        case atomicSwapFailed
         case targetChangedBeforeCommit
         case targetMissingBeforeCommit
 
@@ -19,6 +20,8 @@ struct SafeFileCommitter: Sendable {
                 "The prepared save payload does not match its captured snapshot."
             case .atomicSwapUnavailable:
                 "This filesystem cannot safely replace the file in place. Use Save As to write a new file."
+            case .atomicSwapFailed:
+                "The atomic file replacement failed before changing the destination."
             case .targetChangedBeforeCommit:
                 "The file changed while DarthScriptum was preparing to save it."
             case .targetMissingBeforeCommit:
@@ -30,16 +33,25 @@ struct SafeFileCommitter: Sendable {
     private let strategy: Strategy
     private let recoveryDirectory: URL
     private let beforeAtomicSwap: (@Sendable () throws -> Void)?
+    private let afterAtomicSwap: (@Sendable () throws -> Void)?
+    private let beforeRecoveryAcknowledgement:
+        (@Sendable () throws -> Void)?
 
     init(
         strategy: Strategy = .automatic,
         recoveryDirectory: URL =
             CommitRecoveryJournalStore.defaultRecoveryDirectory,
-        beforeAtomicSwap: (@Sendable () throws -> Void)? = nil
+        beforeAtomicSwap: (@Sendable () throws -> Void)? = nil,
+        afterAtomicSwap: (@Sendable () throws -> Void)? = nil,
+        beforeRecoveryAcknowledgement:
+            (@Sendable () throws -> Void)? = nil
     ) {
         self.strategy = strategy
         self.recoveryDirectory = recoveryDirectory
         self.beforeAtomicSwap = beforeAtomicSwap
+        self.afterAtomicSwap = afterAtomicSwap
+        self.beforeRecoveryAcknowledgement =
+            beforeRecoveryAcknowledgement
     }
 
     func commit(_ token: PendingSaveToken) throws -> FileCommitResult {
@@ -123,11 +135,17 @@ struct SafeFileCommitter: Sendable {
             candidateURL: candidateURL,
             replacementDirectoryURL: replacementDirectory,
             targetURL: targetURL,
+            requestedTargetURL: requestedTargetURL,
             documentIdentity: .make(url: requestedTargetURL),
+            commitGeneration: token.generation,
             expectedPreimageFingerprint: expectedPreimageFingerprint,
             committedPayloadFingerprint: token.contentFingerprint,
             recoveryDirectory: recoveryDirectory
         )
+        // Once the prepared journal exists, its candidate must remain owned
+        // until durable acknowledgement completes. Any intervening failure is
+        // an uncertain commit that reconciliation must still be able to prove.
+        retainedRecoveryArtifact = preparedRecoveryArtifact
         try beforeAtomicSwap?()
 
         let swapResult: Int32
@@ -150,7 +168,7 @@ struct SafeFileCommitter: Sendable {
         }
 
         if swapResult == 0 {
-            retainedRecoveryArtifact = preparedRecoveryArtifact
+            try afterAtomicSwap?()
             try DurableFileIO.synchronizeDirectory(
                 targetURL.deletingLastPathComponent()
             )
@@ -169,9 +187,7 @@ struct SafeFileCommitter: Sendable {
                 displacedFingerprint.contentDigest
                     != expectedPreimageFingerprint.contentDigest
             if !hasUnexpectedPreimage {
-                try CommitRecoveryJournalStore.acknowledge(
-                    preparedRecoveryArtifact
-                )
+                try acknowledge(preparedRecoveryArtifact)
                 retainedRecoveryArtifact = nil
             }
             return FileCommitResult(
@@ -187,13 +203,21 @@ struct SafeFileCommitter: Sendable {
         }
 
         let swapError = errno
-        try? CommitRecoveryJournalStore.acknowledge(
-            preparedRecoveryArtifact
-        )
-        guard swapError == ENOTSUP || swapError == EXDEV || swapError == EINVAL else {
-            throw POSIXError(POSIXErrorCode(rawValue: swapError) ?? .EIO)
+        try acknowledge(preparedRecoveryArtifact)
+        retainedRecoveryArtifact = nil
+        guard swapError == ENOTSUP
+                || swapError == EXDEV
+                || swapError == EINVAL else {
+            throw CommitError.atomicSwapFailed
         }
         throw CommitError.atomicSwapUnavailable
+    }
+
+    private func acknowledge(
+        _ artifact: CommitRecoveryArtifact
+    ) throws {
+        try beforeRecoveryAcknowledgement?()
+        try CommitRecoveryJournalStore.acknowledge(artifact)
     }
 
     static func fingerprint(for url: URL, data: Data? = nil) throws -> FileFingerprint {
