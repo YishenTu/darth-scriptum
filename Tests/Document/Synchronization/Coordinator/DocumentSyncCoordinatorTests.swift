@@ -48,7 +48,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             with: "edited\r\n",
             origin: .localEditor(paneID: UUID())
         )
-        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        coordinator.advanceScheduledWork(by: DocumentSyncCoordinator.localWriteDelay)
         let preparation = try XCTUnwrap(executor.savePreparationRequests.last)
 
         XCTAssertEqual(preparation.snapshot.format, loadedSnapshot.format)
@@ -114,7 +114,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             with: "alpha\nBETA\n",
             origin: .localEditor(paneID: UUID())
         )
-        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        coordinator.advanceScheduledWork(by: DocumentSyncCoordinator.localWriteDelay)
 
         XCTAssertTrue(executor.savePreparationRequests.isEmpty)
         XCTAssertTrue(executor.externalReadRequests.isEmpty)
@@ -144,7 +144,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         )
         XCTAssertTrue(executor.savePreparationRequests.isEmpty)
 
-        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        coordinator.advanceScheduledWork(by: DocumentSyncCoordinator.localWriteDelay)
         let preparation = try XCTUnwrap(executor.savePreparationRequests.last)
         XCTAssertEqual(preparation.snapshot.text, "ALPHA\nBETA\n")
         XCTAssertEqual(
@@ -811,7 +811,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
                 with: .finished(.unchanged(observation))
             )
         )
-        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        coordinator.advanceScheduledWork(by: DocumentSyncCoordinator.localWriteDelay)
         let preparation = try XCTUnwrap(executor.savePreparationRequests.last)
         XCTAssertTrue(
             executor.finishSavePreparation(
@@ -2581,7 +2581,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
             with: "first\n",
             origin: .localEditor(paneID: UUID())
         )
-        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        coordinator.advanceScheduledWork(by: DocumentSyncCoordinator.localWriteDelay)
         let stalePreparation = try XCTUnwrap(executor.savePreparationRequests.last)
 
         coordinator.sourceBuffer.replace(
@@ -2596,7 +2596,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         )
         XCTAssertTrue(host.saveRequests.isEmpty)
 
-        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        coordinator.advanceScheduledWork(by: DocumentSyncCoordinator.localWriteDelay)
         let currentPreparation = try XCTUnwrap(executor.savePreparationRequests.last)
         XCTAssertNotEqual(currentPreparation.token, stalePreparation.token)
         XCTAssertTrue(
@@ -2816,7 +2816,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
                 with: .finished(.unchanged(observation))
             )
         )
-        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        coordinator.advanceScheduledWork(by: DocumentSyncCoordinator.localWriteDelay)
         let preparation = try XCTUnwrap(executor.savePreparationRequests.last)
         XCTAssertEqual(preparation.targetURL, destination.url.standardizedFileURL)
         XCTAssertTrue(
@@ -2951,7 +2951,7 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
                 with: .finished(.unchanged(observation))
             )
         )
-        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        coordinator.advanceScheduledWork(by: DocumentSyncCoordinator.localWriteDelay)
         let preparation = try XCTUnwrap(executor.savePreparationRequests.last)
         XCTAssertEqual(preparation.snapshot.text, "newer local\n")
     }
@@ -3236,7 +3236,7 @@ private final class DeterministicCoordinatorFixture {
     }
 
     func fireLocalSave() {
-        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        coordinator.advanceScheduledWork(by: DocumentSyncCoordinator.localWriteDelay)
     }
 
     func fireExternalRead() {

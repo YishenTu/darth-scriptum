@@ -396,13 +396,20 @@ extension DocumentSyncReducerTests {
         in effects: [DocumentSyncEffect],
         kind: SyncDeadlineKind
     ) -> SyncDeadline? {
+        deadlineRequest(in: effects, kind: kind)?.deadline
+    }
+
+    func deadlineRequest(
+        in effects: [DocumentSyncEffect],
+        kind: SyncDeadlineKind
+    ) -> SyncDeadlineRequest? {
         for effect in effects {
             guard case .schedule(let request) = effect,
                 request.deadline.kind == kind
             else {
                 continue
             }
-            return request.deadline
+            return request
         }
         return nil
     }

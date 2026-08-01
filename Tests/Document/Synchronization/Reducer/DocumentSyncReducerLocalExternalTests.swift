@@ -11,7 +11,15 @@ extension DocumentSyncReducerTests {
             initial,
             event: .sourceChanged(revision, format: .newDocument)
         )
-        let deadline = try XCTUnwrap(deadline(in: edited.effects, kind: .localSave))
+        let scheduledSave = try XCTUnwrap(
+            deadlineRequest(in: edited.effects, kind: .localSave)
+        )
+        XCTAssertEqual(scheduledSave.delay, .milliseconds(500))
+        XCTAssertEqual(
+            scheduledSave.delay,
+            DocumentSyncReducer.localSaveDelay
+        )
+        let deadline = scheduledSave.deadline
 
         let preparing = DocumentSyncReducer.reduce(
             edited.state,
@@ -62,6 +70,34 @@ extension DocumentSyncReducerTests {
         XCTAssertEqual(
             finished.state.durableBaseline?.fingerprint,
             result.committedFingerprint
+        )
+    }
+
+    func testExplicitSaveReplacesAutosaveDebounceWithImmediateDeadline() throws {
+        let initial = makeState()
+        let edited = DocumentSyncReducer.reduce(
+            initial,
+            event: .sourceChanged(
+                SourceRevision(number: 8, text: "updated"),
+                format: .newDocument
+            )
+        )
+        let autosave = try XCTUnwrap(
+            deadlineRequest(in: edited.effects, kind: .localSave)
+        )
+
+        let requested = DocumentSyncReducer.reduce(
+            edited.state,
+            event: .saveRequested
+        )
+        let explicitSave = try XCTUnwrap(
+            deadlineRequest(in: requested.effects, kind: .localSave)
+        )
+
+        XCTAssertEqual(explicitSave.delay, .zero)
+        XCTAssertNotEqual(explicitSave.deadline.token, autosave.deadline.token)
+        XCTAssertTrue(
+            requested.effects.contains(.cancelDeadline(autosave.deadline))
         )
     }
 

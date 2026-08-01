@@ -542,7 +542,7 @@ private final class Q1CoordinatorHarness {
     }
 
     func fireLocalSave() {
-        coordinator.advanceScheduledWork(by: .milliseconds(100))
+        coordinator.advanceScheduledWork(by: DocumentSyncCoordinator.localWriteDelay)
     }
 
     func fireExternalRead() {

@@ -11,7 +11,8 @@ extension DocumentSyncReducer {
             return unchanged(state)
         }
         var updated = state
-        let effects = scheduleLocalSave(&updated)
+        var effects = invalidatePendingSavePreparation(&updated)
+        effects += scheduleLocalSave(&updated, delay: .zero)
         return transition(updated, effects: effects)
     }
 
@@ -608,7 +609,7 @@ extension DocumentSyncReducer {
         switch currentIssue.failure {
         case .localSave:
             updated.issue = nil
-            let effects = scheduleLocalSave(&updated)
+            let effects = scheduleLocalSave(&updated, delay: .zero)
             return transition(updated, effects: effects)
         case .externalRead, .attachment:
             updated.issue = nil
@@ -674,7 +675,8 @@ extension DocumentSyncReducer {
     }
 
     static func scheduleLocalSave(
-        _ state: inout DocumentSyncState
+        _ state: inout DocumentSyncState,
+        delay requestedDelay: Duration = localSaveDelay
     ) -> [DocumentSyncEffect] {
         guard canScheduleLocalSave(state), case .dirty(let dirty) = state.local else {
             return []
@@ -687,11 +689,17 @@ extension DocumentSyncReducer {
                 scheduledToken: token
             )
         )
+        let delay: Duration
+        if case .closing = state.lifecycle {
+            delay = .zero
+        } else {
+            delay = requestedDelay
+        }
         return [
             .schedule(
                 SyncDeadlineRequest(
                     deadline: SyncDeadline(kind: .localSave, token: token),
-                    delay: localSaveDelay
+                    delay: delay
                 )
             )
         ]

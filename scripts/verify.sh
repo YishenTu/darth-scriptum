@@ -51,6 +51,7 @@ xcodebuild \
   -xcconfig "$verification_config" \
   -onlyUsePackageVersionsFromResolvedFile \
   -skip-testing:DarthScriptumTests/PerformanceTests \
+  -skip-testing:DarthScriptumTests/EditPipelinePerformanceAuditTests \
   test
 
 xcodebuild \
@@ -62,4 +63,5 @@ xcodebuild \
   -xcconfig "$verification_config" \
   -onlyUsePackageVersionsFromResolvedFile \
   -only-testing:DarthScriptumTests/PerformanceTests \
+  -only-testing:DarthScriptumTests/EditPipelinePerformanceAuditTests \
   test

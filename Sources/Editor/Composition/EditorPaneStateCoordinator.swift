@@ -92,6 +92,7 @@ final class EditorPaneStateCoordinator: NSObject {
             of: textView,
             observer: self
         )
+        endObservingTextStorage(of: textView)
         NotificationCenter.default.removeObserver(self)
         renderedContentResizeCoordinator.stop()
         if let sourceObservation {
@@ -153,6 +154,7 @@ final class EditorPaneStateCoordinator: NSObject {
                 of: textView,
                 observer: self
             )
+            endObservingTextStorage(of: textView)
             if let clipView {
                 NotificationCenter.default.removeObserver(
                     self,
@@ -171,6 +173,7 @@ final class EditorPaneStateCoordinator: NSObject {
                 observer: self,
                 selector: #selector(selectionDidChange(_:))
             )
+            beginObservingTextStorage(of: candidate)
             if let clipView {
                 clipView.postsBoundsChangedNotifications = true
                 NotificationCenter.default.addObserver(
@@ -190,6 +193,65 @@ final class EditorPaneStateCoordinator: NSObject {
         restorePendingSelectionIfNeeded()
         updatePaneState()
         scheduleMermaidParse()
+    }
+
+    private func beginObservingTextStorage(of textView: NSTextView) {
+        guard let textStorage = textView.textStorage else { return }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(observedTextStorageDidProcessEditing(_:)),
+            name: NSTextStorage.didProcessEditingNotification,
+            object: textStorage
+        )
+    }
+
+    private func endObservingTextStorage(of textView: NSTextView?) {
+        guard let textStorage = textView?.textStorage else { return }
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSTextStorage.didProcessEditingNotification,
+            object: textStorage
+        )
+        pane.bindingMutationAccumulator.reset()
+    }
+
+    @objc private func observedTextStorageDidProcessEditing(
+        _ notification: Notification
+    ) {
+        guard let textStorage = notification.object as? NSTextStorage,
+            textStorage === textView?.textStorage,
+            textStorage.editedMask.contains(.editedCharacters)
+        else {
+            return
+        }
+        let editedRange = textStorage.editedRange
+        let changeInLength = textStorage.changeInLength
+        let originalLength = editedRange.length - changeInLength
+        let originalPresentedLength = textStorage.length - changeInLength
+        guard editedRange.location >= 0,
+            editedRange.length >= 0,
+            NSMaxRange(editedRange) <= textStorage.length,
+            originalLength >= 0,
+            originalPresentedLength >= 0
+        else {
+            pane.bindingMutationAccumulator.reset()
+            return
+        }
+        pane.bindingMutationAccumulator.record(
+            EditorBindingMutation(
+                range: NSRange(
+                    location: editedRange.location,
+                    length: originalLength
+                ),
+                replacement: (textStorage.string as NSString).substring(
+                    with: editedRange
+                ),
+                sourceRevisionNumber: sourceBuffer.revision.number,
+                presentedSourceRange: presentation.sourceRange,
+                originalPresentedLength: originalPresentedLength,
+                updatedPresentedLength: textStorage.length
+            )
+        )
     }
 
     @objc private func selectionDidChange(_ notification: Notification) {
