@@ -38,14 +38,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openRecentDocument(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
-        NSDocumentController.shared.openDocument(
-            withContentsOf: url,
-            display: true
-        ) { _, _, error in
-            if let error {
-                NSDocumentController.shared.presentError(error)
-            }
-        }
+        ApplicationDocumentOpener.open(
+            url,
+            replacing: currentDocument
+        )
+    }
+
+    @objc private func openDocument(_ sender: Any?) {
+        ApplicationDocumentOpener.openFromPanel(
+            replacing: currentDocument
+        )
     }
 
     @objc private func toggleSourceMode(_ sender: Any?) {
@@ -225,10 +227,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         newWindowItem.target = self
         let openItem = fileMenu.addItem(
             withTitle: "Open…",
-            action: #selector(NSDocumentController.openDocument(_:)),
+            action: #selector(openDocument(_:)),
             keyEquivalent: "o"
         )
-        openItem.target = NSDocumentController.shared
+        openItem.target = self
         let recentItem = NSMenuItem(
             title: "Open Recent",
             action: nil,

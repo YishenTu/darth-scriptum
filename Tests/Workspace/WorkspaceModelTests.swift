@@ -22,6 +22,18 @@ final class WorkspaceModelTests: XCTestCase {
         )
     }
 
+    func testOpenMarkdownFileWhenInvokedFromEitherPaneUsesApplicationHandler() {
+        let primaryURL = URL(fileURLWithPath: "/tmp/primary.md")
+        let secondaryURL = URL(fileURLWithPath: "/tmp/secondary.markdown")
+        var openedURLs: [URL] = []
+        let model = WorkspaceModel { openedURLs.append($0) }
+
+        model.primaryPane.onOpenMarkdownFile?(primaryURL)
+        model.secondaryPane.onOpenMarkdownFile?(secondaryURL)
+
+        XCTAssertEqual(openedURLs, [primaryURL, secondaryURL])
+    }
+
     func testSplitAndSourceModeDoNotOwnDocumentContents() {
         let model = WorkspaceModel()
         model.toggleSplit()

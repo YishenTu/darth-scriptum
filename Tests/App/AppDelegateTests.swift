@@ -4,6 +4,7 @@ import XCTest
 @testable import DarthScriptum
 
 @objc private protocol AppDelegateMenuActions {
+    func openDocument(_ sender: Any?)
     func undoDocument(_ sender: Any?)
     func redoDocument(_ sender: Any?)
     func toggleSourceMode(_ sender: Any?)
@@ -107,6 +108,14 @@ final class AppDelegateTests: XCTestCase {
             key: "t",
             modifiers: [.command],
             action: #selector(NSDocumentController.newDocument(_:))
+        )
+        let openItem = fileMenu?.item(withTitle: "Open…")
+        XCTAssertTrue(openItem?.target === delegate)
+        assertShortcut(
+            openItem,
+            key: "o",
+            modifiers: [.command],
+            action: #selector(AppDelegateMenuActions.openDocument(_:))
         )
         assertShortcut(
             viewMenu?.item(withTitle: "Toggle Source Mode"),

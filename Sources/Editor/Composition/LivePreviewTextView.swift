@@ -14,6 +14,7 @@ final class EditorPaneModel: ObservableObject, Identifiable {
     let latexRenderer: AdaptiveLaTeXRenderer
     let mermaidRenderer: MermaidRenderer
     let imageProvider: MarkdownImageProvider
+    let onOpenMarkdownFile: ((URL) -> Void)?
     let bindingMutationAccumulator = EditorBindingMutationAccumulator()
     private var cachedConfigurationKey: ConfigurationKey?
     private var cachedConfiguration: MarkdownEditorConfiguration?
@@ -26,7 +27,8 @@ final class EditorPaneModel: ObservableObject, Identifiable {
     init(
         latexRenderer: AdaptiveLaTeXRenderer? = nil,
         mermaidRenderer: MermaidRenderer? = nil,
-        imageProvider: MarkdownImageProvider? = nil
+        imageProvider: MarkdownImageProvider? = nil,
+        onOpenMarkdownFile: ((URL) -> Void)? = nil
     ) {
         self.latexRenderer =
             latexRenderer
@@ -45,6 +47,7 @@ final class EditorPaneModel: ObservableObject, Identifiable {
         self.imageProvider =
             imageProvider
             ?? MarkdownImageProvider(documentURL: nil)
+        self.onOpenMarkdownFile = onOpenMarkdownFile
     }
 
     func configuration(
@@ -93,6 +96,7 @@ struct LivePreviewTextView: NSViewRepresentable {
             pane: pane,
             presentation: presentation,
             normalizesDisplayMathSelection: !usesRawSource,
+            onOpenMarkdownFile: pane.onOpenMarkdownFile,
             onBecameActive: onBecameActive
         )
     }

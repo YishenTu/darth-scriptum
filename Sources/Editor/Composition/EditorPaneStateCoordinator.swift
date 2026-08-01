@@ -5,6 +5,7 @@ final class EditorPaneStateCoordinator: NSObject {
     private let sourceBuffer: MarkdownSourceBuffer
     private let pane: EditorPaneModel
     private let mermaidPresenter: MermaidBlockPresenter
+    private let onOpenMarkdownFile: ((URL) -> Void)?
     private let onBecameActive: @MainActor () -> Void
     private var presentation: MarkdownSourcePresentation
     private var normalizesDisplayMathSelection: Bool
@@ -36,6 +37,7 @@ final class EditorPaneStateCoordinator: NSObject {
         pane: EditorPaneModel,
         presentation: MarkdownSourcePresentation? = nil,
         normalizesDisplayMathSelection: Bool = true,
+        onOpenMarkdownFile: ((URL) -> Void)? = nil,
         onBecameActive: @escaping @MainActor () -> Void = {}
     ) {
         self.sourceBuffer = sourceBuffer
@@ -50,6 +52,7 @@ final class EditorPaneStateCoordinator: NSObject {
                 rendersMarkdown: true
             )
         self.normalizesDisplayMathSelection = normalizesDisplayMathSelection
+        self.onOpenMarkdownFile = onOpenMarkdownFile
         self.onBecameActive = onBecameActive
         lastSourceText = sourceBuffer.revision.text
         super.init()
@@ -92,6 +95,11 @@ final class EditorPaneStateCoordinator: NSObject {
             of: textView,
             observer: self
         )
+        if let textView {
+            MarkdownEngineCompatibility.removeMarkdownFileDropHandler(
+                from: textView
+            )
+        }
         endObservingTextStorage(of: textView)
         NotificationCenter.default.removeObserver(self)
         renderedContentResizeCoordinator.stop()
@@ -154,6 +162,11 @@ final class EditorPaneStateCoordinator: NSObject {
                 of: textView,
                 observer: self
             )
+            if let textView {
+                MarkdownEngineCompatibility.removeMarkdownFileDropHandler(
+                    from: textView
+                )
+            }
             endObservingTextStorage(of: textView)
             if let clipView {
                 NotificationCenter.default.removeObserver(
@@ -174,6 +187,17 @@ final class EditorPaneStateCoordinator: NSObject {
                 selector: #selector(selectionDidChange(_:))
             )
             beginObservingTextStorage(of: candidate)
+            if onOpenMarkdownFile != nil {
+                MarkdownEngineCompatibility.setMarkdownFileDropHandler(
+                    on: candidate
+                ) { [weak self] urls in
+                    guard let onOpenMarkdownFile = self?.onOpenMarkdownFile
+                    else { return }
+                    for url in urls {
+                        onOpenMarkdownFile(url)
+                    }
+                }
+            }
             if let clipView {
                 clipView.postsBoundsChangedNotifications = true
                 NotificationCenter.default.addObserver(

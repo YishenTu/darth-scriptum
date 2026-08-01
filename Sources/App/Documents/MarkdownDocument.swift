@@ -49,6 +49,10 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         fileURL == nil && !syncCoordinator.sourceBuffer.revision.text.isEmpty
     }
 
+    var isReplaceableEmptyUntitledDocument: Bool {
+        fileURL == nil && !hasUnsavedUntitledContent
+    }
+
     nonisolated override class var autosavesInPlace: Bool { false }
     nonisolated override class var preservesVersions: Bool { false }
     nonisolated override class var autosavesDrafts: Bool { false }
@@ -86,7 +90,15 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
             syncCoordinator.attach(to: fileURL)
         }
         let existingFrontWindow = NSApp.keyWindow
-        let controller = MarkdownWindowController(document: self)
+        let controller = MarkdownWindowController(
+            document: self,
+            onOpenMarkdownFile: { [weak self] url in
+                ApplicationDocumentOpener.open(
+                    url,
+                    replacing: self
+                )
+            }
+        )
         addWindowController(controller)
 
         let opensSeparately = (NSApp.delegate as? AppDelegate)?.opensSeparately == true

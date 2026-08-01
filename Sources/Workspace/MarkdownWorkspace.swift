@@ -106,8 +106,6 @@ struct MarkdownWorkspace: View {
             Spacer()
             PanePositionStatus(pane: model.activePane)
                 .id(model.activePaneID)
-            Text(syncCoordinator.format.encoding.displayName)
-            Text(syncCoordinator.format.dominantNewline.rawValue.uppercased())
             Button {
                 model.toggleSourceMode()
             } label: {
@@ -121,15 +119,6 @@ struct MarkdownWorkspace: View {
             .foregroundStyle(Color(nsColor: AppTheme.accent))
             .help(model.sourceMode ? "Use Live Preview" : "Use Source Mode")
             .accessibilityLabel("Toggle Source Mode")
-            Button {
-                model.toggleSplit()
-            } label: {
-                Image(systemName: model.isSplit ? "rectangle" : "rectangle.split.2x1")
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(Color(nsColor: AppTheme.accent))
-            .help(model.isSplit ? "Close Split" : "Split Editor")
-            .accessibilityLabel("Toggle Split")
         }
         .font(.system(size: 11, weight: .medium, design: .monospaced))
         .foregroundStyle(Color(nsColor: AppTheme.mutedForeground))
@@ -197,17 +186,6 @@ private struct PanePositionStatus: View {
             Text("Indexing")
         } else {
             Text("Ln \(pane.line), Col \(pane.column)")
-        }
-    }
-}
-
-extension TextEncoding {
-    fileprivate var displayName: String {
-        switch self {
-        case .utf8: "UTF-8"
-        case .utf8WithBOM: "UTF-8 BOM"
-        case .utf16LittleEndian: "UTF-16 LE"
-        case .utf16BigEndian: "UTF-16 BE"
         }
     }
 }

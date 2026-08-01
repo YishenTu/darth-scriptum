@@ -17,9 +17,14 @@ final class MarkdownWindowController: NSWindowController, NSWindowDelegate {
     private weak var observedTabGroup: NSWindowTabGroup?
     private var tabWindowsObservation: NSKeyValueObservation?
 
-    init(document: MarkdownDocument) {
+    init(
+        document: MarkdownDocument,
+        onOpenMarkdownFile: @escaping (URL) -> Void
+    ) {
         let displayName = document.displayName ?? "Untitled"
-        workspaceModel = WorkspaceModel()
+        workspaceModel = WorkspaceModel(
+            onOpenMarkdownFile: onOpenMarkdownFile
+        )
         let workspace = MarkdownWorkspace(
             syncCoordinator: document.syncCoordinator,
             model: workspaceModel,

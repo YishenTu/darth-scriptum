@@ -10,7 +10,7 @@ final class WorkspaceModel: ObservableObject {
     let primaryPane: EditorPaneModel
     let secondaryPane: EditorPaneModel
 
-    init() {
+    init(onOpenMarkdownFile: ((URL) -> Void)? = nil) {
         let latexRenderer = AdaptiveLaTeXRenderer(
             updateNotification: Notification.Name(
                 "DarthScriptum.LatexRendererDidUpdate.\(UUID().uuidString)"
@@ -25,13 +25,15 @@ final class WorkspaceModel: ObservableObject {
         let primaryPane = EditorPaneModel(
             latexRenderer: latexRenderer,
             mermaidRenderer: mermaidRenderer,
-            imageProvider: imageProvider
+            imageProvider: imageProvider,
+            onOpenMarkdownFile: onOpenMarkdownFile
         )
         self.primaryPane = primaryPane
         secondaryPane = EditorPaneModel(
             latexRenderer: latexRenderer,
             mermaidRenderer: mermaidRenderer,
-            imageProvider: imageProvider
+            imageProvider: imageProvider,
+            onOpenMarkdownFile: onOpenMarkdownFile
         )
         activePaneID = primaryPane.id
     }

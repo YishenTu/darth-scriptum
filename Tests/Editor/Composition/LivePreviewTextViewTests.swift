@@ -183,6 +183,63 @@ final class LivePreviewTextViewTests: XCTestCase {
         _ = window
     }
 
+    func testFileDropWhenMarkdownDocumentTargetsEditorRequestsOpen() async throws {
+        let source = "Existing source"
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(text: source, format: .newDocument)
+        )
+        let markdownURL = URL(fileURLWithPath: "/tmp/dropped.md")
+        var openedURL: URL?
+        let pane = EditorPaneModel {
+            openedURL = $0
+        }
+        let hostingView = NSHostingView(
+            rootView: LivePreviewTextView(
+                sourceBuffer: buffer,
+                pane: pane,
+                sourceMode: false,
+                fontSize: 14,
+                newlineStyle: .lf
+            )
+            .frame(width: 480, height: 320)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 480, height: 320)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+
+        try await waitUntil {
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)?
+                .identifier != nil
+        }
+        let textView = try XCTUnwrap(
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
+        )
+        let pasteboard = NSPasteboard(
+            name: NSPasteboard.Name("MarkdownEditorDrop.\(UUID().uuidString)")
+        )
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.writeObjects([markdownURL as NSURL]))
+
+        XCTAssertTrue(
+            MarkdownEngineCompatibility.performFileDrop(
+                on: textView,
+                pasteboard: pasteboard
+            ) {
+                XCTFail("Markdown drops must not reach native path insertion.")
+                return false
+            }
+        )
+        XCTAssertEqual(openedURL, markdownURL)
+        XCTAssertEqual(buffer.revision.text, source)
+        _ = window
+    }
+
     func testEditorTextAdapterPreservesUntouchedMixedNewlines() {
         XCTAssertEqual(
             MarkdownEditorTextAdapter.reconcile(

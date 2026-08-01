@@ -210,6 +210,127 @@ final class MarkdownEngineCompatibilityTests: XCTestCase {
         )
     }
 
+    func testFileDropWhenAllURLsAreMarkdownOpensDocumentsWithoutFallback() {
+        let textView = NSTextView()
+        let urls = [
+            URL(fileURLWithPath: "/tmp/first.md"),
+            URL(fileURLWithPath: "/tmp/SECOND.MARKDOWN"),
+            URL(fileURLWithPath: "/tmp/third.mdown"),
+        ]
+        var openedURLs: [URL] = []
+        var fallbackCallCount = 0
+        MarkdownEngineCompatibility.setMarkdownFileDropHandler(
+            on: textView
+        ) {
+            openedURLs = $0
+        }
+        defer {
+            MarkdownEngineCompatibility.removeMarkdownFileDropHandler(
+                from: textView
+            )
+        }
+
+        let didHandle = MarkdownEngineCompatibility.performFileDrop(
+            on: textView,
+            pasteboard: filePasteboard(containing: urls)
+        ) {
+            fallbackCallCount += 1
+            return false
+        }
+
+        XCTAssertTrue(didHandle)
+        XCTAssertEqual(openedURLs, urls)
+        XCTAssertEqual(fallbackCallCount, 0)
+    }
+
+    func testNativeDragOperationWhenURLIsMarkdownUsesRegisteredHandler() {
+        let textView = NSTextView()
+        let url = URL(fileURLWithPath: "/tmp/native-drop.md")
+        var openedURLs: [URL] = []
+        MarkdownEngineCompatibility.setMarkdownFileDropHandler(
+            on: textView
+        ) {
+            openedURLs = $0
+        }
+        defer {
+            MarkdownEngineCompatibility.removeMarkdownFileDropHandler(
+                from: textView
+            )
+        }
+
+        let didHandle = textView.performDragOperation(
+            DraggingInfoStub(
+                pasteboard: filePasteboard(containing: [url])
+            )
+        )
+
+        XCTAssertTrue(didHandle)
+        XCTAssertEqual(openedURLs, [url])
+    }
+
+    func testFileDropWhenURLIsNonMarkdownPreservesNativePathInsertion() {
+        let textView = NSTextView()
+        let url = URL(fileURLWithPath: "/tmp/diagram.png")
+        let pasteboard = filePasteboard(containing: [url])
+        var openedURLs: [URL] = []
+        var fallbackCallCount = 0
+        MarkdownEngineCompatibility.setMarkdownFileDropHandler(
+            on: textView
+        ) {
+            openedURLs = $0
+        }
+        defer {
+            MarkdownEngineCompatibility.removeMarkdownFileDropHandler(
+                from: textView
+            )
+        }
+
+        let didHandle = MarkdownEngineCompatibility.performFileDrop(
+            on: textView,
+            pasteboard: pasteboard
+        ) {
+            fallbackCallCount += 1
+            return textView.readSelection(from: pasteboard)
+        }
+
+        XCTAssertTrue(didHandle)
+        XCTAssertTrue(openedURLs.isEmpty)
+        XCTAssertEqual(fallbackCallCount, 1)
+        XCTAssertEqual(textView.string, url.path)
+    }
+
+    func testFileDropWhenURLsAreMixedPreservesNativeFallback() {
+        let textView = NSTextView()
+        let urls = [
+            URL(fileURLWithPath: "/tmp/notes.md"),
+            URL(fileURLWithPath: "/tmp/diagram.png"),
+        ]
+        var openedURLs: [URL] = []
+        var fallbackCallCount = 0
+        MarkdownEngineCompatibility.setMarkdownFileDropHandler(
+            on: textView
+        ) {
+            openedURLs = $0
+        }
+        defer {
+            MarkdownEngineCompatibility.removeMarkdownFileDropHandler(
+                from: textView
+            )
+        }
+
+        let didHandle = MarkdownEngineCompatibility.performFileDrop(
+            on: textView,
+            pasteboard: filePasteboard(containing: urls)
+        ) {
+            fallbackCallCount += 1
+            return true
+        }
+
+        XCTAssertTrue(didHandle)
+        XCTAssertTrue(openedURLs.isEmpty)
+        XCTAssertEqual(fallbackCallCount, 1)
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(3),
         condition: @escaping @MainActor () -> Bool
@@ -222,6 +343,15 @@ final class MarkdownEngineCompatibilityTests: XCTestCase {
         }
         XCTFail("Timed out waiting for the MarkdownEngine wrapper hierarchy.")
     }
+
+    private func filePasteboard(containing urls: [URL]) -> NSPasteboard {
+        let pasteboard = NSPasteboard(
+            name: NSPasteboard.Name("MarkdownFileDrop.\(UUID().uuidString)")
+        )
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.writeObjects(urls as [NSURL]))
+        return pasteboard
+    }
 }
 
 @MainActor
@@ -231,4 +361,49 @@ private final class SelectionObserver: NSObject {
     @objc func selectionDidChange(_ notification: Notification) {
         notificationCount += 1
     }
+}
+
+@MainActor
+private final class DraggingInfoStub: NSObject, @MainActor NSDraggingInfo {
+    typealias EnumerationStop = UnsafeMutablePointer<ObjCBool>
+    typealias EnumerationBlock = (
+        NSDraggingItem,
+        Int,
+        EnumerationStop
+    ) -> Void
+
+    let draggingPasteboard: NSPasteboard
+    var draggingDestinationWindow: NSWindow? { nil }
+    var draggingSourceOperationMask: NSDragOperation { .copy }
+    var draggingLocation: NSPoint { .zero }
+    var draggedImageLocation: NSPoint { .zero }
+    var draggedImage: NSImage? { nil }
+    var draggingSource: Any? { nil }
+    var draggingSequenceNumber = 0
+    var draggingFormation = NSDraggingFormation.none
+    var animatesToDestination = false
+    var numberOfValidItemsForDrop = 1
+    var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+
+    init(pasteboard: NSPasteboard) {
+        draggingPasteboard = pasteboard
+    }
+
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+
+    override func namesOfPromisedFilesDropped(
+        atDestination dropDestination: URL
+    ) -> [String]? {
+        nil
+    }
+
+    func enumerateDraggingItems(
+        options enumOpts: NSDraggingItemEnumerationOptions = [],
+        for view: NSView?,
+        classes classArray: [AnyClass],
+        searchOptions: [NSPasteboard.ReadingOptionKey: Any],
+        using block: @escaping EnumerationBlock
+    ) {}
+
+    func resetSpringLoading() {}
 }
