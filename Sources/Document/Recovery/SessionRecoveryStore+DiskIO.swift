@@ -156,7 +156,7 @@ extension SessionRecoveryStore {
 
     static func persist(_ entry: RecoveryEntry, in directory: URL) throws {
         try DurableFileIO.createDirectory(at: directory)
-        let data = try JSONEncoder.sorted.encode(PersistedRecoveryEntry(entry))
+        let data = try RecoveryJSONEncoding.encode(PersistedRecoveryEntry(entry))
         try DurableFileIO.writeAtomically(data, to: snapshotURL(for: entry.id, in: directory))
     }
 
@@ -197,7 +197,7 @@ extension SessionRecoveryStore {
             acknowledgedRecoveryArtifactID: acknowledgedArtifactID
         )
         try DurableFileIO.writeAtomically(
-            try JSONEncoder.sorted.encode(persisted),
+            try RecoveryJSONEncoding.encode(persisted),
             to: rawMetadataURL(for: entry.id, in: directory)
         )
     }
@@ -225,127 +225,11 @@ extension SessionRecoveryStore {
     ) throws {
         try DurableFileIO.createDirectory(at: directory)
         try DurableFileIO.writeAtomically(
-            try JSONEncoder.sorted.encode(
+            try RecoveryJSONEncoding.encode(
                 PersistedRecoveryGenerationIndex(generations: generations)
             ),
             to: generationIndexURL(in: directory)
         )
-    }
-
-    static func persistMigration(
-        _ migration: PersistedRecoveryMigration,
-        in directory: URL
-    ) throws {
-        try DurableFileIO.createDirectory(at: directory)
-        try DurableFileIO.writeAtomically(
-            try JSONEncoder.sorted.encode(migration),
-            to: migrationURL(in: directory)
-        )
-    }
-
-    static func removeMigration(in directory: URL) throws {
-        let url = migrationURL(in: directory)
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        try DurableFileIO.removeDurably(at: url)
-    }
-
-    static func recoverPersistedMigration(
-        state: inout PersistedState,
-        in directory: URL,
-        migrationWriteHook: MigrationWriteHookBox?
-    ) throws {
-        let url = migrationURL(in: directory)
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        let migration: PersistedRecoveryMigration
-        do {
-            migration = try JSONDecoder().decode(PersistedRecoveryMigration.self, from: data)
-        } catch {
-            throw RecoveryStoreIssue.malformedData
-        }
-        try migration.validateSchema()
-        let recoveredGenerations = try migration.recoveredGenerations(
-            from: state.generations
-        )
-        let snapshotIDs = Set(migration.snapshotIDs)
-        let rawIDs = Set(migration.rawIDs)
-        let persistedSnapshotIDs = Set(state.entries.map(\.id))
-        let persistedRawIDs = Set(state.rawEntries.map(\.id))
-        guard persistedSnapshotIDs.isSuperset(of: snapshotIDs),
-            persistedRawIDs.isSuperset(of: rawIDs)
-        else {
-            throw RecoveryStoreIssue.malformedData
-        }
-        let permittedKeys: Set<String>
-        switch migration.phase {
-        case .preparing:
-            // A crash may occur after only some metadata writes, so selected
-            // records may be under the source or destination identity. Any
-            // third identity is unrelated evidence and must never be relabeled.
-            permittedKeys = [migration.sourceKey, migration.destinationKey]
-        case .committed:
-            // The committed marker is written only after every selected record
-            // has been durably rewritten for the destination.
-            permittedKeys = [migration.destinationKey]
-        }
-        guard
-            state.entries
-                .filter({ snapshotIDs.contains($0.id) })
-                .allSatisfy({ permittedKeys.contains($0.documentIdentity.stableKey) }),
-            state.rawEntries
-                .filter({ rawIDs.contains($0.id) })
-                .allSatisfy({ permittedKeys.contains($0.documentIdentity.stableKey) })
-        else {
-            throw RecoveryStoreIssue.malformedData
-        }
-        let identity = DocumentIdentity(
-            stableKey: migration.phase == .committed
-                ? migration.destinationKey
-                : migration.sourceKey
-        )
-        state.entries = state.entries.map { entry in
-            guard snapshotIDs.contains(entry.id) else { return entry }
-            return RecoveryEntry(
-                id: entry.id,
-                documentIdentity: identity,
-                snapshot: entry.snapshot,
-                createdAt: entry.createdAt
-            )
-        }
-        state.rawEntries = state.rawEntries.map { entry in
-            guard rawIDs.contains(entry.id) else { return entry }
-            return RawRecoveryEntry(
-                id: entry.id,
-                documentIdentity: identity,
-                dataURL: entry.dataURL,
-                byteCount: entry.byteCount,
-                contentDigest: entry.contentDigest,
-                createdAt: entry.createdAt,
-                residentData: entry.residentData,
-                acknowledgedRecoveryArtifactID: entry.acknowledgedRecoveryArtifactID
-            )
-        }
-        var writeCount = 0
-        for entry in state.entries where snapshotIDs.contains(entry.id) {
-            try persist(entry, in: directory)
-            writeCount += 1
-            try migrationWriteHook?.hook(writeCount)
-        }
-        for entry in state.rawEntries where rawIDs.contains(entry.id) {
-            try persistRawMetadata(
-                entry,
-                intendedArtifactID: entry.acknowledgedRecoveryArtifactID,
-                acknowledgedArtifactID: entry.acknowledgedRecoveryArtifactID,
-                in: directory
-            )
-            writeCount += 1
-            try migrationWriteHook?.hook(writeCount)
-        }
-        if let generations = recoveredGenerations {
-            state.generations = generations
-            try persistGenerationIndex(generations, in: directory)
-        }
-        try removeMigration(in: directory)
     }
 
     static func importPendingCommitRecoveries(
@@ -434,225 +318,6 @@ extension SessionRecoveryStore {
         return value
     }
 
-    static func commitDeletion(
-        of urls: [URL],
-        in directory: URL,
-        previousGenerations: [String: UInt64],
-        nextGenerations: [String: UInt64]
-    ) throws {
-        let existingURLs = urls.filter {
-            FileManager.default.fileExists(atPath: $0.path)
-        }
-        guard !existingURLs.isEmpty else {
-            try persistGenerationIndex(nextGenerations, in: directory)
-            return
-        }
-        let transaction = PersistedRecoveryDeletion(
-            entries: existingURLs.map {
-                PersistedRecoveryDeletion.Entry(
-                    sourceName: $0.lastPathComponent,
-                    tombstoneName:
-                        ".\($0.lastPathComponent).\(UUID().uuidString.lowercased()).delete"
-                )
-            },
-            phase: .preparing,
-            previousGenerations: previousGenerations,
-            nextGenerations: nextGenerations
-        )
-        try persistDeletion(transaction, in: directory)
-        for entry in transaction.entries {
-            try DurableFileIO.moveAtomically(
-                from: directory.appendingPathComponent(entry.sourceName),
-                to: directory.appendingPathComponent(entry.tombstoneName)
-            )
-        }
-        try persistGenerationIndex(nextGenerations, in: directory)
-        try persistDeletion(transaction.committed, in: directory)
-        for entry in transaction.entries {
-            try DurableFileIO.removeDurably(
-                at: directory.appendingPathComponent(entry.tombstoneName)
-            )
-        }
-        try removeDeletion(in: directory)
-    }
-
-    private static func persistDeletion(
-        _ deletion: PersistedRecoveryDeletion,
-        in directory: URL
-    ) throws {
-        try DurableFileIO.writeAtomically(
-            try JSONEncoder.sorted.encode(deletion),
-            to: deletionURL(in: directory)
-        )
-    }
-
-    static func removeDeletion(in directory: URL) throws {
-        let url = deletionURL(in: directory)
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        try DurableFileIO.removeDurably(at: url)
-    }
-
-    static func recoverPersistedDeletion(
-        in directory: URL,
-        generations: inout [String: UInt64]
-    ) throws {
-        let url = deletionURL(in: directory)
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        let deletion: PersistedRecoveryDeletion
-        do {
-            deletion = try JSONDecoder().decode(PersistedRecoveryDeletion.self, from: data)
-        } catch {
-            throw RecoveryStoreIssue.malformedData
-        }
-        try deletion.validateSchema()
-        let recoveredGenerations = try deletion.recoveredGenerations(
-            from: generations
-        )
-        if let recoveredGenerations,
-            recoveredGenerations.requiresArtifactIdentityBinding
-        {
-            let artifactIdentityKeys = try deletion.artifactIdentityKeys(
-                in: directory
-            )
-            guard artifactIdentityKeys == recoveredGenerations.changedKeys else {
-                throw RecoveryStoreIssue.malformedData
-            }
-        }
-        switch deletion.phase {
-        case .preparing:
-            for entry in deletion.entries {
-                let source = directory.appendingPathComponent(entry.sourceName)
-                let tombstone = directory.appendingPathComponent(entry.tombstoneName)
-                if FileManager.default.fileExists(atPath: tombstone.path) {
-                    guard !FileManager.default.fileExists(atPath: source.path) else {
-                        throw RecoveryStoreIssue.malformedData
-                    }
-                    try DurableFileIO.moveAtomically(from: tombstone, to: source)
-                } else if !FileManager.default.fileExists(atPath: source.path) {
-                    // A preparing transaction owns one durable copy of every
-                    // selected artifact. If neither name exists, it cannot be
-                    // safely classified as an interrupted deletion.
-                    throw RecoveryStoreIssue.malformedData
-                }
-            }
-            if let recoveredGenerations {
-                generations = recoveredGenerations.target
-                try persistGenerationIndex(generations, in: directory)
-            }
-            try removeDeletion(in: directory)
-        case .committed:
-            for entry in deletion.entries {
-                let source = directory.appendingPathComponent(entry.sourceName)
-                let tombstone = directory.appendingPathComponent(entry.tombstoneName)
-                guard !FileManager.default.fileExists(atPath: source.path) else {
-                    throw RecoveryStoreIssue.malformedData
-                }
-                if FileManager.default.fileExists(atPath: tombstone.path) {
-                    try DurableFileIO.removeDurably(at: tombstone)
-                }
-            }
-            if let recoveredGenerations {
-                generations = recoveredGenerations.target
-                try persistGenerationIndex(generations, in: directory)
-            }
-            try removeDeletion(in: directory)
-        }
-    }
-
-    static func trim(
-        _ candidates: [RecoveryEntry],
-        perDocumentLimit: Int,
-        totalByteLimit: Int
-    ) -> (entries: [RecoveryEntry], removed: [RecoveryEntry]) {
-        var perDocumentCounts: [String: Int] = [:]
-        var kept: [RecoveryEntry] = []
-        var removed: [RecoveryEntry] = []
-        for entry in candidates {
-            let count = perDocumentCounts[entry.documentIdentity.stableKey, default: 0]
-            if count < perDocumentLimit {
-                kept.append(entry)
-                perDocumentCounts[entry.documentIdentity.stableKey] = count + 1
-            } else {
-                removed.append(entry)
-            }
-        }
-        var pinnedIdentities: Set<String> = []
-        var historicalBytes = 0
-        var byteLimited: [RecoveryEntry] = []
-        for entry in kept {
-            if pinnedIdentities.insert(entry.documentIdentity.stableKey).inserted {
-                byteLimited.append(entry)
-                continue
-            }
-            if historicalBytes + entry.snapshot.text.utf8.count <= totalByteLimit {
-                historicalBytes += entry.snapshot.text.utf8.count
-                byteLimited.append(entry)
-            } else {
-                removed.append(entry)
-            }
-        }
-        return (byteLimited, removed)
-    }
-
-    static func recordsAfterDiscard(
-        _ target: DocumentSyncRecoveryDiscardTarget,
-        from records: DocumentSyncRecoveryRecords
-    ) -> DocumentSyncRecoveryRecords? {
-        let removeDecoded: Set<UUID>
-        let removeRaw: Set<UUID>
-        switch target {
-        case .decoded(let entry):
-            removeDecoded = [entry.id]
-            removeRaw = []
-        case .raw(let entries):
-            removeDecoded = []
-            removeRaw = Set(entries.map(\.id))
-        case .selected(let selected):
-            removeDecoded = Set(selected.decoded.map(\.id))
-            removeRaw = Set(selected.raw.map(\.id))
-        case .records(let selected):
-            removeDecoded = Set(selected.decoded.map(\.id))
-            removeRaw = Set(selected.raw.map(\.id))
-        }
-        guard !removeDecoded.isEmpty || !removeRaw.isEmpty,
-            records.decoded.contains(where: { removeDecoded.contains($0.id) })
-                || records.raw.contains(where: { removeRaw.contains($0.id) })
-        else {
-            return nil
-        }
-        return DocumentSyncRecoveryRecords(
-            decoded: records.decoded.filter { !removeDecoded.contains($0.id) },
-            raw: records.raw.filter { !removeRaw.contains($0.id) }
-        )
-    }
-
-    static func migratedRecords(
-        _ records: DocumentSyncRecoveryRecords,
-        to identity: DocumentIdentity
-    ) -> DocumentSyncRecoveryRecords {
-        DocumentSyncRecoveryRecords(
-            decoded: records.decoded.map {
-                RecoveryEntry(
-                    id: $0.id,
-                    documentIdentity: identity,
-                    snapshot: $0.snapshot,
-                    createdAt: $0.createdAt
-                )
-            },
-            raw: records.raw.map {
-                DocumentSyncRawRecoveryReference(
-                    id: $0.id,
-                    documentIdentity: identity,
-                    dataURL: $0.dataURL,
-                    byteCount: $0.byteCount,
-                    contentDigest: $0.contentDigest,
-                    createdAt: $0.createdAt
-                )
-            }
-        )
-    }
-
     static func snapshotURL(for id: UUID, in directory: URL) -> URL {
         directory.appendingPathComponent("\(id.uuidString.lowercased()).snapshot.json")
     }
@@ -676,14 +341,48 @@ extension SessionRecoveryStore {
     static func deletionURL(in directory: URL) -> URL {
         directory.appendingPathComponent("recovery-deletion.json")
     }
-}
 
-extension JSONEncoder {
-    fileprivate static var sorted: JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return encoder
+    static func persistedRecoveryIdentityKey(
+        from data: Data,
+        sourceName: String
+    ) throws -> String {
+        do {
+            if sourceName.hasSuffix(".snapshot.json") {
+                let persisted = try JSONDecoder().decode(
+                    PersistedRecoveryEntry.self,
+                    from: data
+                )
+                try persisted.validateSchema()
+                guard
+                    sourceName
+                        == "\(persisted.id.uuidString.lowercased()).snapshot.json"
+                else {
+                    throw RecoveryStoreIssue.malformedData
+                }
+                return persisted.stableKey
+            }
+            if sourceName.hasSuffix(".raw.json") {
+                let persisted = try JSONDecoder().decode(
+                    PersistedRawRecoveryEntry.self,
+                    from: data
+                )
+                try persisted.validateSchema()
+                guard
+                    sourceName
+                        == "\(persisted.id.uuidString.lowercased()).raw.json"
+                else {
+                    throw RecoveryStoreIssue.malformedData
+                }
+                return persisted.stableKey
+            }
+            throw RecoveryStoreIssue.malformedData
+        } catch let issue as RecoveryStoreIssue {
+            throw issue
+        } catch {
+            throw RecoveryStoreIssue.malformedData
+        }
     }
+
 }
 
 private struct PersistedRecoveryEntry: Codable {
@@ -790,365 +489,5 @@ private struct PersistedRecoveryGenerationIndex: Codable {
         {
             throw RecoveryStoreIssue.unsupportedSchema
         }
-    }
-}
-
-struct PersistedRecoveryMigration: Codable {
-    enum Phase: String, Codable {
-        case preparing
-        case committed
-    }
-
-    let schemaVersion: Int?
-    let sourceKey: String
-    let destinationKey: String
-    let snapshotIDs: [UUID]
-    let rawIDs: [UUID]
-    let phase: Phase
-    let previousGenerations: [String: UInt64]?
-    let nextGenerations: [String: UInt64]?
-
-    init(
-        sourceKey: String,
-        destinationKey: String,
-        snapshotIDs: [UUID],
-        rawIDs: [UUID],
-        phase: Phase,
-        previousGenerations: [String: UInt64]?,
-        nextGenerations: [String: UInt64]?
-    ) {
-        schemaVersion = SessionRecoveryStore.currentSchemaVersion
-        self.sourceKey = sourceKey
-        self.destinationKey = destinationKey
-        self.snapshotIDs = snapshotIDs
-        self.rawIDs = rawIDs
-        self.phase = phase
-        self.previousGenerations = previousGenerations
-        self.nextGenerations = nextGenerations
-    }
-
-    var committed: PersistedRecoveryMigration {
-        PersistedRecoveryMigration(
-            sourceKey: sourceKey,
-            destinationKey: destinationKey,
-            snapshotIDs: snapshotIDs,
-            rawIDs: rawIDs,
-            phase: .committed,
-            previousGenerations: previousGenerations,
-            nextGenerations: nextGenerations
-        )
-    }
-
-    func validateSchema() throws {
-        if let schemaVersion,
-            schemaVersion > SessionRecoveryStore.currentSchemaVersion
-        {
-            throw RecoveryStoreIssue.unsupportedSchema
-        }
-        let snapshotIDSet = Set(snapshotIDs)
-        let rawIDSet = Set(rawIDs)
-        guard sourceKey != destinationKey,
-            snapshotIDSet.count == snapshotIDs.count,
-            Set(rawIDs).count == rawIDs.count,
-            snapshotIDSet.isDisjoint(with: rawIDSet),
-            !sourceKey.isEmpty,
-            !destinationKey.isEmpty
-        else {
-            throw RecoveryStoreIssue.malformedData
-        }
-    }
-
-    /// Current-schema migration journals carry a complete generation index.
-    /// Replaying one must be an exact transition from the durable index, never
-    /// an authority to replace unrelated counters with journal-provided data.
-    func recoveredGenerations(
-        from current: [String: UInt64]
-    ) throws -> [String: UInt64]? {
-        switch (previousGenerations, nextGenerations) {
-        case (nil, nil):
-            // The first journal format predates durable mutation generations.
-            // Preserve that compatibility only for explicitly older formats;
-            // a current-schema omission is malformed rather than ambiguous.
-            guard let schemaVersion,
-                schemaVersion < SessionRecoveryStore.currentSchemaVersion
-            else {
-                throw RecoveryStoreIssue.malformedData
-            }
-            return nil
-        case (.some(let previous), .some(let next)):
-            let sourceGeneration = previous[sourceKey, default: 0]
-            let destinationGeneration = previous[destinationKey, default: 0]
-            let destinationBase = max(sourceGeneration, destinationGeneration)
-            guard sourceGeneration < UInt64.max,
-                destinationBase < UInt64.max
-            else {
-                throw RecoveryStoreIssue.malformedData
-            }
-            var expectedNext = previous
-            expectedNext[sourceKey] = sourceGeneration + 1
-            expectedNext[destinationKey] = destinationBase + 1
-            guard next == expectedNext else {
-                throw RecoveryStoreIssue.malformedData
-            }
-            switch phase {
-            case .preparing:
-                guard current == previous else {
-                    throw RecoveryStoreIssue.malformedData
-                }
-                return previous
-            case .committed:
-                guard current == previous || current == next else {
-                    throw RecoveryStoreIssue.malformedData
-                }
-                return next
-            }
-        case (.some, nil), (nil, .some):
-            throw RecoveryStoreIssue.malformedData
-        }
-    }
-}
-
-private struct PersistedRecoveryDeletion: Codable {
-    enum Phase: String, Codable {
-        case preparing
-        case committed
-    }
-
-    struct Entry: Codable, Equatable {
-        let sourceName: String
-        let tombstoneName: String
-    }
-
-    let schemaVersion: Int?
-    let entries: [Entry]
-    let phase: Phase
-    let previousGenerations: [String: UInt64]?
-    let nextGenerations: [String: UInt64]?
-
-    init(
-        entries: [Entry],
-        phase: Phase,
-        previousGenerations: [String: UInt64]?,
-        nextGenerations: [String: UInt64]?
-    ) {
-        schemaVersion = SessionRecoveryStore.currentSchemaVersion
-        self.entries = entries
-        self.phase = phase
-        self.previousGenerations = previousGenerations
-        self.nextGenerations = nextGenerations
-    }
-
-    var committed: PersistedRecoveryDeletion {
-        PersistedRecoveryDeletion(
-            entries: entries,
-            phase: .committed,
-            previousGenerations: previousGenerations,
-            nextGenerations: nextGenerations
-        )
-    }
-
-    func validateSchema() throws {
-        if let schemaVersion,
-            schemaVersion > SessionRecoveryStore.currentSchemaVersion
-        {
-            throw RecoveryStoreIssue.unsupportedSchema
-        }
-        guard !entries.isEmpty,
-            Set(entries.map(\.sourceName)).count == entries.count,
-            Set(entries.map(\.tombstoneName)).count == entries.count,
-            Set(entries.map(\.sourceName)).isDisjoint(
-                with: Set(entries.map(\.tombstoneName))
-            ),
-            entries.allSatisfy({ entry in
-                isRecoveryArtifactName(entry.sourceName)
-                    && isTombstoneName(
-                        entry.tombstoneName,
-                        for: entry.sourceName
-                    )
-            })
-        else {
-            throw RecoveryStoreIssue.malformedData
-        }
-        let sourceNames = Set(entries.map(\.sourceName))
-        for sourceName in sourceNames where sourceName.hasSuffix(".raw") {
-            let metadataName = String(sourceName.dropLast(4)) + ".raw.json"
-            guard sourceNames.contains(metadataName) else {
-                throw RecoveryStoreIssue.malformedData
-            }
-        }
-        for sourceName in sourceNames where sourceName.hasSuffix(".raw.json") {
-            let payloadName = String(sourceName.dropLast(5))
-            guard sourceNames.contains(payloadName) else {
-                throw RecoveryStoreIssue.malformedData
-            }
-        }
-    }
-
-    struct RecoveredGenerations {
-        let target: [String: UInt64]
-        let changedKeys: Set<String>
-        let requiresArtifactIdentityBinding: Bool
-    }
-
-    func recoveredGenerations(
-        from current: [String: UInt64]
-    ) throws -> RecoveredGenerations? {
-        switch (previousGenerations, nextGenerations) {
-        case (nil, nil):
-            guard let schemaVersion,
-                schemaVersion < SessionRecoveryStore.currentSchemaVersion
-            else {
-                throw RecoveryStoreIssue.malformedData
-            }
-            return nil
-        case (.some(let previous), .some(let next)):
-            let allKeys = Set(previous.keys).union(next.keys)
-            var changedKeys: Set<String> = []
-            for key in allKeys {
-                let previousValue = previous[key, default: 0]
-                guard let nextValue = next[key] else {
-                    throw RecoveryStoreIssue.malformedData
-                }
-                if previousValue == nextValue {
-                    // A new zero-value key is not a mutation and therefore
-                    // cannot be journaled as part of a deletion transition.
-                    guard previous[key] != nil else {
-                        throw RecoveryStoreIssue.malformedData
-                    }
-                    continue
-                }
-                guard previousValue < UInt64.max,
-                    nextValue == previousValue + 1
-                else {
-                    throw RecoveryStoreIssue.malformedData
-                }
-                changedKeys.insert(key)
-            }
-            guard !changedKeys.isEmpty else {
-                throw RecoveryStoreIssue.malformedData
-            }
-            switch phase {
-            case .preparing:
-                // Deletion writes its next-generation index before the
-                // committed marker. A crash in that narrow interval is a
-                // normal preparing journal with either durable map; replay
-                // restores the artifacts and rolls the index back exactly.
-                guard current == previous || current == next else {
-                    throw RecoveryStoreIssue.malformedData
-                }
-                return RecoveredGenerations(
-                    target: previous,
-                    changedKeys: changedKeys,
-                    requiresArtifactIdentityBinding: true
-                )
-            case .committed:
-                guard current == previous || current == next else {
-                    throw RecoveryStoreIssue.malformedData
-                }
-                return RecoveredGenerations(
-                    target: next,
-                    changedKeys: changedKeys,
-                    requiresArtifactIdentityBinding: current == previous
-                )
-            }
-        case (.some, nil), (nil, .some):
-            throw RecoveryStoreIssue.malformedData
-        }
-    }
-
-    func artifactIdentityKeys(in directory: URL) throws -> Set<String> {
-        var identityKeys: Set<String> = []
-        for entry in entries {
-            guard
-                entry.sourceName.hasSuffix(".snapshot.json")
-                    || entry.sourceName.hasSuffix(".raw.json")
-            else {
-                continue
-            }
-            let source = directory.appendingPathComponent(entry.sourceName)
-            let tombstone = directory.appendingPathComponent(entry.tombstoneName)
-            let artifactURL: URL
-            let fileManager = FileManager.default
-            if fileManager.fileExists(atPath: source.path) {
-                guard !fileManager.fileExists(atPath: tombstone.path) else {
-                    throw RecoveryStoreIssue.malformedData
-                }
-                artifactURL = source
-            } else if fileManager.fileExists(atPath: tombstone.path) {
-                artifactURL = tombstone
-            } else {
-                throw RecoveryStoreIssue.malformedData
-            }
-            do {
-                let data = try Data(
-                    contentsOf: artifactURL,
-                    options: [.mappedIfSafe]
-                )
-                if entry.sourceName.hasSuffix(".snapshot.json") {
-                    let persisted = try JSONDecoder().decode(
-                        PersistedRecoveryEntry.self,
-                        from: data
-                    )
-                    try persisted.validateSchema()
-                    guard snapshotFileName(for: persisted.id) == entry.sourceName else {
-                        throw RecoveryStoreIssue.malformedData
-                    }
-                    identityKeys.insert(persisted.stableKey)
-                } else {
-                    let persisted = try JSONDecoder().decode(
-                        PersistedRawRecoveryEntry.self,
-                        from: data
-                    )
-                    try persisted.validateSchema()
-                    guard
-                        rawMetadataFileName(for: persisted.id)
-                            == entry.sourceName
-                    else {
-                        throw RecoveryStoreIssue.malformedData
-                    }
-                    identityKeys.insert(persisted.stableKey)
-                }
-            } catch let issue as RecoveryStoreIssue {
-                throw issue
-            } catch {
-                throw RecoveryStoreIssue.malformedData
-            }
-        }
-        return identityKeys
-    }
-
-    private func isRecoveryArtifactName(_ name: String) -> Bool {
-        let suffixes = [".snapshot.json", ".raw.json", ".raw"]
-        guard let suffix = suffixes.first(where: name.hasSuffix) else {
-            return false
-        }
-        let identifierText = String(name.dropLast(suffix.count))
-        guard let identifier = UUID(uuidString: identifierText) else {
-            return false
-        }
-        return name == "\(identifier.uuidString.lowercased())\(suffix)"
-    }
-
-    private func isTombstoneName(_ name: String, for sourceName: String) -> Bool {
-        let prefix = ".\(sourceName)."
-        let suffix = ".delete"
-        guard name.hasPrefix(prefix), name.hasSuffix(suffix) else {
-            return false
-        }
-        let identifierText = String(
-            name.dropFirst(prefix.count).dropLast(suffix.count)
-        )
-        guard let identifier = UUID(uuidString: identifierText) else {
-            return false
-        }
-        return name == "\(prefix)\(identifier.uuidString.lowercased())\(suffix)"
-    }
-
-    private func snapshotFileName(for id: UUID) -> String {
-        "\(id.uuidString.lowercased()).snapshot.json"
-    }
-
-    private func rawMetadataFileName(for id: UUID) -> String {
-        "\(id.uuidString.lowercased()).raw.json"
     }
 }
