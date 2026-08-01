@@ -31,11 +31,11 @@ if [[ ! -d "$repository_root" ]]; then
     exit 2
 fi
 repository_root="$(cd "$repository_root" && pwd -P)"
-source_root="$repository_root/src"
-tests_root="$repository_root/tests"
+source_root="$repository_root/Sources"
+tests_root="$repository_root/Tests"
 
 if [[ ! -d "$source_root" ]]; then
-    print -u2 "Architecture check expected src directory: $source_root"
+    print -u2 "Architecture check expected Sources directory: $source_root"
     exit 2
 fi
 if ! command -v rg >/dev/null 2>&1; then
@@ -65,12 +65,12 @@ validate_scoped_instructions() {
     local discovered_file
     local relative_discovered_file
     local -a scoped_directories=(
-        "$source_root/app"
-        "$source_root/core"
-        "$source_root/document"
-        "$source_root/editor"
-        "$source_root/workspace"
-        "$source_root/resources"
+        "$source_root/App"
+        "$source_root/Core"
+        "$source_root/Document"
+        "$source_root/Editor"
+        "$source_root/Workspace"
+        "$source_root/Resources"
         "$tests_root"
     )
     local -A expected_files
@@ -156,9 +156,9 @@ first_existing_file() {
     return 1
 }
 
-core_directory="$source_root/core"
-document_directory="$source_root/document"
-editor_directory="$source_root/editor"
+core_directory="$source_root/Core"
+document_directory="$source_root/Document"
+editor_directory="$source_root/Editor"
 
 assert_legacy_ownership_paths_absent() {
     local legacy_path
@@ -174,7 +174,7 @@ assert_legacy_ownership_paths_absent() {
 
 if [[ -f "$repository_root/DarthScriptum.xcodeproj/project.pbxproj" ]]; then
     if [[ ! -d "$tests_root" ]]; then
-        print -u2 "Architecture check expected tests directory: $tests_root"
+        print -u2 "Architecture check expected Tests directory: $tests_root"
         exit 2
     fi
     validate_scoped_instructions
@@ -189,8 +189,10 @@ editor_persistence_reference='\b(DocumentSyncCoordinator|DocumentSyncCoordinator
 internal_markdown_engine_key='\b(LatexRenderedImage|LatexImageBounds|LatexIsBlock|LatexBlockOffsetY|ThematicBreak|BlockquoteLevel|BulletListMarker|ScrollableBlockNaturalWidth|ScrollableBlockSourceID|ScrollableBlockTotalHeight|ScrollableBlockFullRange|NodeLinkID|TaskCheckbox)\b'
 
 assert_legacy_ownership_paths_absent \
-    "$document_directory/markdownsourcebuffer.swift" \
-    "$document_directory/markdowndocument.swift"
+    "$document_directory/MarkdownSourceBuffer.swift" \
+    "$document_directory/MarkdownDocument.swift" \
+    "$document_directory/markdown-source-buffer.swift" \
+    "$document_directory/markdown-document.swift"
 
 scan_pattern \
     "$core_directory" \
@@ -219,13 +221,13 @@ scan_pattern \
     "editor must not reference concrete synchronization or persistence types"
 
 markdown_engine_compatibility_file="$(first_existing_file \
-    "$editor_directory/compatibility/markdownenginecompatibility.swift" \
-    "$editor_directory/compatibility/markdownenginecompatibility.swiftfixture" || true)"
+    "$editor_directory/Compatibility/MarkdownEngineCompatibility.swift" \
+    "$editor_directory/Compatibility/markdown-engine-compatibility.swiftfixture" || true)"
 if [[ -n "$markdown_engine_compatibility_file" ]]; then
     scan_pattern \
         "$source_root" \
         "$internal_markdown_engine_key" \
-        "raw MarkdownEngine internal attribute keys belong only in markdownenginecompatibility.swift" \
+        "raw MarkdownEngine internal attribute keys belong only in MarkdownEngineCompatibility.swift" \
         "$markdown_engine_compatibility_file"
 fi
 
@@ -235,6 +237,3 @@ if (( violation_count > 0 )); then
 fi
 
 print "Architecture check passed."
-if [[ -z "$markdown_engine_compatibility_file" ]]; then
-    print "Migration target: raw MarkdownEngine internal-key location enforcement activates when E1 adds src/editor/compatibility/markdownenginecompatibility.swift."
-fi

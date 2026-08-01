@@ -10,14 +10,7 @@ A lightweight, performance-first Markdown editor for macOS.
 ## Build
 
 ```sh
-xcodebuild \
-  -project DarthScriptum.xcodeproj \
-  -scheme DarthScriptum \
-  -configuration Debug \
-  -destination 'platform=macOS,arch=arm64' \
-  -derivedDataPath DerivedData \
-  CODE_SIGNING_ALLOWED=NO \
-  build
+./scripts/build-debug.sh
 ```
 
 The app will be available at:
@@ -26,7 +19,27 @@ The app will be available at:
 DerivedData/Build/Products/Debug/DarthScriptum.app
 ```
 
-## Verify
+## Lint
+
+```sh
+./scripts/lint.sh
+```
+
+## Test
+
+Run one or more focused test identifiers:
+
+```sh
+./scripts/test.sh DarthScriptumTests/SourceTypesTests
+```
+
+Run the complete non-performance test suite:
+
+```sh
+./scripts/test.sh --all
+```
+
+## Full verification
 
 Run the complete test and build suite:
 
@@ -34,10 +47,11 @@ Run the complete test and build suite:
 ./scripts/verify.sh
 ```
 
-## Documentation
+Verify vendored renderer files without building:
 
-- [Architecture](docs/architecture.md)
-- [Maintenance, dependency updates, and release checks](docs/maintenance.md)
+```sh
+./scripts/check-vendored-resources.sh
+```
 
 ## License
 

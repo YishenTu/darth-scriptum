@@ -5,7 +5,7 @@ version="11.16.0"
 archive_sha256="ff48c94a0a0458b377a5187ad01407184d2a182e6476c2015b7068ff58355fae"
 bundle_sha256="74d7c46dabca328c2294733910a8aa1ed0c37451776e8d5295da38a2b758fb9b"
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-destination="$repository_root/src/resources/Mermaid.bundle"
+destination="$repository_root/Sources/Resources/Mermaid.bundle"
 vendor_tmp=$(mktemp -d)
 trap 'rm -rf "$vendor_tmp"' EXIT HUP INT TERM
 
