@@ -11,7 +11,7 @@
 
 ## Build and verification
 
-- Preserve the native macOS architecture and keep changes focused on the requested behavior.
+- Build and verify the macOS app for Apple Silicon (`arm64`) only, and keep changes focused on the requested behavior.
 - After changing code, run the relevant tests and build the Debug app before handing the work back.
 - Use a repository-local Derived Data directory so the runnable app has a predictable path:
 
@@ -23,10 +23,12 @@ xcodebuild \
   -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath DerivedData \
   CODE_SIGNING_ALLOWED=NO \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
   build
 ```
 
-- Run `./scripts/verify.sh` for changes with broad impact or before committing a completed implementation.
+- Run `./scripts/verify.sh` for changes with broad impact or before committing a completed implementation. The script must keep every build and test configuration restricted to `arm64`.
 
 ## Fast local feedback
 

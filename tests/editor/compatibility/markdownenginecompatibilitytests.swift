@@ -126,6 +126,89 @@ final class MarkdownEngineCompatibilityTests: XCTestCase {
         )
     }
 
+    func testCenteredRenderedBlockIsLeftPinnedAndRecentersAtNewWidth() throws {
+        let textView = NSTextView(
+            frame: NSRect(x: 0, y: 0, width: 300, height: 200)
+        )
+        let storage = try XCTUnwrap(textView.textStorage)
+        storage.setAttributedString(NSAttributedString(string: "formula\n"))
+        let centered = NSMutableParagraphStyle()
+        centered.alignment = .center
+        storage.addAttribute(
+            .paragraphStyle,
+            value: centered,
+            range: NSRange(location: 0, length: storage.length)
+        )
+        MarkdownEngineCompatibility.applyRenderedBlockImage(
+            NSImage(size: NSSize(width: 200, height: 60)),
+            bounds: CGRect(x: 0, y: 0, width: 200, height: 60),
+            sourceIdentity: 1,
+            displayWidth: 200,
+            to: storage,
+            range: NSRange(location: 0, length: 1)
+        )
+        textView.textContainer?.containerSize = NSSize(
+            width: 300,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+
+        XCTAssertTrue(
+            MarkdownEngineCompatibility.stabilizeCenteredRenderedBlocks(
+                in: textView
+            )
+        )
+        var paragraph = try XCTUnwrap(
+            storage.attribute(
+                .paragraphStyle,
+                at: 0,
+                effectiveRange: nil
+            ) as? NSParagraphStyle
+        )
+        XCTAssertEqual(paragraph.alignment, .left)
+        XCTAssertEqual(paragraph.headIndent, 50, accuracy: 0.5)
+        XCTAssertEqual(paragraph.firstLineHeadIndent, 50, accuracy: 0.5)
+
+        XCTAssertTrue(
+            MarkdownEngineCompatibility.stabilizeCenteredRenderedBlocks(
+                in: textView,
+                viewportWidth: 160
+            )
+        )
+        paragraph = try XCTUnwrap(
+            storage.attribute(
+                .paragraphStyle,
+                at: 0,
+                effectiveRange: nil
+            ) as? NSParagraphStyle
+        )
+        XCTAssertEqual(paragraph.alignment, .left)
+        XCTAssertEqual(paragraph.headIndent, 0, accuracy: 0.5)
+        XCTAssertEqual(paragraph.firstLineHeadIndent, 0, accuracy: 0.5)
+    }
+
+    func testTableCandidateDetectionMatchesOuterPipeSourceSyntax() {
+        XCTAssertTrue(
+            MarkdownEngineCompatibility.containsTableCandidate(
+                in: "| Name | Value |\n| --- | ---: |\n| A | 1 |\n"
+            )
+        )
+        XCTAssertTrue(
+            MarkdownEngineCompatibility.containsTableCandidate(
+                in: "  | Name | Value |  \r\n  | --- | ---: |  \r\n"
+            )
+        )
+        XCTAssertFalse(
+            MarkdownEngineCompatibility.containsTableCandidate(
+                in: "$$\n|x|\n$$\n"
+            )
+        )
+        XCTAssertFalse(
+            MarkdownEngineCompatibility.containsTableCandidate(
+                in: "| Name | Value |\n| not | a separator |\n"
+            )
+        )
+    }
+
     private func waitUntil(
         timeout: Duration = .seconds(3),
         condition: @escaping @MainActor () -> Bool

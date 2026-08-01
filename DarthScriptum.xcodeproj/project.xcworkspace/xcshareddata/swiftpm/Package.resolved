@@ -1,5 +1,5 @@
 {
-  "originHash" : "9ed4f5d8715189cde9424c4b36df0390799a4a9ea782bd449adf422a68174ea6",
+  "originHash" : "bb18de9b95b2405cf7d1918c17d54fbbae150a1ac55b24e79b42070c985efcea",
   "pins" : [
     {
       "identity" : "highlighterswift",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/nodes-app/swift-markdown-engine.git",
       "state" : {
-        "revision" : "3d55f661b716cc8ae768c1ce8addf7b2e522f099",
-        "version" : "0.10.1"
+        "revision" : "9244f8bc88590520a902b83b9f6c3f45d0690eb7",
+        "version" : "0.11.0"
       }
     },
     {

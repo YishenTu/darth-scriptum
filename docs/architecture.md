@@ -143,7 +143,7 @@ termination rather than forcing documents closed.
 ## Renderer trust boundary
 
 Markdown and renderer input is untrusted document content. Native presentation
-uses MarkdownEngine `0.10.1`; all native text-view traversal and raw
+uses MarkdownEngine `0.11.0`; all native text-view traversal and raw
 MarkdownEngine internal attributed-string keys are isolated in
 `src/editor/compatibility/markdownenginecompatibility.swift`.
 

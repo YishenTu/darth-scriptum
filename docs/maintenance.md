@@ -64,7 +64,7 @@ The application dependency is exact-pinned in the Xcode project, with the full
 resolved graph recorded by SwiftPM. Audit the current pin with:
 
 ```sh
-rg -n 'swift-markdown-engine|0\.10\.1' \
+rg -n 'swift-markdown-engine|0\.11\.0' \
   DarthScriptum.xcodeproj/project.pbxproj \
   DarthScriptum.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 ```

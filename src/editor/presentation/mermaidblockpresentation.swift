@@ -203,10 +203,24 @@ enum MermaidFencedBlockParser {
 
 @MainActor
 final class MermaidBlockPresenter {
+    private struct PreparedPresentation {
+        let block: MermaidFencedBlock
+        let diagram: MermaidRenderedDiagram
+        let displaySize: CGSize
+        let centeringIndent: CGFloat
+        let anchorLocation: Int
+        let sourceIdentity: Int
+    }
+
     private static let markerFont = NSFont.systemFont(ofSize: 0.1)
     private static let maximumDisplayHeight: CGFloat = 4_096
     private static let horizontalPadding: CGFloat = 16
     private static let paragraphSpacing: CGFloat = 10
+    /// Baked leading indent of the anchor paragraph; part of the presented
+    /// identity so widening past the natural diagram size still re-centers.
+    private static let centeringIndentAttribute = NSAttributedString.Key(
+        "MermaidCenteringIndent"
+    )
 
     private let renderer: MermaidRenderer
 
@@ -214,31 +228,32 @@ final class MermaidBlockPresenter {
         self.renderer = renderer
     }
 
+    @discardableResult
     func apply(
         to textView: NSTextView,
         rendersMarkdown: Bool,
         source: String,
-        blocks: [MermaidFencedBlock]
-    ) {
+        blocks: [MermaidFencedBlock],
+        viewportWidth: CGFloat? = nil
+    ) -> Bool {
         guard rendersMarkdown,
               let textStorage = textView.textStorage,
               textStorage.length > 0,
               textStorage.length == (source as NSString).length,
               !blocks.isEmpty else {
-            return
+            return false
         }
 
         let selectedRange = textView.selectedRange()
         let sourceText = source as NSString
-        let maximumWidth = availableWidth(in: textView)
-        guard maximumWidth > 0 else { return }
+        let maximumWidth = availableWidth(
+            in: textView,
+            viewportWidth: viewportWidth
+        )
+        guard maximumWidth > 0 else { return false }
 
-        textStorage.beginEditing()
-        defer {
-            textStorage.endEditing()
-            textView.setNeedsDisplay(textView.visibleRect)
-        }
-
+        var prepared: [PreparedPresentation] = []
+        prepared.reserveCapacity(blocks.count)
         for block in blocks {
             guard NSMaxRange(block.fullRange) <= textStorage.length,
                   NSMaxRange(block.contentRange) <= textStorage.length,
@@ -261,31 +276,58 @@ final class MermaidBlockPresenter {
                 continue
             }
 
+            let centeringIndent = centeringIndent(
+                displayWidth: displaySize.width,
+                maximumWidth: maximumWidth
+            )
             let sourceIdentity = block.source.hashValue
             if isAlreadyPresented(
                 textStorage: textStorage,
                 anchorLocation: anchorLocation,
                 sourceIdentity: sourceIdentity,
-                displayWidth: displaySize.width
+                displayWidth: displaySize.width,
+                centeringIndent: centeringIndent
             ) {
                 continue
             }
 
+            prepared.append(
+                PreparedPresentation(
+                    block: block,
+                    diagram: diagram,
+                    displaySize: displaySize,
+                    centeringIndent: centeringIndent,
+                    anchorLocation: anchorLocation,
+                    sourceIdentity: sourceIdentity
+                )
+            )
+        }
+        guard !prepared.isEmpty else { return false }
+
+        textStorage.beginEditing()
+        defer {
+            textStorage.endEditing()
+            textView.setNeedsDisplay(textView.visibleRect)
+        }
+        for presentation in prepared {
             present(
-                block,
-                diagram: diagram,
-                displaySize: displaySize,
-                anchorLocation: anchorLocation,
-                sourceIdentity: sourceIdentity,
+                presentation.block,
+                diagram: presentation.diagram,
+                displaySize: presentation.displaySize,
+                centeringIndent: presentation.centeringIndent,
+                anchorLocation: presentation.anchorLocation,
+                sourceIdentity: presentation.sourceIdentity,
                 textStorage: textStorage
             )
         }
+        return true
     }
 
     private func present(
         _ block: MermaidFencedBlock,
         diagram: MermaidRenderedDiagram,
         displaySize: CGSize,
+        centeringIndent: CGFloat,
         anchorLocation: Int,
         sourceIdentity: Int,
         textStorage: NSTextStorage
@@ -306,8 +348,16 @@ final class MermaidBlockPresenter {
             baseFont.ascender - baseFont.descender + baseFont.leading
         )
 
+        // Left-pinned centering: the indent is baked in, so a stale,
+        // over-wide line during a rapid shrink extends past the trailing
+        // edge (clipped) instead of centering into negative territory.
+        // A negative leading edge makes TextKit 2 shift the text view's
+        // `textContainerOrigin.x` — a sticky adjustment that offsets the
+        // whole text column long after the block re-renders.
         let visibleParagraph = NSMutableParagraphStyle()
-        visibleParagraph.alignment = .center
+        visibleParagraph.alignment = .left
+        visibleParagraph.headIndent = centeringIndent
+        visibleParagraph.firstLineHeadIndent = centeringIndent
         visibleParagraph.lineBreakMode = .byClipping
         visibleParagraph.minimumLineHeight = max(
             baseLineHeight,
@@ -369,6 +419,11 @@ final class MermaidBlockPresenter {
             to: textStorage,
             range: anchorRange
         )
+        textStorage.addAttribute(
+            Self.centeringIndentAttribute,
+            value: centeringIndent,
+            range: anchorRange
+        )
         textStorage.addAttributes(
             [
                 .foregroundColor: NSColor.clear,
@@ -422,7 +477,8 @@ final class MermaidBlockPresenter {
         textStorage: NSTextStorage,
         anchorLocation: Int,
         sourceIdentity: Int,
-        displayWidth: CGFloat
+        displayWidth: CGFloat,
+        centeringIndent: CGFloat
     ) -> Bool {
         guard let current = MarkdownEngineCompatibility.renderedBlock(
             in: textStorage,
@@ -430,18 +486,32 @@ final class MermaidBlockPresenter {
         ) else {
             return false
         }
+        let currentIndent = textStorage.attribute(
+            Self.centeringIndentAttribute,
+            at: anchorLocation,
+            effectiveRange: nil
+        ) as? CGFloat ?? -1
         return current.sourceIdentity == sourceIdentity
             && current.displayWidth.map {
                 abs($0 - displayWidth) < 0.5
             } == true
+            && abs(currentIndent - centeringIndent) < 0.5
     }
 
-    private func availableWidth(in textView: NSTextView) -> CGFloat {
+    private func availableWidth(
+        in textView: NSTextView,
+        viewportWidth: CGFloat?
+    ) -> CGFloat {
         let containerWidth = textView.textContainer?.size.width
         let fallbackWidth = textView.bounds.width
             - textView.textContainerInset.width * 2
         let finiteWidth: CGFloat
-        if let containerWidth,
+        if let viewportWidth,
+           viewportWidth.isFinite,
+           viewportWidth > textView.textContainerInset.width * 2 {
+            finiteWidth = viewportWidth
+                - textView.textContainerInset.width * 2
+        } else if let containerWidth,
            containerWidth.isFinite,
            containerWidth > Self.horizontalPadding,
            containerWidth < 100_000 {
@@ -454,6 +524,17 @@ final class MermaidBlockPresenter {
             return 0
         }
         return finiteWidth - Self.horizontalPadding
+    }
+
+    /// Baked-in leading indent that visually centers the diagram. Derived
+    /// from the same width the diagram is baked at, so the pair stays
+    /// consistent while a resize re-render is pending.
+    private func centeringIndent(
+        displayWidth: CGFloat,
+        maximumWidth: CGFloat
+    ) -> CGFloat {
+        let containerWidth = maximumWidth + Self.horizontalPadding
+        return max(0, (containerWidth - displayWidth) / 2)
     }
 
     private func displaySize(

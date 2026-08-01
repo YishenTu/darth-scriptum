@@ -10,6 +10,13 @@ final class EditorPaneStateCoordinator: NSObject {
     private var normalizesDisplayMathSelection: Bool
     private weak var textView: NSTextView?
     private weak var clipView: NSClipView?
+    private lazy var renderedContentResizeCoordinator =
+        RenderedContentResizeCoordinator(
+            presentation: presentation,
+            restyleNotification: pane.latexRenderer.updateNotification
+        ) { [weak self] viewportWidth in
+            self?.scheduleMermaidApply(viewportWidth: viewportWidth)
+        }
     private var sourceObservation: UUID?
     private var lineIndexObservation: UUID?
     private var lastSourceText: String
@@ -22,6 +29,7 @@ final class EditorPaneStateCoordinator: NSObject {
     private var mermaidParseRevision: UInt64?
     private var mermaidParseSourceRange: NSRange?
     private var mermaidApplyScheduled = false
+    private var pendingMermaidViewportWidth: CGFloat?
 
     init(
         sourceBuffer: MarkdownSourceBuffer,
@@ -60,6 +68,15 @@ final class EditorPaneStateCoordinator: NSObject {
             name: pane.mermaidRenderer.updateNotification,
             object: nil
         )
+        if pane.latexRenderer.updateNotification
+            != pane.mermaidRenderer.updateNotification {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(renderedContentDidUpdate(_:)),
+                name: pane.latexRenderer.updateNotification,
+                object: nil
+            )
+        }
     }
 
     func stop() {
@@ -67,11 +84,13 @@ final class EditorPaneStateCoordinator: NSObject {
         mermaidParseTask = nil
         mermaidParseRevision = nil
         mermaidParseSourceRange = nil
+        pendingMermaidViewportWidth = nil
         MarkdownEngineCompatibility.endObservingSelection(
             of: textView,
             observer: self
         )
         NotificationCenter.default.removeObserver(self)
+        renderedContentResizeCoordinator.stop()
         if let sourceObservation {
             sourceBuffer.removeObserver(sourceObservation)
         }
@@ -88,7 +107,12 @@ final class EditorPaneStateCoordinator: NSObject {
         DispatchQueue.main.async { [weak self, weak rootView] in
             guard let self, let rootView else { return }
             rootView.layoutSubtreeIfNeeded()
-            self.attach(in: rootView)
+            guard let candidate = MarkdownEngineCompatibility.nativeTextView(
+                in: rootView
+            ) else {
+                return
+            }
+            self.attach(to: candidate)
         }
     }
 
@@ -102,6 +126,7 @@ final class EditorPaneStateCoordinator: NSObject {
             presentation.sourceRange.location
                 != newPresentation.sourceRange.location
         presentation = newPresentation
+        renderedContentResizeCoordinator.updatePresentation(newPresentation)
         if sourceRangeChanged {
             pendingSelectionRestore = pane.selectedRange
             hasRestoredState = false
@@ -109,12 +134,7 @@ final class EditorPaneStateCoordinator: NSObject {
         scheduleMermaidParse()
     }
 
-    private func attach(in rootView: NSView) {
-        guard let candidate = MarkdownEngineCompatibility.nativeTextView(
-            in: rootView
-        ) else {
-            return
-        }
+    private func attach(to candidate: NSTextView) {
         if candidate !== textView {
             MarkdownEngineCompatibility.endObservingSelection(
                 of: textView,
@@ -149,6 +169,7 @@ final class EditorPaneStateCoordinator: NSObject {
             }
             hasRestoredState = false
         }
+        renderedContentResizeCoordinator.attach(to: candidate)
         restoreStateIfNeeded()
         restorePendingSelectionIfNeeded()
         updatePaneState()
@@ -194,7 +215,24 @@ final class EditorPaneStateCoordinator: NSObject {
     }
 
     @objc private func renderedContentDidUpdate(_ notification: Notification) {
-        scheduleMermaidApply()
+        if let sender = notification.object as? NSTextView {
+            guard sender === textView else { return }
+            // The resize coordinator posts this targeted notification and
+            // stabilizes the resulting full restyle synchronously itself.
+            return
+        }
+        let isMermaidUpdate =
+            notification.name == pane.mermaidRenderer.updateNotification
+        let isLatexUpdate =
+            notification.name == pane.latexRenderer.updateNotification
+        if isMermaidUpdate || isLatexUpdate {
+            scheduleMermaidApply()
+        }
+        if isLatexUpdate {
+            renderedContentResizeCoordinator.renderedContentDidUpdate(
+                mayContainCenteredBlocks: true
+            )
+        }
     }
 
     private func sourceDidChange(
@@ -243,6 +281,7 @@ final class EditorPaneStateCoordinator: NSObject {
             hasRestoredState = false
         }
         presentation = newPresentation
+        renderedContentResizeCoordinator.updatePresentation(newPresentation)
         lastSourceText = revision.text
         scheduleMermaidParse()
     }
@@ -383,12 +422,19 @@ final class EditorPaneStateCoordinator: NSObject {
         }
     }
 
-    private func scheduleMermaidApply() {
+    private func scheduleMermaidApply(viewportWidth: CGFloat? = nil) {
+        if let viewportWidth,
+           viewportWidth.isFinite,
+           viewportWidth > 0 {
+            pendingMermaidViewportWidth = viewportWidth
+        }
         guard !mermaidApplyScheduled else { return }
         mermaidApplyScheduled = true
         DispatchQueue.main.async { [weak self, weak textView] in
             guard let self else { return }
             self.mermaidApplyScheduled = false
+            let viewportWidth = self.pendingMermaidViewportWidth
+            self.pendingMermaidViewportWidth = nil
             guard
                   let textView,
                   textView === self.textView,
@@ -396,12 +442,18 @@ final class EditorPaneStateCoordinator: NSObject {
                     == self.sourceBuffer.revision.number else {
                 return
             }
-            self.mermaidPresenter.apply(
+            let didApply = self.mermaidPresenter.apply(
                 to: textView,
                 rendersMarkdown: self.presentation.rendersMarkdown,
                 source: self.presentation.text,
-                blocks: self.mermaidBlocks
+                blocks: self.mermaidBlocks,
+                viewportWidth: viewportWidth
             )
+            if didApply {
+                self.renderedContentResizeCoordinator.renderedContentDidUpdate(
+                    mayContainCenteredBlocks: false
+                )
+            }
         }
     }
 

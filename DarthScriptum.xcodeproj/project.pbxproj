@@ -128,7 +128,7 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		F00000000000000000000003 /* swift-markdown-engine */ = {isa = XCRemoteSwiftPackageReference; repositoryURL = "https://github.com/nodes-app/swift-markdown-engine.git"; requirement = {kind = exactVersion; version = 0.10.1;};};
+		F00000000000000000000003 /* swift-markdown-engine */ = {isa = XCRemoteSwiftPackageReference; repositoryURL = "https://github.com/nodes-app/swift-markdown-engine.git"; requirement = {kind = exactVersion; version = 0.11.0;};};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */

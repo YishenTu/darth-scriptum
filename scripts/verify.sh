@@ -25,6 +25,8 @@ xcodebuild \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
   CODE_SIGNING_ALLOWED=NO \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
   build
 
 xcodebuild \
@@ -34,6 +36,8 @@ xcodebuild \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
   CODE_SIGNING_ALLOWED=NO \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
   build
 
 xcodebuild \
@@ -43,6 +47,8 @@ xcodebuild \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
   CODE_SIGNING_ALLOWED=NO \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
   -skip-testing:DarthScriptumTests/PerformanceTests \
   test
 
@@ -53,5 +59,7 @@ xcodebuild \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
   CODE_SIGNING_ALLOWED=NO \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
   -only-testing:DarthScriptumTests/PerformanceTests \
   test
