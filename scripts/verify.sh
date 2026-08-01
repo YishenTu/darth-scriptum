@@ -17,6 +17,7 @@ trap cleanup EXIT
 cd "$repository_root"
 
 ./scripts/check-architecture.sh
+tests/architecture/run-tests.sh
 
 xcodebuild \
   -project "$project_path" \
@@ -24,6 +25,7 @@ xcodebuild \
   -configuration Debug \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -onlyUsePackageVersionsFromResolvedFile \
   CODE_SIGNING_ALLOWED=NO \
   ARCHS=arm64 \
   ONLY_ACTIVE_ARCH=YES \
@@ -35,6 +37,7 @@ xcodebuild \
   -configuration Release \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -onlyUsePackageVersionsFromResolvedFile \
   CODE_SIGNING_ALLOWED=NO \
   ARCHS=arm64 \
   ONLY_ACTIVE_ARCH=YES \
@@ -46,6 +49,7 @@ xcodebuild \
   -configuration Debug \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -onlyUsePackageVersionsFromResolvedFile \
   CODE_SIGNING_ALLOWED=NO \
   ARCHS=arm64 \
   ONLY_ACTIVE_ARCH=YES \
@@ -58,6 +62,7 @@ xcodebuild \
   -configuration Benchmark \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -onlyUsePackageVersionsFromResolvedFile \
   CODE_SIGNING_ALLOWED=NO \
   ARCHS=arm64 \
   ONLY_ACTIVE_ARCH=YES \
