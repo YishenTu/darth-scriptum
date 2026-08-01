@@ -32,19 +32,18 @@ scripts/
 
 ## Naming
 
-- Follow the Swift API Design Guidelines and optimize names for clarity at the call site.
-- Use `UpperCamelCase` for targets, modules, types, protocols, generic parameters, Swift directories, and Swift filenames. Use `lowerCamelCase` for functions, properties, variables, parameters, enum cases, and constants.
-- Name files after their primary declaration and keep one primary top-level type per file. Use `Type+Capability.swift` for focused extensions.
-- Avoid generic filenames such as `Types.swift`, `Models.swift`, `Helpers.swift`, `Extensions.swift`, and `Constants.swift`.
-- Use nouns for values and types. Name capability protocols with `-able`, `-ible`, or `-ing`; do not use an `I` prefix or unnecessary `Protocol` suffix.
-- Use precise role suffixes such as `Store`, `Coordinator`, `Reducer`, `Renderer`, `Policy`, `Scheduler`, `Observer`, `Delegate`, `Factory`, or `Adapter`. Avoid vague `Manager`, `Helper`, `Util`, `Base`, and `Service` names.
-- Use verbs for side effects, noun phrases for queries, `make` for factories, assertion-style Boolean names, and `Error` for error types. Do not restate `async` or `throws` in a name.
-- Preserve Swift casing for initialisms and established names: `URLSession`, `documentURL`, `HTMLRenderer`, `UTF8`, `recordID`, `AppKit`, `SwiftUI`, `WebKit`, and `LaTeX`.
-- Use the narrowest truthful access level. Preserve required or upstream names for `main.swift`, `Package.swift`, `Info.plist`, assets, generated files, and vendored files.
-- Name repository shell scripts with lower-kebab-case verb phrases, such as `build-debug.sh`.
+- Follow Swift API Design Guidelines. Use `UpperCamelCase` for types, protocols, Swift files, and directories; use `lowerCamelCase` for members and values; preserve established initialisms.
+- Name files after their primary declaration and keep one primary top-level type per file. Use `Type+Capability.swift` for focused extensions; avoid generic or catch-all names.
+- Choose precise roles: nouns for types and values, verbs for side effects, `make` for factories, assertion-style Booleans, `Error` errors, and `-able` capability protocols. Prefer role suffixes such as `Store`, `Coordinator`, or `Renderer` over vague names such as `Manager` or `Helper`.
+- Use the narrowest truthful access level; preserve required and upstream names. Name repository shell scripts with lower-kebab-case verb phrases.
+
+## Working notes
+
+- Do not create or commit `docs/` content; it becomes stale quickly. Put temporary documentation, plans, and handoff notes in Git-ignored `.context/`.
 
 ## Tests
 
+- TDD is mandatory.
 - Name XCTest types and files `<Subject>Tests`; name methods `test<Action>When<Condition><Outcome>()`.
 - Name support types by role: `Recorder`, `Spy`, `Stub`, `Fake`, `Harness`, or `Fixture`. Use `Mock` only when it verifies interactions.
 - Name shared support files `<Subject>TestSupport.swift` or `<Purpose>TestHarness.swift`. Use lower-kebab-case for repository-owned non-Swift fixtures.
