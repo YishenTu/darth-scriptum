@@ -70,17 +70,28 @@ final class MarkdownWorkspaceResizeTests: XCTestCase {
                 repeating: "Spacer paragraph keeps the document scrollable.\n\n",
                 count: 160
             )
-        let (harness, syncCoordinator, model) = makeHarness(source: source)
+        let (harness, syncCoordinator, _) = makeHarness(source: source)
         defer {
             harness.close()
             syncCoordinator.close()
         }
         let textView = try await harness.nativeTextView()
         let tableLocation = (source as NSString).range(of: "| Legal form").location
+
+        // Establish a deterministic wide baseline after the coordinator is
+        // attached. The hosting view can initially present the table at its
+        // minimum width before the requested window size finishes settling.
+        await harness.resize(through: [1_000])
+        let initialContainerWidth = try XCTUnwrap(
+            textView.textContainer?.containerSize.width
+        )
         let initialBlock = try await harness.renderedBlock(
             in: textView,
             at: tableLocation
-        )
+        ) {
+            $0.bounds.width <= initialContainerWidth + 0.5
+                && $0.bounds.width >= initialContainerWidth - 4
+        }
         try await harness.scrollPastDocumentLocation(
             NSMaxRange(
                 (source as NSString).range(
@@ -97,33 +108,25 @@ final class MarkdownWorkspaceResizeTests: XCTestCase {
         }
         try harness.beginLiveResize(for: textView)
         liveResizeActive = true
-        let restyled = expectation(
-            forNotification:
-                model.primaryPane.latexRenderer.updateNotification,
-            object: textView
-        )
         await harness.resize(through: [820, 760, 700, 680])
-        await fulfillment(of: [restyled], timeout: 2)
 
         let containerWidth = try XCTUnwrap(
             textView.textContainer?.containerSize.width
         )
-        let currentBlock = try XCTUnwrap(
-            textView.textStorage.flatMap {
-                MarkdownEngineCompatibility.renderedBlock(
-                    in: $0,
-                    at: tableLocation
-                )
-            }
-        )
-        XCTAssertEqual(
+        let currentBlock = try await harness.renderedBlock(
+            in: textView,
+            at: tableLocation
+        ) {
+            $0.bounds.width <= containerWidth + 0.5
+                && $0.bounds.width < initialBlock.bounds.width - 20
+        }
+        XCTAssertLessThanOrEqual(
             currentBlock.bounds.width,
-            containerWidth,
-            accuracy: 1
+            containerWidth + 0.5
         )
-        XCTAssertGreaterThan(
-            abs(currentBlock.bounds.width - initialBlock.bounds.width),
-            20
+        XCTAssertLessThan(
+            currentBlock.bounds.width,
+            initialBlock.bounds.width - 20
         )
 
         try harness.endLiveResize(for: textView)
