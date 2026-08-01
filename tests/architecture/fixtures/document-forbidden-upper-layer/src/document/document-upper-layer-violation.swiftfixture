@@ -1,0 +1,3 @@
+struct DocumentViolation {
+    let editor: LivePreviewTextView?
+}

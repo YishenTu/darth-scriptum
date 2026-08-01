@@ -2,6 +2,35 @@ import XCTest
 @testable import DarthScriptum
 
 final class PerformanceTests: XCTestCase {
+    @MainActor
+    func testFourMiBRawSourceEditPreservesExactContent() throws {
+        let source = String(
+            repeating: "0123456789abcdef",
+            count: 256 * 1_024
+        )
+        let location = (source as NSString).length / 2
+        let expected = NSMutableString(string: source)
+        expected.replaceCharacters(
+            in: NSRange(location: location, length: 16),
+            with: "RAW-SOURCE-EDIT"
+        )
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(text: source, format: .newDocument)
+        )
+
+        try buffer.apply(
+            SourceEdit(
+                range: NSRange(location: location, length: 16),
+                replacement: "RAW-SOURCE-EDIT",
+                expectedRevision: buffer.revision.number,
+                origin: .localEditor(paneID: UUID())
+            )
+        )
+
+        XCTAssertEqual(buffer.revision.number, 1)
+        XCTAssertEqual(buffer.revision.text, expected as String)
+    }
+
     func testOneMiBEditorReconciliationIsCorrect() {
         let line = "- [x] **fast** `native` [link](relative.md)\r\n"
         let repetitions = max(1, 1_048_576 / line.utf8.count)
@@ -133,6 +162,68 @@ final class PerformanceTests: XCTestCase {
         XCTAssertTrue(text.contains("external 2\n"))
     }
 
+    @MainActor
+    func testFourMiBRecoveryPersistenceRoundTripIsExact() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let recoveryDirectory = directory.appendingPathComponent(
+            "recovery",
+            isDirectory: true
+        )
+        let documentURL = directory.appendingPathComponent("large.md")
+        let identity = DocumentIdentity.make(url: documentURL)
+        let data = Data(
+            repeating: 0xA5,
+            count: 4 * 1_024 * 1_024
+        )
+        let store = SessionRecoveryStore(
+            persistenceDirectory: recoveryDirectory
+        )
+
+        let persisted = try await store.addRawData(data, for: identity)
+        XCTAssertEqual(persisted.byteCount, data.count)
+        XCTAssertFalse(persisted.isDataResident)
+
+        let reopened = SessionRecoveryStore(
+            persistenceDirectory: recoveryDirectory
+        )
+        let entries = try await reopened.rawRecoveryEntries(for: identity)
+        let recovered = try XCTUnwrap(entries.first)
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(recovered.contentDigest, persisted.contentDigest)
+        let recoveredData = try await recovered.loadData()
+        XCTAssertEqual(recoveredData, data)
+    }
+
+    @MainActor
+    func testRendererQueueSaturationRemainsBoundedAndDeterministic()
+        async {
+        let backend = BenchmarkMermaidBackend()
+        let renderer = MermaidRenderer(backend: backend)
+        let submittedCount = MermaidRenderer.maximumPendingEntries + 32
+
+        for index in 0..<submittedCount {
+            XCTAssertNil(
+                renderer.diagram(
+                    for: "flowchart LR\nA\(index) --> B\(index)"
+                )
+            )
+        }
+
+        XCTAssertEqual(
+            renderer.pendingEntryCountForTesting,
+            MermaidRenderer.maximumPendingEntries
+        )
+        await backend.waitForCallCount(
+            MermaidRenderer.maximumPendingEntries
+        )
+        XCTAssertEqual(
+            backend.callCount,
+            MermaidRenderer.maximumPendingEntries
+        )
+    }
+
     func testTenMiBCodecRoundTripMeasurement() throws {
         let source = String(repeating: "text\r\n", count: 1_500_000)
         let snapshot = DocumentSnapshot(
@@ -156,17 +247,64 @@ final class PerformanceTests: XCTestCase {
 
     @MainActor
     private func waitForLineIndex(
-        in buffer: MarkdownSourceBuffer,
-        timeout: Duration = .seconds(10)
+        in buffer: MarkdownSourceBuffer
     ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            if buffer.position(atUTF16Location: 0) != nil {
-                return
-            }
-            try await Task.sleep(for: .milliseconds(10))
+        if buffer.position(atUTF16Location: 0) != nil {
+            return
         }
-        XCTFail("Timed out waiting for the background line index.")
+        await withCheckedContinuation { continuation in
+            var observerToken: UUID?
+            observerToken = buffer.observeLineIndex {
+                if let observerToken {
+                    buffer.removeLineIndexObserver(observerToken)
+                }
+                continuation.resume()
+            }
+            if buffer.position(atUTF16Location: 0) != nil {
+                if let observerToken {
+                    buffer.removeLineIndexObserver(observerToken)
+                }
+                continuation.resume()
+            }
+        }
+    }
+}
+
+@MainActor
+private final class BenchmarkMermaidBackend: MermaidRenderingBackend {
+    private struct Waiter {
+        let expectedCount: Int
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private(set) var callCount = 0
+    private var waiters: [Waiter] = []
+
+    func render(source: String) async -> MermaidRenderOutcome {
+        callCount += 1
+        let ready = waiters.filter { callCount >= $0.expectedCount }
+        waiters.removeAll { callCount >= $0.expectedCount }
+        for waiter in ready {
+            waiter.continuation.resume()
+        }
+        return .unsupported
+    }
+
+    func waitForCallCount(_ expectedCount: Int) async {
+        if callCount >= expectedCount {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            if callCount >= expectedCount {
+                continuation.resume()
+            } else {
+                waiters.append(
+                    Waiter(
+                        expectedCount: expectedCount,
+                        continuation: continuation
+                    )
+                )
+            }
+        }
     }
 }

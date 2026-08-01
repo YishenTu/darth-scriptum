@@ -238,6 +238,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         fileMenu.addItem(recentItem)
         openRecentMenu = recentMenu
         fileMenu.addItem(.separator())
+        let saveAsItem = fileMenu.addItem(
+            withTitle: "Save As…",
+            action: #selector(NSDocument.saveAs(_:)),
+            keyEquivalent: "s"
+        )
+        saveAsItem.keyEquivalentModifierMask = [.command, .shift]
+        fileMenu.addItem(.separator())
         fileMenu.addItem(
             withTitle: "Close",
             action: #selector(NSWindow.performClose(_:)),

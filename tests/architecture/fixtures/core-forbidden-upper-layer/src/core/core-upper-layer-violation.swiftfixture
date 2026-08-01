@@ -1,0 +1,3 @@
+struct CoreViolation {
+    let workspace: WorkspaceModel?
+}

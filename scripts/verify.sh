@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+script_path="${0:A}"
+repository_root="${script_path:h:h}"
 project_path="DarthScriptum.xcodeproj"
 scheme_name="DarthScriptum"
 destination_name="platform=macOS,arch=arm64"
@@ -12,13 +14,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+cd "$repository_root"
+
+./scripts/check-architecture.sh
+tests/architecture/run-tests.sh
+
 xcodebuild \
   -project "$project_path" \
   -scheme "$scheme_name" \
   -configuration Debug \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -onlyUsePackageVersionsFromResolvedFile \
   CODE_SIGNING_ALLOWED=NO \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
   build
 
 xcodebuild \
@@ -27,7 +37,10 @@ xcodebuild \
   -configuration Release \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -onlyUsePackageVersionsFromResolvedFile \
   CODE_SIGNING_ALLOWED=NO \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
   build
 
 xcodebuild \
@@ -36,7 +49,10 @@ xcodebuild \
   -configuration Debug \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -onlyUsePackageVersionsFromResolvedFile \
   CODE_SIGNING_ALLOWED=NO \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
   -skip-testing:DarthScriptumTests/PerformanceTests \
   test
 
@@ -46,6 +62,9 @@ xcodebuild \
   -configuration Benchmark \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -onlyUsePackageVersionsFromResolvedFile \
   CODE_SIGNING_ALLOWED=NO \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=YES \
   -only-testing:DarthScriptumTests/PerformanceTests \
   test
