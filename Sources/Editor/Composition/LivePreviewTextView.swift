@@ -14,6 +14,7 @@ final class EditorPaneModel: ObservableObject, Identifiable {
     let latexRenderer: AdaptiveLaTeXRenderer
     let mermaidRenderer: MermaidRenderer
     let imageProvider: MarkdownImageProvider
+    let bindingMutationAccumulator = EditorBindingMutationAccumulator()
     private var cachedConfigurationKey: ConfigurationKey?
     private var cachedConfiguration: MarkdownEditorConfiguration?
     @Published var selectedRange = NSRange(location: 0, length: 0)
@@ -185,6 +186,7 @@ struct LivePreviewTextView: NSViewRepresentable {
                 guard
                     let edit = MarkdownEditorTextAdapter.sourceEdit(
                         editorText: updatedText,
+                        capturedMutation: pane.bindingMutationAccumulator.consume(),
                         currentRevision: revision,
                         newlineStyle: newlineStyle,
                         origin: .localEditor(paneID: pane.id),
@@ -254,8 +256,11 @@ enum MarkdownPresentationPolicy {
 }
 
 enum MarkdownEditorTextAdapter {
+    private static let maximumTrustedMutationLength = 64 * 1_024
+
     static func sourceEdit(
         editorText: String,
+        capturedMutation: EditorBindingMutation? = nil,
         currentRevision: SourceRevision,
         newlineStyle: NewlineStyle,
         origin: DocumentChangeOrigin,
@@ -275,6 +280,18 @@ enum MarkdownEditorTextAdapter {
             assertionFailure("Presented source range is outside the document.")
             return nil
         }
+        if let capturedMutation,
+            let edit = sourceEdit(
+                capturedMutation: capturedMutation,
+                editorText: editorText,
+                currentRevision: currentRevision,
+                newlineStyle: newlineStyle,
+                origin: origin,
+                sourceRange: sourceRange
+            )
+        {
+            return edit
+        }
         let presentedSource = source.substring(with: sourceRange)
         guard editorText != presentedSource else { return nil }
 
@@ -293,6 +310,71 @@ enum MarkdownEditorTextAdapter {
                 location: sourceRange.location
                     + difference.originalRange.location,
                 length: difference.originalRange.length
+            ),
+            replacement: terminatingFrontMatterNewlineIfNeeded(
+                normalizedReplacement,
+                currentSource: currentRevision.text,
+                sourceRange: sourceRange,
+                newlineStyle: newlineStyle
+            ),
+            expectedRevision: currentRevision.number,
+            origin: origin
+        )
+    }
+
+    private static func sourceEdit(
+        capturedMutation: EditorBindingMutation,
+        editorText: String,
+        currentRevision: SourceRevision,
+        newlineStyle: NewlineStyle,
+        origin: DocumentChangeOrigin,
+        sourceRange: NSRange
+    ) -> SourceEdit? {
+        guard capturedMutation.sourceRevisionNumber == currentRevision.number,
+            capturedMutation.presentedSourceRange == sourceRange,
+            capturedMutation.originalPresentedLength == sourceRange.length,
+            capturedMutation.range.location >= 0,
+            capturedMutation.range.length >= 0,
+            NSMaxRange(capturedMutation.range) <= sourceRange.length,
+            capturedMutation.range.length <= maximumTrustedMutationLength
+        else {
+            return nil
+        }
+
+        let replacementLength = (capturedMutation.replacement as NSString).length
+        guard replacementLength <= maximumTrustedMutationLength,
+            capturedMutation.updatedPresentedLength
+                == sourceRange.length
+                - capturedMutation.range.length
+                + replacementLength
+        else {
+            return nil
+        }
+
+        let edited = editorText as NSString
+        guard edited.length == capturedMutation.updatedPresentedLength else {
+            return nil
+        }
+        let replacementRange = NSRange(
+            location: capturedMutation.range.location,
+            length: replacementLength
+        )
+        guard NSMaxRange(replacementRange) <= edited.length,
+            edited.substring(with: replacementRange)
+                == capturedMutation.replacement
+        else {
+            return nil
+        }
+
+        let normalizedReplacement = normalizeNewlines(
+            capturedMutation.replacement,
+            to: newlineStyle
+        )
+        return SourceEdit(
+            range: NSRange(
+                location: sourceRange.location
+                    + capturedMutation.range.location,
+                length: capturedMutation.range.length
             ),
             replacement: terminatingFrontMatterNewlineIfNeeded(
                 normalizedReplacement,

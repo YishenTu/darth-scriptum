@@ -19,7 +19,10 @@ if [[ "$1" == "--all" ]]; then
     usage
     exit 2
   fi
-  test_selection=("-skip-testing:DarthScriptumTests/PerformanceTests")
+  test_selection=(
+    "-skip-testing:DarthScriptumTests/PerformanceTests"
+    "-skip-testing:DarthScriptumTests/EditPipelinePerformanceAuditTests"
+  )
 else
   test_identifier=""
   for test_identifier in "$@"; do

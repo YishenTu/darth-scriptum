@@ -3,7 +3,7 @@ import Foundation
 // The pure synchronization reducer exposes one event dispatcher. Focused extension
 // files hold its transition domains and share only reducer-internal helpers.
 enum DocumentSyncReducer {
-    static let localSaveDelay: Duration = .milliseconds(100)
+    static let localSaveDelay: Duration = .milliseconds(500)
     static let externalReadDelay: Duration = .zero
     static let closeDeadline: Duration = .seconds(30)
 

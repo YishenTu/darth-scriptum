@@ -53,6 +53,17 @@ Verify vendored renderer files without building:
 ./scripts/check-vendored-resources.sh
 ```
 
+## Performance audit
+
+Run the focused edit-pipeline benchmark with:
+
+```sh
+./scripts/perf-audit.sh
+```
+
+The recorded baseline, performance budgets, and comparison method are in the
+[performance audit](docs/performance-audit.md).
+
 ## License
 
 DarthScriptum is available under the [MIT License](LICENSE). Third-party

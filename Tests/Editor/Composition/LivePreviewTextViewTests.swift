@@ -33,6 +33,80 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
     }
 
+    func testEditorTextAdapterUsesCapturedNativeMutation() throws {
+        let source = "alpha\nomega"
+        let revision = SourceRevision(number: 7, text: source)
+        let edit = try XCTUnwrap(
+            MarkdownEditorTextAdapter.sourceEdit(
+                editorText: "alpha\nxomega",
+                capturedMutation: EditorBindingMutation(
+                    range: NSRange(location: 6, length: 0),
+                    replacement: "x",
+                    sourceRevisionNumber: revision.number,
+                    presentedSourceRange: NSRange(
+                        location: 0,
+                        length: (source as NSString).length
+                    ),
+                    originalPresentedLength: (source as NSString).length,
+                    updatedPresentedLength: (source as NSString).length + 1
+                ),
+                currentRevision: revision,
+                newlineStyle: .lf,
+                origin: .undoRedo
+            )
+        )
+
+        XCTAssertEqual(edit.range, NSRange(location: 6, length: 0))
+        XCTAssertEqual(edit.replacement, "x")
+        XCTAssertEqual(try edit.applying(to: revision).text, "alpha\nxomega")
+    }
+
+    func testEditorTextAdapterFallsBackForStaleCapturedMutation() throws {
+        let source = "alpha\nomega"
+        let revision = SourceRevision(number: 7, text: source)
+        let edit = try XCTUnwrap(
+            MarkdownEditorTextAdapter.sourceEdit(
+                editorText: "alpha\nyomega",
+                capturedMutation: EditorBindingMutation(
+                    range: NSRange(location: 6, length: 0),
+                    replacement: "x",
+                    sourceRevisionNumber: 6,
+                    presentedSourceRange: NSRange(
+                        location: 0,
+                        length: (source as NSString).length
+                    ),
+                    originalPresentedLength: (source as NSString).length,
+                    updatedPresentedLength: (source as NSString).length + 1
+                ),
+                currentRevision: revision,
+                newlineStyle: .lf,
+                origin: .undoRedo
+            )
+        )
+
+        XCTAssertEqual(edit.range, NSRange(location: 6, length: 0))
+        XCTAssertEqual(edit.replacement, "y")
+        XCTAssertEqual(try edit.applying(to: revision).text, "alpha\nyomega")
+    }
+
+    func testMutationAccumulatorRejectsAmbiguousTextTransactions() {
+        let accumulator = EditorBindingMutationAccumulator()
+        let mutation = EditorBindingMutation(
+            range: NSRange(location: 0, length: 0),
+            replacement: "x",
+            sourceRevisionNumber: 0,
+            presentedSourceRange: NSRange(location: 0, length: 0),
+            originalPresentedLength: 0,
+            updatedPresentedLength: 1
+        )
+
+        accumulator.record(mutation)
+        accumulator.record(mutation)
+
+        XCTAssertNil(accumulator.consume())
+        XCTAssertEqual(accumulator.mutationConsumptionCount, 0)
+    }
+
     func testNativeEditorPreservesCRLFForAppendedLineAndFinalNewline() async throws {
         let source = "# CRLF\r\n\r\nFirst line\r\nSecond line\r\n"
         let appendedLine = source + "Saved line"
@@ -102,6 +176,10 @@ final class LivePreviewTextViewTests: XCTestCase {
             buffer.revision.text == expected
         }
         XCTAssertEqual(buffer.revision.text, expected)
+        XCTAssertGreaterThanOrEqual(
+            pane.bindingMutationAccumulator.mutationConsumptionCount,
+            1
+        )
         _ = window
     }
 
