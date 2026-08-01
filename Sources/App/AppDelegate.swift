@@ -311,9 +311,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let sourceItem = viewMenu.addItem(
             withTitle: "Toggle Source Mode",
             action: #selector(toggleSourceMode(_:)),
-            keyEquivalent: "m"
+            keyEquivalent: "e"
         )
-        sourceItem.keyEquivalentModifierMask = [.command, .shift]
         sourceItem.target = self
         let splitRightItem = viewMenu.addItem(
             withTitle: "Split Right",

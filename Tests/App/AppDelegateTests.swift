@@ -6,6 +6,7 @@ import XCTest
 @objc private protocol AppDelegateMenuActions {
     func undoDocument(_ sender: Any?)
     func redoDocument(_ sender: Any?)
+    func toggleSourceMode(_ sender: Any?)
     func splitRight(_ sender: Any?)
     func focusPreviousPane(_ sender: Any?)
     func focusNextPane(_ sender: Any?)
@@ -106,6 +107,12 @@ final class AppDelegateTests: XCTestCase {
             key: "t",
             modifiers: [.command],
             action: #selector(NSDocumentController.newDocument(_:))
+        )
+        assertShortcut(
+            viewMenu?.item(withTitle: "Toggle Source Mode"),
+            key: "e",
+            modifiers: [.command],
+            action: #selector(AppDelegateMenuActions.toggleSourceMode(_:))
         )
         assertShortcut(
             viewMenu?.item(withTitle: "Split Right"),
