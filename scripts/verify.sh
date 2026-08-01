@@ -7,6 +7,7 @@ repository_root="${script_path:h:h}"
 project_path="DarthScriptum.xcodeproj"
 scheme_name="DarthScriptum"
 destination_name="platform=macOS,arch=arm64"
+verification_config="Sources/Configuration/Verification.xcconfig"
 derived_data="$(mktemp -d "${TMPDIR:-/tmp}/darth-scriptum-verify.XXXXXX")"
 
 cleanup() {
@@ -16,8 +17,10 @@ trap cleanup EXIT
 
 cd "$repository_root"
 
+./scripts/lint.sh
+./scripts/check-vendored-resources.sh
 ./scripts/check-architecture.sh
-tests/architecture/run-tests.sh
+Tests/Architecture/run-tests.sh
 
 xcodebuild \
   -project "$project_path" \
@@ -25,10 +28,8 @@ xcodebuild \
   -configuration Debug \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -xcconfig "$verification_config" \
   -onlyUsePackageVersionsFromResolvedFile \
-  CODE_SIGNING_ALLOWED=NO \
-  ARCHS=arm64 \
-  ONLY_ACTIVE_ARCH=YES \
   build
 
 xcodebuild \
@@ -37,10 +38,8 @@ xcodebuild \
   -configuration Release \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -xcconfig "$verification_config" \
   -onlyUsePackageVersionsFromResolvedFile \
-  CODE_SIGNING_ALLOWED=NO \
-  ARCHS=arm64 \
-  ONLY_ACTIVE_ARCH=YES \
   build
 
 xcodebuild \
@@ -49,10 +48,8 @@ xcodebuild \
   -configuration Debug \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -xcconfig "$verification_config" \
   -onlyUsePackageVersionsFromResolvedFile \
-  CODE_SIGNING_ALLOWED=NO \
-  ARCHS=arm64 \
-  ONLY_ACTIVE_ARCH=YES \
   -skip-testing:DarthScriptumTests/PerformanceTests \
   test
 
@@ -62,9 +59,7 @@ xcodebuild \
   -configuration Benchmark \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
+  -xcconfig "$verification_config" \
   -onlyUsePackageVersionsFromResolvedFile \
-  CODE_SIGNING_ALLOWED=NO \
-  ARCHS=arm64 \
-  ONLY_ACTIVE_ARCH=YES \
   -only-testing:DarthScriptumTests/PerformanceTests \
   test
