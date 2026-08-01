@@ -398,6 +398,39 @@ final class RenderedContentResizeTests: XCTestCase {
         }
     }
 
+    func testFirstOrdinaryResizePinsFirstVisibleWrappedLine() async throws {
+        let source = (0..<180).map { index in
+            """
+            Paragraph \(index) has enough prose to wrap repeatedly as the \
+            viewport narrows, changing the height of every preceding paragraph \
+            without changing the reader's semantic position in the note.
+            """
+        }.joined(separator: "\n\n")
+        let harness = makeHarness(
+            source: source,
+            pane: EditorPaneModel(),
+            onScreen: true
+        )
+        defer { harness.close() }
+        let textView = try await harness.nativeTextView()
+        try await harness.scroll(toVerticalFraction: 0.45, in: textView)
+        let anchor = try XCTUnwrap(
+            FirstVisibleLineViewportAnchor.capture(in: textView)
+        )
+
+        harness.resizeImmediately(to: 680)
+
+        let currentOffset = try XCTUnwrap(
+            anchor.currentViewportOffset(in: textView)
+        )
+        XCTAssertEqual(
+            currentOffset,
+            anchor.viewportOffset,
+            accuracy: 1,
+            "The anchor must be captured before the first ordinary width change."
+        )
+    }
+
     func testDelayedTableRestyleKeepsFirstVisibleLinePinned() async throws {
         let table = """
         | Legal form | Detailed formation and registration requirements | Recurring accounting taxation and compliance obligations |

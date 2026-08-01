@@ -92,16 +92,25 @@ struct LivePreviewTextView: NSViewRepresentable {
 
     func makeNSView(
         context: Context
-    ) -> NSHostingView<AnyView> {
-        let hostingView = NSHostingView(rootView: AnyView(editorView))
+    ) -> EditorLayoutHostingView {
+        let hostingView = EditorLayoutHostingView(
+            rootView: AnyView(editorView)
+        )
         hostingView.sizingOptions = []
+        let coordinator = context.coordinator
+        hostingView.onWidthWillChange = { [weak coordinator] width in
+            coordinator?.editorWidthWillChange(to: width)
+        }
+        hostingView.onLayoutDidComplete = { [weak coordinator] in
+            coordinator?.editorLayoutDidComplete()
+        }
         context.coordinator.start()
         context.coordinator.scheduleAttachment(in: hostingView)
         return hostingView
     }
 
     func updateNSView(
-        _ hostingView: NSHostingView<AnyView>,
+        _ hostingView: EditorLayoutHostingView,
         context: Context
     ) {
         context.coordinator.setPresentation(presentation)
@@ -111,9 +120,11 @@ struct LivePreviewTextView: NSViewRepresentable {
     }
 
     static func dismantleNSView(
-        _ hostingView: NSHostingView<AnyView>,
+        _ hostingView: EditorLayoutHostingView,
         coordinator: EditorPaneStateCoordinator
     ) {
+        hostingView.onWidthWillChange = nil
+        hostingView.onLayoutDidComplete = nil
         coordinator.stop()
     }
 

@@ -8,6 +8,7 @@ final class RenderedContentResizeCoordinator {
     private let onMermaidViewportWidth: @MainActor (CGFloat) -> Void
 
     private weak var textView: NSTextView?
+    private weak var layoutView: NSView?
     private var presentation: MarkdownSourcePresentation
     private var hasTableCandidate: Bool?
     private var originNormalizationScheduled = false
@@ -33,7 +34,6 @@ final class RenderedContentResizeCoordinator {
 
         viewportObserver.onImmediateWidthChange = { [weak self] _ in
             self?.scheduleTextContainerOriginNormalization()
-            self?.firstVisibleLineAnchor.layoutDidChange()
         }
         viewportObserver.onLiveResizeWillStart = { [weak self] viewportWidth in
             self?.resizeWillStart(viewportWidth: viewportWidth)
@@ -47,20 +47,26 @@ final class RenderedContentResizeCoordinator {
         }
     }
 
-    func attach(to textView: NSTextView) {
+    var isApplyingAnchorCompensation: Bool {
+        firstVisibleLineAnchor.isApplyingCompensation
+    }
+
+    func attach(to textView: NSTextView, layoutView: NSView) {
         let editorChanged = textView !== self.textView
+            || layoutView !== self.layoutView
         if editorChanged {
             cancelPendingFinalTableRestyle()
             originNormalizationScheduled = false
             renderedBlockStabilizationScheduled = false
             self.textView = textView
+            self.layoutView = layoutView
             lastTableRestyleWidth = nil
         }
         viewportObserver.attach(
             clipView: textView.enclosingScrollView?.contentView,
             window: textView.window
         )
-        firstVisibleLineAnchor.attach(to: textView)
+        firstVisibleLineAnchor.attach(to: textView, layoutView: layoutView)
         if editorChanged {
             scheduleRenderedBlockStabilization()
         }
@@ -73,6 +79,16 @@ final class RenderedContentResizeCoordinator {
         self.presentation = presentation
         hasTableCandidate = nil
         lastTableRestyleWidth = nil
+    }
+
+    func editorWidthWillChange(to width: CGFloat) {
+        guard width.isFinite, width > 0 else { return }
+        cancelPendingFinalTableRestyle()
+        firstVisibleLineAnchor.widthWillChange()
+    }
+
+    func editorLayoutDidComplete() {
+        firstVisibleLineAnchor.layoutDidComplete()
     }
 
     func renderedContentDidUpdate(mayContainCenteredBlocks: Bool) {
@@ -93,6 +109,7 @@ final class RenderedContentResizeCoordinator {
         originNormalizationScheduled = false
         renderedBlockStabilizationScheduled = false
         textView = nil
+        layoutView = nil
     }
 
     private func handle(
@@ -121,7 +138,7 @@ final class RenderedContentResizeCoordinator {
 
     private func resizeWillStart(viewportWidth: CGFloat) {
         cancelPendingFinalTableRestyle()
-        firstVisibleLineAnchor.begin()
+        firstVisibleLineAnchor.beginIfNeeded()
         stabilizeCenteredRenderedBlocks(viewportWidth: viewportWidth)
     }
 

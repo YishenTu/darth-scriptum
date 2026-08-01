@@ -217,29 +217,34 @@ final class FirstVisibleLineResizeAnchor: NSObject {
 
     private weak var textView: NSTextView?
     private weak var scrollView: NSScrollView?
+    private weak var layoutView: NSView?
     private var anchor: FirstVisibleLineViewportAnchor?
     private var isActive = false
     private var isUserScrolling = false
-    private var restoreScheduled = false
+    private var layoutNeedsRestore = false
     private var finishRequested = false
     private var finishTimer: Timer?
     private let settleInterval: TimeInterval
+
+    private(set) var isApplyingCompensation = false
 
     init(settleInterval: TimeInterval = defaultSettleInterval) {
         self.settleInterval = max(0, settleInterval)
         super.init()
     }
 
-    func attach(to textView: NSTextView) {
+    func attach(to textView: NSTextView, layoutView: NSView) {
         let candidateScrollView = textView.enclosingScrollView
         guard textView !== self.textView
-                || candidateScrollView !== scrollView else {
+                || candidateScrollView !== scrollView
+                || layoutView !== self.layoutView else {
             return
         }
         stopObservingScrollView()
         cancel()
         self.textView = textView
         scrollView = candidateScrollView
+        self.layoutView = layoutView
         if let candidateScrollView {
             NotificationCenter.default.addObserver(
                 self,
@@ -256,7 +261,21 @@ final class FirstVisibleLineResizeAnchor: NSObject {
         }
     }
 
-    func begin() {
+    func beginIfNeeded() {
+        guard !isActive else { return }
+        begin()
+    }
+
+    func widthWillChange() {
+        beginIfNeeded()
+        guard isActive, !isUserScrolling, anchor != nil else { return }
+        finishTimer?.invalidate()
+        finishTimer = nil
+        finishRequested = false
+        layoutNeedsRestore = true
+    }
+
+    private func begin() {
         guard let textView else { return }
         finishTimer?.invalidate()
         finishTimer = nil
@@ -264,17 +283,45 @@ final class FirstVisibleLineResizeAnchor: NSObject {
         isUserScrolling = false
         isActive = true
         anchor = FirstVisibleLineViewportAnchor.capture(in: textView)
+        layoutNeedsRestore = false
     }
 
     func layoutDidChange() {
         guard isActive, !isUserScrolling else { return }
-        // Width changes are delivered while AppKit is still processing the
-        // resize event. Restore now so the transient reflowed position cannot
-        // become a visible frame. Keep the deferred pass as well because
-        // SwiftUI and rendered-block updates can invalidate layout again later
-        // in the same run-loop turn.
-        restoreNow(layoutViewHierarchy: false)
-        scheduleRestore()
+        layoutNeedsRestore = true
+        requestLayout()
+    }
+
+    func layoutDidComplete() {
+        guard isActive,
+              !isUserScrolling,
+              layoutNeedsRestore,
+              !isApplyingCompensation,
+              let textView,
+              let anchor else {
+            return
+        }
+
+        layoutNeedsRestore = false
+        isApplyingCompensation = true
+        defer { isApplyingCompensation = false }
+
+        // TextKit can refine viewport geometry when the scroll position moves.
+        // A small bounded convergence loop keeps the transaction synchronous
+        // without allowing viewport relocation to recursively re-enter layout.
+        for _ in 0..<3 {
+            guard let currentOffset = anchor.currentViewportOffset(
+                in: textView
+            ) else {
+                break
+            }
+            guard abs(currentOffset - anchor.viewportOffset) > 0.5 else {
+                break
+            }
+            guard anchor.restore(in: textView) else { break }
+        }
+        textView.setNeedsDisplay(textView.visibleRect)
+
         if finishRequested {
             scheduleFinish()
         }
@@ -293,8 +340,9 @@ final class FirstVisibleLineResizeAnchor: NSObject {
         anchor = nil
         isActive = false
         isUserScrolling = false
-        restoreScheduled = false
+        layoutNeedsRestore = false
         finishRequested = false
+        isApplyingCompensation = false
     }
 
     func stop() {
@@ -302,26 +350,7 @@ final class FirstVisibleLineResizeAnchor: NSObject {
         cancel()
         textView = nil
         scrollView = nil
-    }
-
-    private func scheduleRestore() {
-        guard anchor != nil, !restoreScheduled else { return }
-        restoreScheduled = true
-        let observedTextView = textView
-        RunLoop.main.perform(inModes: [.default, .eventTracking]) {
-            [weak self, weak observedTextView] in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                self.restoreScheduled = false
-                guard self.isActive,
-                      !self.isUserScrolling,
-                      let observedTextView,
-                      observedTextView === self.textView else {
-                    return
-                }
-                self.restoreNow(layoutViewHierarchy: true)
-            }
-        }
+        layoutView = nil
     }
 
     private func scheduleFinish() {
@@ -341,16 +370,16 @@ final class FirstVisibleLineResizeAnchor: NSObject {
 
     private func finishNow() {
         guard isActive, !isUserScrolling else { return }
-        restoreNow(layoutViewHierarchy: true)
+        guard !layoutNeedsRestore else {
+            requestLayout()
+            scheduleFinish()
+            return
+        }
         cancel()
     }
 
-    private func restoreNow(layoutViewHierarchy: Bool) {
-        guard let textView, let anchor else { return }
-        if layoutViewHierarchy {
-            textView.window?.contentView?.layoutSubtreeIfNeeded()
-        }
-        _ = anchor.restore(in: textView)
+    private func requestLayout() {
+        layoutView?.needsLayout = true
     }
 
     @objc private func userScrollWillStart(_ notification: Notification) {
@@ -362,6 +391,7 @@ final class FirstVisibleLineResizeAnchor: NSObject {
         finishTimer = nil
         isUserScrolling = true
         anchor = nil
+        layoutNeedsRestore = false
     }
 
     @objc private func userScrollDidEnd(_ notification: Notification) {
@@ -372,6 +402,7 @@ final class FirstVisibleLineResizeAnchor: NSObject {
         }
         isUserScrolling = false
         anchor = FirstVisibleLineViewportAnchor.capture(in: textView)
+        layoutNeedsRestore = false
         if finishRequested {
             scheduleFinish()
         }

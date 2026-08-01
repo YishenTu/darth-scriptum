@@ -112,8 +112,16 @@ final class EditorPaneStateCoordinator: NSObject {
             ) else {
                 return
             }
-            self.attach(to: candidate)
+            self.attach(to: candidate, layoutView: rootView)
         }
+    }
+
+    func editorWidthWillChange(to width: CGFloat) {
+        renderedContentResizeCoordinator.editorWidthWillChange(to: width)
+    }
+
+    func editorLayoutDidComplete() {
+        renderedContentResizeCoordinator.editorLayoutDidComplete()
     }
 
     func setNormalizesDisplayMathSelection(_ shouldNormalize: Bool) {
@@ -134,7 +142,7 @@ final class EditorPaneStateCoordinator: NSObject {
         scheduleMermaidParse()
     }
 
-    private func attach(to candidate: NSTextView) {
+    private func attach(to candidate: NSTextView, layoutView: NSView) {
         if candidate !== textView {
             MarkdownEngineCompatibility.endObservingSelection(
                 of: textView,
@@ -169,7 +177,10 @@ final class EditorPaneStateCoordinator: NSObject {
             }
             hasRestoredState = false
         }
-        renderedContentResizeCoordinator.attach(to: candidate)
+        renderedContentResizeCoordinator.attach(
+            to: candidate,
+            layoutView: layoutView
+        )
         restoreStateIfNeeded()
         restorePendingSelectionIfNeeded()
         updatePaneState()
@@ -200,6 +211,8 @@ final class EditorPaneStateCoordinator: NSObject {
               observed === clipView else {
             return
         }
+        let isAnchorCompensation = renderedContentResizeCoordinator
+            .isApplyingAnchorCompensation
         DispatchQueue.main.async { [weak self, weak observed] in
             guard let self,
                   let observed,
@@ -210,7 +223,9 @@ final class EditorPaneStateCoordinator: NSObject {
             if self.pane.visibleOrigin != origin {
                 self.pane.visibleOrigin = origin
             }
-            self.scheduleMermaidApply()
+            if !isAnchorCompensation {
+                self.scheduleMermaidApply()
+            }
         }
     }
 
