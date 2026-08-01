@@ -1,39 +1,6 @@
 import Combine
 import Foundation
 
-struct DocumentSynchronizationStatusSnapshot: Equatable {
-    let presentedState: SynchronizationState?
-    let failureRequiresSaveAs: Bool
-    let recoveryMigrationIsPending: Bool
-    let recoveryRetryAvailable: Bool
-    let rawRecoveryURL: URL?
-    let hasLocalRecovery: Bool
-
-    static let empty = DocumentSynchronizationStatusSnapshot(
-        presentedState: nil,
-        failureRequiresSaveAs: false,
-        recoveryMigrationIsPending: false,
-        recoveryRetryAvailable: false,
-        rawRecoveryURL: nil,
-        hasLocalRecovery: false
-    )
-}
-
-private struct VerifiedCoordinatorAttachment: Sendable {
-    let targetURL: URL
-    let identity: DocumentIdentity
-    let sourceRevision: SourceRevision
-    let durableBaseline: DocumentSyncDurableBaseline?
-    let dataMatchesExpectedBytes: Bool
-    let verifiedExternalChange: DocumentSyncExternalChange?
-}
-
-private struct UnverifiedCoordinatorAttachment: Sendable {
-    let targetURL: URL
-    let identity: DocumentIdentity
-    let sourceRevision: SourceRevision
-}
-
 private enum PendingVerifiedExternalReadOutcome {
     case result(DocumentSyncExternalReadResult)
     case failure
@@ -49,45 +16,6 @@ private struct PendingVerifiedExternalRead {
 private struct PendingInitialPresenterSignal {
     let requestID: UUID
     let attachmentEpoch: UInt64
-}
-
-private enum CoordinatorAttachmentInspection: Sendable {
-    case verified(VerifiedCoordinatorAttachment)
-    case unavailable(UnverifiedCoordinatorAttachment)
-
-    var target: UnverifiedCoordinatorAttachment {
-        switch self {
-        case .verified(let attachment):
-            UnverifiedCoordinatorAttachment(
-                targetURL: attachment.targetURL,
-                identity: attachment.identity,
-                sourceRevision: attachment.sourceRevision
-            )
-        case .unavailable(let target):
-            target
-        }
-    }
-
-    var durableBaseline: DocumentSyncDurableBaseline? {
-        if case .verified(let attachment) = self {
-            return attachment.durableBaseline
-        }
-        return nil
-    }
-
-    var didReadData: Bool {
-        if case .verified = self {
-            return true
-        }
-        return false
-    }
-}
-
-enum DocumentSyncCoordinatorAttachmentError: Error, Sendable, Equatable {
-    case invalidSaveAsEvidence
-    case verificationUnavailable
-    case verificationInterrupted
-    case recoveryBlocksVerification
 }
 
 @MainActor
@@ -107,12 +35,12 @@ final class DocumentSyncCoordinator: ObservableObject {
     /// The reducer value is the sole owner of synchronization decisions.
     private(set) var reducerState: DocumentSyncState
 
-    private let recoveryStore: SessionRecoveryStore
     /// `DurableFileState` has no attachment identity, so it can only remain a
     /// compatibility projection until a verified file attachment replaces it.
     private var unattachedDurableState: DurableFileState?
     private let fileMonitoringEnabled: Bool
     private let effectExecutor: DocumentSyncCoordinatorEffectExecuting
+    private let recoveryEffectExecutor: DocumentSyncRecoveryEffectExecutor
     private let manualScheduler: ManualSyncScheduler?
     private let savePreparationHook: (@MainActor () async -> Void)?
     private let externalReadHook: (@MainActor (UInt64) async -> Void)?
@@ -165,11 +93,13 @@ final class DocumentSyncCoordinator: ObservableObject {
         durableState = initialDurableState
         unattachedDurableState = initialDurableState
         self.bridge = bridge
-        self.recoveryStore = recoveryStore
         self.fileMonitoringEnabled = fileMonitoringEnabled
         self.effectExecutor =
             effectExecutor
             ?? DocumentSyncDefaultEffectExecutor(recoveryStore: recoveryStore)
+        recoveryEffectExecutor = DocumentSyncRecoveryEffectExecutor(
+            recoveryStore: recoveryStore
+        )
         self.manualScheduler = manualScheduler
         self.savePreparationHook = savePreparationHook
         self.externalReadHook = externalReadHook
@@ -440,10 +370,10 @@ final class DocumentSyncCoordinator: ObservableObject {
         let sourceFormat = reducerState.format
         let baselineSourceRevision = expectedSourceRevision ?? capturedSource
         let commitGeneration = reducerState.durableBaseline?.commitGeneration ?? 0
-        let verification: CoordinatorAttachmentInspection
+        let verification: DocumentSyncAttachmentInspection
         do {
             verification = try await DocumentFileAccess.perform {
-                try Self.inspectSaveAsAttachment(
+                try DocumentSyncAttachmentInspection.inspectSaveAs(
                     at: targetURL,
                     expectedData: expectedData,
                     expectedSnapshot: expectedSnapshot,
@@ -652,7 +582,7 @@ final class DocumentSyncCoordinator: ObservableObject {
     }
 
     private func installInitialAttachment(
-        target: UnverifiedCoordinatorAttachment,
+        target: DocumentSyncAttachmentInspection.Target,
         durableBaseline: DocumentSyncDurableBaseline?,
         initialFormat: TextFileFormat? = nil,
         requiresExternalVerification: Bool = false
@@ -747,10 +677,10 @@ final class DocumentSyncCoordinator: ObservableObject {
     ) {
         let commitGeneration = reducerState.durableBaseline?.commitGeneration ?? 0
         attachmentTask = Task { [weak self] in
-            let inspection: CoordinatorAttachmentInspection
+            let inspection: DocumentSyncAttachmentInspection
             do {
                 inspection = try await DocumentFileAccess.perform {
-                    Self.inspectAttachment(
+                    DocumentSyncAttachmentInspection.inspect(
                         at: targetURL,
                         knownData: knownData,
                         sourceRevision: sourceRevision,
@@ -780,7 +710,7 @@ final class DocumentSyncCoordinator: ObservableObject {
     private func completeAttachment(
         requestID: UUID,
         event: AttachmentEvent,
-        inspection: CoordinatorAttachmentInspection,
+        inspection: DocumentSyncAttachmentInspection,
         initialFormat: TextFileFormat? = nil
     ) {
         guard !isTornDown, attachmentRequestID == requestID else { return }
@@ -891,7 +821,7 @@ final class DocumentSyncCoordinator: ObservableObject {
     /// captured by initial inspection so recovery readiness and the monitor
     /// token gate it ahead of every local save.
     private func queueFreshInitialTargetObservation(
-        from inspection: CoordinatorAttachmentInspection
+        from inspection: DocumentSyncAttachmentInspection
     ) -> Bool {
         guard case .verified(let attachment) = inspection,
             !attachment.dataMatchesExpectedBytes
@@ -1223,176 +1153,17 @@ final class DocumentSyncCoordinator: ObservableObject {
         }
     }
 
-    /// Recovery effects execute only their immutable request. The actor owns
-    /// the FIFO index and all blocking I/O, while this main-actor coordinator
-    /// only echoes the original reducer token with a typed result.
     private func executeRecovery(_ request: DocumentSyncRecoveryRequest) {
-        let recoveryStore = recoveryStore
-        Task { [weak self] in
-            let result: DocumentSyncRecoveryResult
-            do {
-                switch request {
-                case .load(let load):
-                    if load.retriesStartup {
-                        _ = try await recoveryStore.retryStartup()
-                    }
-                    let receipt = try await recoveryStore.load(scope: load.scope)
-                    result = .loaded(
-                        DocumentSyncRecoveryLoadResult(
-                            scope: receipt.scope,
-                            generation: receipt.generation,
-                            records: self?.recoveryRecords(from: receipt.records)
-                                ?? .empty
-                        )
-                    )
-                case .reconcile(let reconciliation):
-                    let receipt = try await recoveryStore.reconcile(
-                        reconciliation.intent
-                    )
-                    result = .reconciled(
-                        DocumentSyncRecoveryReconciliationResult(
-                            identity: receipt.identity,
-                            generation: receipt.generation,
-                            records: self?.recoveryRecords(from: receipt.records)
-                                ?? .empty,
-                            acknowledgedRecoveryArtifact:
-                                receipt.acknowledgedRecoveryArtifact
-                        )
-                    )
-                case .persist(let persistence):
-                    switch persistence.payload {
-                    case .snapshot(let snapshot):
-                        let receipt = try await recoveryStore.add(
-                            id: persistence.entryID,
-                            snapshot: snapshot,
-                            for: persistence.identity,
-                            expectedRecords: persistence.expectedRecords,
-                            expectedGeneration:
-                                persistence.expectedStoreGeneration
-                        )
-                        result = .persisted(
-                            self?.mutationResult(from: receipt)
-                                ?? DocumentSyncRecoveryMutationResult(
-                                    previousGeneration: 0,
-                                    generation: 0,
-                                    records: .empty
-                                )
-                        )
-                    case .raw(let payload):
-                        let receipt = try await recoveryStore.persistRawData(
-                            payload.data,
-                            for: persistence.identity,
-                            id: persistence.entryID,
-                            expectedRecords: persistence.expectedRecords,
-                            expectedGeneration:
-                                persistence.expectedStoreGeneration,
-                            recoveryArtifact: payload.recoveryArtifact
-                        )
-                        let decodeOutcome = await Self.decodeRawRecovery(
-                            payload,
-                            identity: persistence.identity
-                        )
-                        let mutation =
-                            self?.mutationResult(from: receipt.mutation)
-                            ?? DocumentSyncRecoveryMutationResult(
-                                previousGeneration: 0,
-                                generation: 0,
-                                records: .empty
-                            )
-                        result = .rawPersisted(
-                            DocumentSyncRawRecoveryPersistResult(
-                                mutation: mutation,
-                                durablyPersistedRawEntryID: receipt.entry.id,
-                                acknowledgedRecoveryArtifact:
-                                    receipt.acknowledgedRecoveryArtifact,
-                                decodeOutcome: decodeOutcome
-                            )
-                        )
-                    }
-                case .migrate(let migration):
-                    let receipt = try await recoveryStore.moveEntries(
-                        from: migration.sourceIdentity,
-                        to: migration.destinationIdentity,
-                        expectedRecords: migration.records,
-                        expectedGeneration: migration.expectedStoreGeneration
-                    )
-                    result = .migrated(
-                        self?.mutationResult(from: receipt)
-                            ?? DocumentSyncRecoveryMutationResult(
-                                previousGeneration: 0,
-                                generation: 0,
-                                records: .empty
-                            )
-                    )
-                case .discard(let discard):
-                    let receipt = try await recoveryStore.discard(
-                        target: discard.target,
-                        for: discard.identity,
-                        expectedRecords: discard.expectedRecords,
-                        expectedGeneration: discard.expectedStoreGeneration
-                    )
-                    result = .discarded(
-                        self?.mutationResult(from: receipt)
-                            ?? DocumentSyncRecoveryMutationResult(
-                                previousGeneration: 0,
-                                generation: 0,
-                                records: .empty
-                            )
-                    )
-                }
-            } catch {
-                result = .failed(.recovery)
-            }
-            guard !Task.isCancelled else { return }
-            self?.dispatch(.recoveryFinished(token: request.token, result: result))
+        recoveryEffectExecutor.execute(request) { [weak self] result in
+            guard let self else { return }
+            self.dispatch(.recoveryFinished(token: request.token, result: result))
             if case .failed = result {
-                self?.resolvePendingVerifiedExternalRead(
+                self.resolvePendingVerifiedExternalRead(
                     throwing: .recoveryBlocksVerification
                 )
             } else {
-                self?.resolvePendingVerifiedExternalReadIfBlocked()
+                self.resolvePendingVerifiedExternalReadIfBlocked()
             }
-        }
-    }
-
-    private func mutationResult(
-        from receipt: SessionRecoveryStoreMutationReceipt
-    ) -> DocumentSyncRecoveryMutationResult {
-        DocumentSyncRecoveryMutationResult(
-            previousGeneration: receipt.previousGeneration,
-            generation: receipt.generation,
-            records: DocumentSyncRecoveryRecords(
-                decoded: receipt.decodedEntries,
-                raw: receipt.rawEntries.map(DocumentSyncRawRecoveryReference.init)
-            )
-        )
-    }
-
-    private func recoveryRecords(
-        from records: SessionRecoveryStoreRecords
-    ) -> DocumentSyncRecoveryRecords {
-        DocumentSyncRecoveryRecords(
-            decoded: records.decoded,
-            raw: records.raw.map(DocumentSyncRawRecoveryReference.init)
-        )
-    }
-
-    private nonisolated static func decodeRawRecovery(
-        _ payload: DocumentSyncRawRecoveryPayload,
-        identity: DocumentIdentity
-    ) async -> DocumentSyncDisplacedPreimageDecodeOutcome {
-        do {
-            let change = try await DocumentFileAccess.perform {
-                try TextFileCodec.decodeExternalChange(
-                    data: payload.data,
-                    targetURL: payload.targetURL,
-                    identity: identity,
-                    fingerprint: payload.fingerprint
-                )
-            }
-            return .decoded(change)
-        } catch {
-            return .undecodable
         }
     }
 
@@ -1512,230 +1283,6 @@ final class DocumentSyncCoordinator: ObservableObject {
         isApplyingReducerSource = true
         sourceBuffer.replace(with: text, origin: origin)
         isApplyingReducerSource = false
-    }
-
-    private nonisolated static func inspectAttachment(
-        at targetURL: URL,
-        knownData: Data?,
-        sourceRevision: SourceRevision,
-        sourceFormat: TextFileFormat,
-        baselineSourceRevision: SourceRevision,
-        commitGeneration: UInt64,
-        requiresFreshTargetObservation: Bool = false
-    ) -> CoordinatorAttachmentInspection {
-        let target = attachmentTarget(
-            at: targetURL,
-            sourceRevision: sourceRevision
-        )
-        do {
-            if requiresFreshTargetObservation, let knownData {
-                return .verified(
-                    try verifiedInitialAttachment(
-                        target: target,
-                        knownData: knownData,
-                        sourceFormat: sourceFormat,
-                        baselineSourceRevision: baselineSourceRevision,
-                        commitGeneration: commitGeneration
-                    )
-                )
-            }
-            let data =
-                try knownData
-                ?? Data(
-                    contentsOf: targetURL,
-                    options: [.mappedIfSafe]
-                )
-            return .verified(
-                try verifiedAttachment(
-                    target: target,
-                    data: data,
-                    sourceFormat: sourceFormat,
-                    baselineSourceRevision: baselineSourceRevision,
-                    commitGeneration: commitGeneration
-                )
-            )
-        } catch {
-            return .unavailable(target)
-        }
-    }
-
-    private nonisolated static func verifiedInitialAttachment(
-        target: UnverifiedCoordinatorAttachment,
-        knownData: Data,
-        sourceFormat: TextFileFormat,
-        baselineSourceRevision: SourceRevision,
-        commitGeneration: UInt64
-    ) throws -> VerifiedCoordinatorAttachment {
-        let currentData = try Data(
-            contentsOf: target.targetURL,
-            options: [.mappedIfSafe]
-        )
-        let currentFingerprint = try SafeFileCommitter.fingerprint(
-            for: target.targetURL,
-            data: currentData
-        )
-        if currentData == knownData {
-            return try verifiedAttachment(
-                target: target,
-                data: currentData,
-                fingerprint: currentFingerprint,
-                sourceFormat: sourceFormat,
-                baselineSourceRevision: baselineSourceRevision,
-                commitGeneration: commitGeneration
-            )
-        }
-
-        // The captured bytes predate this inspection, so they cannot safely
-        // inherit the target's current resource identifier. Keep their
-        // intrinsic fingerprint as the provisional baseline and carry the
-        // current target as a separate immutable external observation.
-        let expected = try verifiedAttachment(
-            target: target,
-            data: knownData,
-            fingerprint: FileFingerprint.make(data: knownData),
-            sourceFormat: sourceFormat,
-            baselineSourceRevision: baselineSourceRevision,
-            commitGeneration: commitGeneration
-        )
-        let currentChange = try? TextFileCodec.decodeExternalChange(
-            data: currentData,
-            targetURL: target.targetURL,
-            identity: target.identity,
-            fingerprint: currentFingerprint
-        )
-        return VerifiedCoordinatorAttachment(
-            targetURL: target.targetURL,
-            identity: target.identity,
-            sourceRevision: target.sourceRevision,
-            durableBaseline: expected.durableBaseline,
-            dataMatchesExpectedBytes: false,
-            verifiedExternalChange: currentChange
-        )
-    }
-
-    private nonisolated static func inspectSaveAsAttachment(
-        at targetURL: URL,
-        expectedData: Data,
-        expectedSnapshot: DocumentSnapshot,
-        sourceRevision: SourceRevision,
-        sourceFormat: TextFileFormat,
-        baselineSourceRevision: SourceRevision,
-        commitGeneration: UInt64
-    ) throws -> CoordinatorAttachmentInspection {
-        guard try TextFileCodec.decode(expectedData) == expectedSnapshot else {
-            throw DocumentSyncCoordinatorAttachmentError.invalidSaveAsEvidence
-        }
-        let target = attachmentTarget(
-            at: targetURL,
-            sourceRevision: sourceRevision
-        )
-        do {
-            // Save As owns the immutable bytes passed by NSDocument. Use those
-            // bytes for the initial durable baseline, then separately verify
-            // the current target bytes before this async API returns.
-            let expected = try verifiedAttachment(
-                target: target,
-                data: expectedData,
-                sourceFormat: sourceFormat,
-                baselineSourceRevision: baselineSourceRevision,
-                commitGeneration: commitGeneration
-            )
-            let currentData = try Data(
-                contentsOf: targetURL,
-                options: [.mappedIfSafe]
-            )
-            let currentFingerprint = try SafeFileCommitter.fingerprint(
-                for: targetURL,
-                data: currentData
-            )
-            let dataMatchesExpectedBytes = currentData == expectedData
-            let verifiedExternalChange =
-                dataMatchesExpectedBytes
-                ? nil
-                : try? TextFileCodec.decodeExternalChange(
-                    data: currentData,
-                    targetURL: targetURL,
-                    identity: target.identity,
-                    fingerprint: currentFingerprint
-                )
-            return .verified(
-                VerifiedCoordinatorAttachment(
-                    targetURL: target.targetURL,
-                    identity: target.identity,
-                    sourceRevision: target.sourceRevision,
-                    durableBaseline: expected.durableBaseline,
-                    dataMatchesExpectedBytes: dataMatchesExpectedBytes,
-                    verifiedExternalChange: verifiedExternalChange
-                )
-            )
-        } catch {
-            return .unavailable(target)
-        }
-    }
-
-    private nonisolated static func attachmentTarget(
-        at targetURL: URL,
-        sourceRevision: SourceRevision
-    ) -> UnverifiedCoordinatorAttachment {
-        UnverifiedCoordinatorAttachment(
-            targetURL: targetURL,
-            identity: DocumentIdentity.make(url: targetURL),
-            sourceRevision: sourceRevision
-        )
-    }
-
-    private nonisolated static func verifiedAttachment(
-        target: UnverifiedCoordinatorAttachment,
-        data: Data,
-        fingerprint: FileFingerprint? = nil,
-        sourceFormat: TextFileFormat,
-        baselineSourceRevision: SourceRevision,
-        commitGeneration: UInt64
-    ) throws -> VerifiedCoordinatorAttachment {
-        let verifiedFingerprint: FileFingerprint
-        if let fingerprint {
-            verifiedFingerprint = fingerprint
-        } else {
-            verifiedFingerprint = try SafeFileCommitter.fingerprint(
-                for: target.targetURL,
-                data: data
-            )
-        }
-        let snapshot = try? TextFileCodec.decode(data)
-        let stampedSourceRevision: SourceRevision?
-        if let snapshot {
-            stampedSourceRevision =
-                snapshot
-                    == DocumentSnapshot(
-                        text: baselineSourceRevision.text,
-                        format: sourceFormat
-                    )
-                ? baselineSourceRevision
-                : SourceRevision(
-                    number: baselineSourceRevision.number,
-                    text: snapshot.text
-                )
-        } else {
-            stampedSourceRevision = nil
-        }
-        let durableBaseline = stampedSourceRevision.flatMap { revision in
-            try? TextFileCodec.durableBaseline(
-                data: data,
-                targetURL: target.targetURL,
-                fingerprint: verifiedFingerprint,
-                documentIdentity: target.identity,
-                sourceRevision: revision,
-                commitGeneration: commitGeneration
-            )
-        }
-        return VerifiedCoordinatorAttachment(
-            targetURL: target.targetURL,
-            identity: target.identity,
-            sourceRevision: target.sourceRevision,
-            durableBaseline: durableBaseline,
-            dataMatchesExpectedBytes: true,
-            verifiedExternalChange: nil
-        )
     }
 
     private func sourceReplacementOrigin(
