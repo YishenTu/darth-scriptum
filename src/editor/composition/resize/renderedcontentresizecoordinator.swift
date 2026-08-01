@@ -3,6 +3,7 @@ import AppKit
 @MainActor
 final class RenderedContentResizeCoordinator {
     private let viewportObserver: EditorViewportResizeObserver
+    private let firstVisibleLineAnchor: FirstVisibleLineResizeAnchor
     private let restyleNotification: Notification.Name
     private let onMermaidViewportWidth: @MainActor (CGFloat) -> Void
 
@@ -20,15 +21,19 @@ final class RenderedContentResizeCoordinator {
         restyleNotification: Notification.Name,
         viewportObserver: EditorViewportResizeObserver =
             EditorViewportResizeObserver(),
+        firstVisibleLineAnchor: FirstVisibleLineResizeAnchor =
+            FirstVisibleLineResizeAnchor(),
         onMermaidViewportWidth: @escaping @MainActor (CGFloat) -> Void
     ) {
         self.presentation = presentation
         self.restyleNotification = restyleNotification
         self.viewportObserver = viewportObserver
+        self.firstVisibleLineAnchor = firstVisibleLineAnchor
         self.onMermaidViewportWidth = onMermaidViewportWidth
 
         viewportObserver.onImmediateWidthChange = { [weak self] _ in
             self?.scheduleTextContainerOriginNormalization()
+            self?.firstVisibleLineAnchor.layoutDidChange()
         }
         viewportObserver.onLiveResizeWillStart = { [weak self] viewportWidth in
             self?.resizeWillStart(viewportWidth: viewportWidth)
@@ -55,6 +60,7 @@ final class RenderedContentResizeCoordinator {
             clipView: textView.enclosingScrollView?.contentView,
             window: textView.window
         )
+        firstVisibleLineAnchor.attach(to: textView)
         if editorChanged {
             scheduleRenderedBlockStabilization()
         }
@@ -63,6 +69,7 @@ final class RenderedContentResizeCoordinator {
     func updatePresentation(_ presentation: MarkdownSourcePresentation) {
         guard presentation != self.presentation else { return }
         cancelPendingFinalTableRestyle()
+        firstVisibleLineAnchor.cancel()
         self.presentation = presentation
         hasTableCandidate = nil
         lastTableRestyleWidth = nil
@@ -74,10 +81,12 @@ final class RenderedContentResizeCoordinator {
         } else {
             scheduleTextContainerOriginNormalization()
         }
+        firstVisibleLineAnchor.layoutDidChange()
     }
 
     func stop() {
         viewportObserver.stop()
+        firstVisibleLineAnchor.stop()
         cancelPendingFinalTableRestyle()
         lastTableRestyleWidth = nil
         hasTableCandidate = nil
@@ -94,6 +103,7 @@ final class RenderedContentResizeCoordinator {
             applyTableRestyle(viewportWidth: viewportWidth)
             onMermaidViewportWidth(viewportWidth)
             stabilizeCenteredRenderedBlocks(viewportWidth: viewportWidth)
+            firstVisibleLineAnchor.finishWhenSettled()
         case let .liveQuiet(viewportWidth):
             applyTableRestyle(viewportWidth: viewportWidth)
             onMermaidViewportWidth(viewportWidth)
@@ -105,11 +115,13 @@ final class RenderedContentResizeCoordinator {
             // committed the final descendant layout. Always run one trailing
             // final-width restyle after live resizing ends.
             scheduleFinalTableRestyle(viewportWidth: viewportWidth)
+            firstVisibleLineAnchor.finishWhenSettled()
         }
     }
 
     private func resizeWillStart(viewportWidth: CGFloat) {
         cancelPendingFinalTableRestyle()
+        firstVisibleLineAnchor.begin()
         stabilizeCenteredRenderedBlocks(viewportWidth: viewportWidth)
     }
 
@@ -138,6 +150,7 @@ final class RenderedContentResizeCoordinator {
         )
         MarkdownEngineCompatibility.normalizeTextContainerOrigin(in: textView)
         scheduleTextContainerOriginNormalization()
+        firstVisibleLineAnchor.layoutDidChange()
     }
 
     private func scheduleTextContainerOriginNormalization() {
@@ -199,6 +212,7 @@ final class RenderedContentResizeCoordinator {
             of: textView,
             notification: restyleNotification
         )
+        firstVisibleLineAnchor.layoutDidChange()
         return true
     }
 

@@ -344,6 +344,120 @@ final class RenderedContentResizeTests: XCTestCase {
         }
     }
 
+    func testRapidResizePinsFirstVisibleWrappedLine() async throws {
+        let source = (0..<180).map { index in
+            """
+            Paragraph \(index) has enough prose to wrap repeatedly as the \
+            viewport narrows, changing the height of every preceding paragraph \
+            without changing the reader's semantic position in the note.
+            """
+        }.joined(separator: "\n\n")
+        let harness = makeHarness(
+            source: source,
+            pane: EditorPaneModel(),
+            onScreen: true
+        )
+        defer { harness.close() }
+        let textView = try await harness.nativeTextView()
+        try await harness.scroll(toVerticalFraction: 0.45, in: textView)
+        let anchor = try XCTUnwrap(
+            FirstVisibleLineViewportAnchor.capture(in: textView)
+        )
+
+        var liveResizeActive = false
+        defer {
+            if liveResizeActive {
+                try? harness.endLiveResize(for: textView)
+            }
+        }
+        try harness.beginLiveResize(for: textView)
+        liveResizeActive = true
+        for width in stride(from: 888.0, through: 680.0, by: -16.0) {
+            harness.resizeImmediately(to: width)
+            let currentOffset = try XCTUnwrap(
+                anchor.currentViewportOffset(in: textView)
+            )
+            XCTAssertEqual(
+                currentOffset,
+                anchor.viewportOffset,
+                accuracy: 1,
+                "The visible anchor must be restored before AppKit can draw."
+            )
+            harness.window.displayIfNeeded()
+        }
+
+        try harness.endLiveResize(for: textView)
+        liveResizeActive = false
+        try await harness.waitUntil {
+            guard let currentOffset = anchor.currentViewportOffset(
+                in: textView
+            ) else {
+                return false
+            }
+            return abs(currentOffset - anchor.viewportOffset) <= 1
+        }
+    }
+
+    func testDelayedTableRestyleKeepsFirstVisibleLinePinned() async throws {
+        let table = """
+        | Legal form | Detailed formation and registration requirements | Recurring accounting taxation and compliance obligations |
+        | --- | --- | --- |
+        | Sole proprietorship with direct owner control | Registration filings professional advice initial licensing and local permit expenses | Bookkeeping annual accounts tax preparation regulatory renewals and continuing professional advice throughout the year |
+        | Partnership governed by a negotiated agreement | Contract drafting registration filings professional advice initial licensing and local permit expenses | Ongoing administration partner reporting tax preparation regulatory renewals and continuing professional advice |
+        """
+        let trailingProse = (0..<150).map { index in
+            """
+            Section \(index) remains readable while the table above it rewraps \
+            during the delayed full-restyle pass at the end of live resizing.
+            """
+        }.joined(separator: "\n\n")
+        let source = table + "\n\n" + trailingProse
+        let notification = Notification.Name(
+            "RenderedContentResizeTests.anchorTable.\(UUID().uuidString)"
+        )
+        let harness = makeHarness(
+            source: source,
+            pane: EditorPaneModel(
+                latexRenderer: AdaptiveLatexRenderer(
+                    updateNotification: notification
+                )
+            ),
+            onScreen: true
+        )
+        defer { harness.close() }
+        let textView = try await harness.nativeTextView()
+        try await harness.scroll(toVerticalFraction: 0.4, in: textView)
+        let anchor = try XCTUnwrap(
+            FirstVisibleLineViewportAnchor.capture(in: textView)
+        )
+
+        var liveResizeActive = false
+        defer {
+            if liveResizeActive {
+                try? harness.endLiveResize(for: textView)
+            }
+        }
+        try harness.beginLiveResize(for: textView)
+        liveResizeActive = true
+        await harness.resize(through: [820, 760, 700, 680], display: true)
+        let finalRestyle = expectation(
+            forNotification: notification,
+            object: textView
+        )
+        try harness.endLiveResize(for: textView)
+        liveResizeActive = false
+        await fulfillment(of: [finalRestyle], timeout: 2)
+
+        try await harness.waitUntil {
+            guard let currentOffset = anchor.currentViewportOffset(
+                in: textView
+            ) else {
+                return false
+            }
+            return abs(currentOffset - anchor.viewportOffset) <= 1
+        }
+    }
+
     private func makeHarness(
         source: String,
         pane: EditorPaneModel,

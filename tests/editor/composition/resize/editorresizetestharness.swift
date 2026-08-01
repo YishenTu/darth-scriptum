@@ -73,15 +73,22 @@ final class EditorResizeTestHarness {
         display: Bool = false
     ) async {
         for width in widths {
-            let contentHeight = window.contentView?.bounds.height ?? 680
-            window.setContentSize(
-                NSSize(width: width, height: contentHeight)
-            )
-            window.layoutIfNeeded()
-            if display {
-                window.displayIfNeeded()
-            }
+            resizeImmediately(to: width, display: display)
             await nextMainQueueTurn()
+        }
+    }
+
+    func resizeImmediately(
+        to width: CGFloat,
+        display: Bool = false
+    ) {
+        let contentHeight = window.contentView?.bounds.height ?? 680
+        window.setContentSize(
+            NSSize(width: width, height: contentHeight)
+        )
+        window.layoutIfNeeded()
+        if display {
+            window.displayIfNeeded()
         }
     }
 
@@ -178,6 +185,29 @@ final class EditorResizeTestHarness {
                 to: viewportRange.location
             )
             return viewportLocation > location
+        }
+    }
+
+    func scroll(
+        toVerticalFraction fraction: CGFloat,
+        in textView: NSTextView
+    ) async throws {
+        let scrollView = try XCTUnwrap(textView.enclosingScrollView)
+        let layoutManager = try XCTUnwrap(textView.textLayoutManager)
+        layoutManager.ensureLayout(for: layoutManager.documentRange)
+        window.layoutIfNeeded()
+        let clipView = scrollView.contentView
+        let maximumY = max(
+            0,
+            (scrollView.documentView?.bounds.height ?? 0)
+                - clipView.bounds.height
+        )
+        let targetY = maximumY * min(max(fraction, 0), 1)
+        clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: targetY))
+        scrollView.reflectScrolledClipView(clipView)
+        layoutManager.textViewportLayoutController.layoutViewport()
+        try await waitUntil {
+            abs(clipView.bounds.minY - targetY) <= 1
         }
     }
 
