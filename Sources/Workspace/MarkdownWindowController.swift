@@ -87,6 +87,19 @@ final class MarkdownWindowController: NSWindowController, NSWindowDelegate {
         focus(workspaceModel.secondaryPane)
     }
 
+    override func cancelOperation(_ sender: Any?) {
+        guard
+            let window,
+            let focusedTextView = window.firstResponder as? NSTextView,
+            editorTextViews(in: window).contains(where: {
+                $0 === focusedTextView
+            })
+        else {
+            return
+        }
+        window.makeFirstResponder(nil)
+    }
+
     func splitRight() {
         workspaceModel.splitRight()
         DispatchQueue.main.async { [weak self] in
@@ -96,7 +109,7 @@ final class MarkdownWindowController: NSWindowController, NSWindowDelegate {
 
     private func focusPane(relativeOffset: Int) {
         guard let window else { return }
-        let textViews = descendantTextViews(in: window.contentView)
+        let textViews = editorTextViews(in: window)
         guard !textViews.isEmpty else { return }
         let current = window.firstResponder as? NSTextView
         let currentIndex = current.flatMap { textViews.firstIndex(of: $0) } ?? 0
@@ -106,7 +119,8 @@ final class MarkdownWindowController: NSWindowController, NSWindowDelegate {
 
     private func focus(_ pane: EditorPaneModel) {
         guard
-            let textView = descendantTextViews(in: window?.contentView)
+            let window,
+            let textView = editorTextViews(in: window)
                 .first(where: {
                     $0.identifier?.rawValue.hasSuffix(pane.id.uuidString) == true
                 })
@@ -173,10 +187,9 @@ final class MarkdownWindowController: NSWindowController, NSWindowDelegate {
         )
     }
 
-    private func descendantTextViews(in view: NSView?) -> [NSTextView] {
-        guard let view else { return [] }
-        return (view as? NSTextView).map { [$0] }
-            ?? view.subviews.flatMap { descendantTextViews(in: $0) }
+    private func editorTextViews(in window: NSWindow) -> [NSTextView] {
+        guard let contentView = window.contentView else { return [] }
+        return MarkdownEngineCompatibility.nativeTextViews(in: contentView)
     }
 
     @available(*, unavailable)

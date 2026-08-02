@@ -11,6 +11,9 @@ final class EditorPaneStateCoordinator: NSObject {
     private var normalizesDisplayMathSelection: Bool
     private weak var textView: NSTextView?
     private weak var clipView: NSClipView?
+    private weak var observedFocusWindow: NSWindow?
+    private var focusObservation: NSKeyValueObservation?
+    private var revealsActiveSyntax: Bool?
     private lazy var renderedContentResizeCoordinator =
         RenderedContentResizeCoordinator(
             presentation: presentation,
@@ -95,6 +98,7 @@ final class EditorPaneStateCoordinator: NSObject {
             of: textView,
             observer: self
         )
+        endObservingFocus()
         if let textView {
             MarkdownEngineCompatibility.removeMarkdownFileDropHandler(
                 from: textView
@@ -157,11 +161,13 @@ final class EditorPaneStateCoordinator: NSObject {
     }
 
     private func attach(to candidate: NSTextView, layoutView: NSView) {
-        if candidate !== textView {
+        let isNewTextView = candidate !== textView
+        if isNewTextView {
             MarkdownEngineCompatibility.endObservingSelection(
                 of: textView,
                 observer: self
             )
+            endObservingFocus()
             if let textView {
                 MarkdownEngineCompatibility.removeMarkdownFileDropHandler(
                     from: textView
@@ -215,6 +221,11 @@ final class EditorPaneStateCoordinator: NSObject {
         )
         restoreStateIfNeeded()
         restorePendingSelectionIfNeeded()
+        beginObservingFocus(of: candidate)
+        refreshFocusPresentation(
+            in: candidate,
+            refreshWhenUnfocused: true
+        )
         updatePaneState()
         scheduleMermaidParse()
     }
@@ -237,6 +248,31 @@ final class EditorPaneStateCoordinator: NSObject {
             object: textStorage
         )
         pane.bindingMutationAccumulator.reset()
+    }
+
+    private func beginObservingFocus(of textView: NSTextView) {
+        guard let window = textView.window else { return }
+        guard window !== observedFocusWindow else { return }
+        endObservingFocus()
+        observedFocusWindow = window
+        focusObservation = window.observe(
+            \.firstResponder,
+            options: [.new]
+        ) { [weak self, weak textView] _, _ in
+            MainActor.assumeIsolated {
+                guard let self, let textView, textView === self.textView else {
+                    return
+                }
+                self.refreshFocusPresentation(in: textView)
+            }
+        }
+    }
+
+    private func endObservingFocus() {
+        focusObservation?.invalidate()
+        focusObservation = nil
+        observedFocusWindow = nil
+        revealsActiveSyntax = nil
     }
 
     @objc private func observedTextStorageDidProcessEditing(
@@ -297,6 +333,23 @@ final class EditorPaneStateCoordinator: NSObject {
             self.updatePaneState()
             self.scheduleMermaidApply()
         }
+    }
+
+    private func refreshFocusPresentation(
+        in textView: NSTextView,
+        refreshWhenUnfocused: Bool = false
+    ) {
+        let shouldRevealSyntax = textView.window?.firstResponder === textView
+        let shouldRefresh =
+            shouldRevealSyntax != revealsActiveSyntax
+            || (refreshWhenUnfocused && !shouldRevealSyntax)
+        guard shouldRefresh else { return }
+        revealsActiveSyntax = shouldRevealSyntax
+        MarkdownEngineCompatibility.refreshSelectionPresentation(
+            in: textView,
+            revealsActiveSyntax: shouldRevealSyntax,
+            notification: pane.latexRenderer.updateNotification
+        )
     }
 
     @objc private func viewportDidChange(_ notification: Notification) {

@@ -297,6 +297,24 @@ enum MarkdownEngineCompatibility {
         )
     }
 
+    /// Recomputes caret-sensitive live-preview attributes for a focus change.
+    ///
+    /// MarkdownEngine 0.11.0 derives marker visibility from editability and
+    /// selection, but does not accept focus as an input or restyle when an
+    /// editor resigns first responder. Drive its public full-restyle channel
+    /// with editability suppressed while unfocused, then restore the actual
+    /// editing contract without changing the document or its selection.
+    static func refreshSelectionPresentation(
+        in textView: NSTextView,
+        revealsActiveSyntax: Bool,
+        notification: Notification.Name
+    ) {
+        let wasEditable = textView.isEditable
+        textView.isEditable = wasEditable && revealsActiveSyntax
+        defer { textView.isEditable = wasEditable }
+        requestFullRestyle(of: textView, notification: notification)
+    }
+
     static func applyRenderedBlockImage(
         _ image: NSImage,
         bounds: CGRect,

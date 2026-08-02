@@ -1050,6 +1050,200 @@ final class LivePreviewTextViewTests: XCTestCase {
         window.orderOut(nil)
     }
 
+    func testLivePreviewHidesActiveSyntaxWhenEditorLosesFocus() async throws {
+        let source = "# Heading\n- item\n> quote"
+        let sourceText = source as NSString
+        let headingMarkerLocation = sourceText.range(of: "# Heading").location
+        let bulletMarkerLocation = sourceText.range(of: "- item").location
+        let quoteMarkerLocation = sourceText.range(of: "> quote").location
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(text: source, format: .newDocument)
+        )
+        let pane = EditorPaneModel()
+        let hostingView = NSHostingView(
+            rootView: LivePreviewTextView(
+                sourceBuffer: buffer,
+                pane: pane,
+                sourceMode: false,
+                fontSize: 14,
+                newlineStyle: .lf
+            )
+            .frame(width: 480, height: 320)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 480, height: 320)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+        try await waitUntil {
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView) != nil
+        }
+        let textView = try XCTUnwrap(
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
+        )
+        try await waitUntil {
+            textView.identifier?.rawValue
+                == "DarthScriptum.MarkdownEditor.\(pane.id.uuidString)"
+        }
+        try await waitUntil("initial unfocused heading syntax to hide") {
+            guard let storage = textView.textStorage else { return false }
+            return self.isSyntaxHidden(
+                in: storage,
+                at: headingMarkerLocation
+            )
+        }
+        try await waitUntil("initial unfocused list syntax to render") {
+            guard let storage = textView.textStorage else { return false }
+            return MarkdownEngineCompatibility.isBulletListMarker(
+                in: storage,
+                at: bulletMarkerLocation
+            )
+        }
+        try await waitUntil("initial unfocused quote syntax to hide") {
+            guard let storage = textView.textStorage else { return false }
+            return self.isSyntaxHidden(
+                in: storage,
+                at: quoteMarkerLocation
+            )
+        }
+        window.makeKeyAndOrderFront(nil)
+        XCTAssertTrue(window.makeFirstResponder(textView))
+        textView.setSelectedRange(NSRange(location: 1, length: 0))
+        try await waitUntil("active heading syntax to be revealed") {
+            guard let storage = textView.textStorage else { return false }
+            return pane.selectedRange == NSRange(location: 1, length: 0)
+                && !self.isSyntaxHidden(
+                    in: storage,
+                    at: headingMarkerLocation
+                )
+        }
+
+        XCTAssertTrue(window.makeFirstResponder(nil))
+
+        try await waitUntil("heading syntax to hide after focus loss") {
+            guard let storage = textView.textStorage else { return false }
+            return self.isSyntaxHidden(
+                in: storage,
+                at: headingMarkerLocation
+            )
+        }
+        try await waitUntil("list syntax to render after focus loss") {
+            guard let storage = textView.textStorage else { return false }
+            return MarkdownEngineCompatibility.isBulletListMarker(
+                in: storage,
+                at: bulletMarkerLocation
+            )
+        }
+        try await waitUntil("quote syntax to hide after focus loss") {
+            guard let storage = textView.textStorage else { return false }
+            return self.isSyntaxHidden(
+                in: storage,
+                at: quoteMarkerLocation
+            )
+        }
+        XCTAssertEqual(textView.selectedRange(), NSRange(location: 1, length: 0))
+
+        let updatedSource = "# Changed\n- item\n> quote"
+        buffer.replace(with: updatedSource, origin: .externalReload)
+        try await waitUntil("updated unfocused syntax to stay rendered") {
+            guard textView.string == updatedSource,
+                let storage = textView.textStorage
+            else {
+                return false
+            }
+            return self.isSyntaxHidden(
+                in: storage,
+                at: headingMarkerLocation
+            )
+                && MarkdownEngineCompatibility.isBulletListMarker(
+                    in: storage,
+                    at: bulletMarkerLocation
+                )
+                && self.isSyntaxHidden(
+                    in: storage,
+                    at: quoteMarkerLocation
+                )
+        }
+
+        XCTAssertTrue(window.makeFirstResponder(textView))
+
+        try await waitUntil("heading syntax to reveal after refocusing") {
+            guard let storage = textView.textStorage else { return false }
+            return !self.isSyntaxHidden(
+                in: storage,
+                at: headingMarkerLocation
+            )
+        }
+        window.orderOut(nil)
+    }
+
+    func testLivePreviewObservesFocusAfterLateWindowAttachment() async throws {
+        let source = "# Heading"
+        let updatedSource = "# Changed"
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(text: source, format: .newDocument)
+        )
+        let pane = EditorPaneModel()
+        let hostingView = NSHostingView(
+            rootView: LivePreviewTextView(
+                sourceBuffer: buffer,
+                pane: pane,
+                sourceMode: false,
+                fontSize: 14,
+                newlineStyle: .lf
+            )
+            .frame(width: 480, height: 320)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 480, height: 320)
+        hostingView.layoutSubtreeIfNeeded()
+        try await waitUntil {
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)?
+                .identifier?.rawValue
+                == "DarthScriptum.MarkdownEditor.\(pane.id.uuidString)"
+        }
+        let textView = try XCTUnwrap(
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
+        )
+        XCTAssertNil(textView.window)
+
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+        buffer.replace(with: updatedSource, origin: .externalReload)
+        try await waitUntil("late-attached preview to update") {
+            guard textView.string == updatedSource,
+                let storage = textView.textStorage
+            else {
+                return false
+            }
+            return self.isSyntaxHidden(in: storage, at: 0)
+        }
+
+        window.makeKeyAndOrderFront(nil)
+        XCTAssertTrue(window.makeFirstResponder(textView))
+        textView.setSelectedRange(NSRange(location: 1, length: 0))
+        try await waitUntil("late-attached syntax to reveal on focus") {
+            guard let storage = textView.textStorage else { return false }
+            return !self.isSyntaxHidden(in: storage, at: 0)
+        }
+
+        XCTAssertTrue(window.makeFirstResponder(nil))
+        try await waitUntil("late-attached syntax to hide after focus loss") {
+            guard let storage = textView.textStorage else { return false }
+            return self.isSyntaxHidden(in: storage, at: 0)
+        }
+        window.orderOut(nil)
+    }
+
     func testTaskToggleChangesOnlyTheSourceMarker() {
         let source = "- [ ] first\n1. [x] second\n"
         XCTAssertEqual(
@@ -1104,7 +1298,10 @@ final class LivePreviewTextViewTests: XCTestCase {
     }
 
     private func waitUntil(
+        _ state: String = "editor state",
         timeout: Duration = .seconds(3),
+        file: StaticString = #filePath,
+        line: UInt = #line,
         condition: @escaping @MainActor () -> Bool
     ) async throws {
         let clock = ContinuousClock()
@@ -1113,7 +1310,27 @@ final class LivePreviewTextViewTests: XCTestCase {
             if condition() { return }
             try await Task.sleep(for: .milliseconds(10))
         }
-        XCTFail("Timed out waiting for editor state.")
+        XCTFail("Timed out waiting for \(state).", file: file, line: line)
+    }
+
+    private func isSyntaxHidden(
+        in textStorage: NSTextStorage,
+        at location: Int
+    ) -> Bool {
+        let color =
+            textStorage.attribute(
+                .foregroundColor,
+                at: location,
+                effectiveRange: nil
+            ) as? NSColor
+        let font =
+            textStorage.attribute(
+                .font,
+                at: location,
+                effectiveRange: nil
+            ) as? NSFont
+        return (color?.alphaComponent ?? 1) <= 0.001
+            || (font?.pointSize ?? 2) <= 1
     }
 
     private func wrappedLineCount(in textView: NSTextView) -> Int {
