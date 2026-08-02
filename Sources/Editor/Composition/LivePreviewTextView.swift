@@ -16,6 +16,7 @@ final class EditorPaneModel: ObservableObject, Identifiable {
     let imageProvider: MarkdownImageProvider
     let onOpenMarkdownFile: ((URL) -> Void)?
     let bindingMutationAccumulator = EditorBindingMutationAccumulator()
+    let textBindingContext = EditorTextBindingContext()
     private var cachedConfigurationKey: ConfigurationKey?
     private var cachedConfiguration: MarkdownEditorConfiguration?
     @Published var selectedRange = NSRange(location: 0, length: 0)
@@ -91,7 +92,8 @@ struct LivePreviewTextView: NSViewRepresentable {
     var onBecameActive: @MainActor () -> Void = {}
 
     func makeCoordinator() -> EditorPaneStateCoordinator {
-        EditorPaneStateCoordinator(
+        updateTextBindingContext()
+        return EditorPaneStateCoordinator(
             sourceBuffer: sourceBuffer,
             pane: pane,
             presentation: presentation,
@@ -104,6 +106,7 @@ struct LivePreviewTextView: NSViewRepresentable {
     func makeNSView(
         context: Context
     ) -> EditorLayoutHostingView {
+        updateTextBindingContext()
         let hostingView = EditorLayoutHostingView(
             rootView: AnyView(editorView)
         )
@@ -124,6 +127,7 @@ struct LivePreviewTextView: NSViewRepresentable {
         _ hostingView: EditorLayoutHostingView,
         context: Context
     ) {
+        updateTextBindingContext()
         context.coordinator.setPresentation(presentation)
         context.coordinator.setNormalizesDisplayMathSelection(!usesRawSource)
         hostingView.rootView = AnyView(editorView)
@@ -178,21 +182,33 @@ struct LivePreviewTextView: NSViewRepresentable {
     private var editorText: Binding<String> {
         Binding(
             get: {
-                presentation.text
+                pane.textBindingContext.presentation(
+                    text: sourceBuffer.revision.text,
+                    metrics: sourceBuffer.metrics
+                ).text
             },
             set: { updatedText in
                 let revision = sourceBuffer.revision
-                let currentPresentation = MarkdownPresentationPolicy.presentation(
-                    requestedSourceMode: sourceMode,
+                let currentPresentation = pane.textBindingContext.presentation(
                     text: revision.text,
                     metrics: sourceBuffer.metrics
                 )
+                let capturedMutation = pane.bindingMutationAccumulator.consume()
+                if let capturedMutation,
+                    capturedMutation.presentedSourceRange
+                        != currentPresentation.sourceRange
+                {
+                    assertionFailure(
+                        "The editor mutation used a stale presentation range."
+                    )
+                    return
+                }
                 guard
                     let edit = MarkdownEditorTextAdapter.sourceEdit(
                         editorText: updatedText,
-                        capturedMutation: pane.bindingMutationAccumulator.consume(),
+                        capturedMutation: capturedMutation,
                         currentRevision: revision,
-                        newlineStyle: newlineStyle,
+                        newlineStyle: pane.textBindingContext.newlineStyle,
                         origin: .localEditor(paneID: pane.id),
                         presentedSourceRange: currentPresentation.sourceRange
                     )
@@ -209,7 +225,7 @@ struct LivePreviewTextView: NSViewRepresentable {
                         with: MarkdownEditorTextAdapter.reconcile(
                             editorText: updatedText,
                             currentSource: revision.text,
-                            newlineStyle: newlineStyle,
+                            newlineStyle: pane.textBindingContext.newlineStyle,
                             presentedSourceRange:
                                 currentPresentation.sourceRange
                         ),
@@ -217,6 +233,13 @@ struct LivePreviewTextView: NSViewRepresentable {
                     )
                 }
             }
+        )
+    }
+
+    private func updateTextBindingContext() {
+        pane.textBindingContext.update(
+            requestedSourceMode: sourceMode,
+            newlineStyle: newlineStyle
         )
     }
 }

@@ -237,6 +237,72 @@ final class MarkdownPresentationTests: XCTestCase {
         _ = window
     }
 
+    func testEditWhenSwitchingFromLivePreviewToSourceModePreservesFrontMatter()
+        async throws
+    {
+        let source = "---\ntitle: Test\n---\n# Original heading\n"
+        let expected = "---\ntitle: Test\n---\n# Updated heading\n"
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(text: source, format: .newDocument)
+        )
+        let pane = EditorPaneModel()
+        let hostingView = NSHostingView(
+            rootView: LivePreviewTextView(
+                sourceBuffer: buffer,
+                pane: pane,
+                sourceMode: false,
+                fontSize: 14,
+                newlineStyle: .lf
+            )
+            .frame(width: 640, height: 300)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 640, height: 300)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+
+        try await waitUntil {
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)?
+                .string == "# Original heading\n"
+        }
+
+        hostingView.rootView = LivePreviewTextView(
+            sourceBuffer: buffer,
+            pane: pane,
+            sourceMode: true,
+            fontSize: 14,
+            newlineStyle: .lf
+        )
+        .frame(width: 640, height: 300)
+        hostingView.layoutSubtreeIfNeeded()
+
+        try await waitUntil {
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)?
+                .string == source
+        }
+        let textView = try XCTUnwrap(
+            MarkdownEngineCompatibility.nativeTextView(in: hostingView)
+        )
+        textView.insertText(
+            "Updated",
+            replacementRange: (textView.string as NSString).range(
+                of: "Original"
+            )
+        )
+
+        try await waitUntil {
+            buffer.revision.number == 1
+        }
+        XCTAssertEqual(buffer.revision.text, expected)
+        XCTAssertEqual(textView.string, expected)
+        _ = window
+    }
+
     func testSwitchingPresentationModesPreservesSourceSelection() async throws {
         let source = "---\ntitle: Test\n---\n# Heading\n"
         let buffer = MarkdownSourceBuffer(
