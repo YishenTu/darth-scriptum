@@ -25,7 +25,10 @@ extension SessionRecoveryStore {
     ) throws {
         let url = migrationURL(in: directory)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
-        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let data = try TextFileCodec.readSupportedData(
+            at: url,
+            followingSymbolicLinks: false
+        )
         let migration: PersistedRecoveryMigration
         do {
             migration = try JSONDecoder().decode(PersistedRecoveryMigration.self, from: data)

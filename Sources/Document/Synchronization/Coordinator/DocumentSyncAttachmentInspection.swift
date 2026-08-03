@@ -62,7 +62,7 @@ enum DocumentSyncAttachmentInspection: Sendable {
         do {
             if requiresFreshTargetObservation, let knownData {
                 return .verified(
-                    try verifiedInitialAttachment(
+                    try verifiedAttachmentComparingCurrentData(
                         target: target,
                         knownData: knownData,
                         sourceFormat: sourceFormat,
@@ -71,16 +71,14 @@ enum DocumentSyncAttachmentInspection: Sendable {
                     )
                 )
             }
-            let data =
-                try knownData
-                ?? Data(
-                    contentsOf: targetURL,
-                    options: [.mappedIfSafe]
-                )
+            let payload = try TextFileCodec.readVerifiedFilePayload(
+                at: targetURL
+            )
             return .verified(
                 try verifiedAttachment(
                     target: target,
-                    data: data,
+                    data: payload.data,
+                    fingerprint: payload.fingerprint,
                     sourceFormat: sourceFormat,
                     baselineSourceRevision: baselineSourceRevision,
                     commitGeneration: commitGeneration
@@ -91,26 +89,22 @@ enum DocumentSyncAttachmentInspection: Sendable {
         }
     }
 
-    private static func verifiedInitialAttachment(
+    private static func verifiedAttachmentComparingCurrentData(
         target: Target,
         knownData: Data,
         sourceFormat: TextFileFormat,
         baselineSourceRevision: SourceRevision,
         commitGeneration: UInt64
     ) throws -> Verified {
-        let currentData = try Data(
-            contentsOf: target.targetURL,
-            options: [.mappedIfSafe]
+        let currentPayload = try TextFileCodec.readVerifiedFilePayload(
+            at: target.targetURL
         )
-        let currentFingerprint = try SafeFileCommitter.fingerprint(
-            for: target.targetURL,
-            data: currentData
-        )
-        if currentData == knownData {
+        try TextFileCodec.validateSupportedSize(knownData)
+        if currentPayload.data == knownData {
             return try verifiedAttachment(
                 target: target,
-                data: currentData,
-                fingerprint: currentFingerprint,
+                data: currentPayload.data,
+                fingerprint: currentPayload.fingerprint,
                 sourceFormat: sourceFormat,
                 baselineSourceRevision: baselineSourceRevision,
                 commitGeneration: commitGeneration
@@ -130,10 +124,10 @@ enum DocumentSyncAttachmentInspection: Sendable {
             commitGeneration: commitGeneration
         )
         let currentChange = try? TextFileCodec.decodeExternalChange(
-            data: currentData,
+            data: currentPayload.data,
             targetURL: target.targetURL,
             identity: target.identity,
-            fingerprint: currentFingerprint
+            fingerprint: currentPayload.fingerprint
         )
         return Verified(
             targetURL: target.targetURL,
@@ -162,42 +156,13 @@ enum DocumentSyncAttachmentInspection: Sendable {
             sourceRevision: sourceRevision
         )
         do {
-            // Save As owns the immutable bytes passed by NSDocument. Use those
-            // bytes for the initial durable baseline, then separately verify
-            // the current target bytes before this async API returns.
-            let expected = try verifiedAttachment(
-                target: target,
-                data: expectedData,
-                sourceFormat: sourceFormat,
-                baselineSourceRevision: baselineSourceRevision,
-                commitGeneration: commitGeneration
-            )
-            let currentData = try Data(
-                contentsOf: targetURL,
-                options: [.mappedIfSafe]
-            )
-            let currentFingerprint = try SafeFileCommitter.fingerprint(
-                for: targetURL,
-                data: currentData
-            )
-            let dataMatchesExpectedBytes = currentData == expectedData
-            let verifiedExternalChange =
-                dataMatchesExpectedBytes
-                ? nil
-                : try? TextFileCodec.decodeExternalChange(
-                    data: currentData,
-                    targetURL: targetURL,
-                    identity: target.identity,
-                    fingerprint: currentFingerprint
-                )
             return .verified(
-                Verified(
-                    targetURL: target.targetURL,
-                    identity: target.identity,
-                    sourceRevision: target.sourceRevision,
-                    durableBaseline: expected.durableBaseline,
-                    dataMatchesExpectedBytes: dataMatchesExpectedBytes,
-                    verifiedExternalChange: verifiedExternalChange
+                try verifiedAttachmentComparingCurrentData(
+                    target: target,
+                    knownData: expectedData,
+                    sourceFormat: sourceFormat,
+                    baselineSourceRevision: baselineSourceRevision,
+                    commitGeneration: commitGeneration
                 )
             )
         } catch {
@@ -219,20 +184,12 @@ enum DocumentSyncAttachmentInspection: Sendable {
     private static func verifiedAttachment(
         target: Target,
         data: Data,
-        fingerprint: FileFingerprint? = nil,
+        fingerprint: FileFingerprint,
         sourceFormat: TextFileFormat,
         baselineSourceRevision: SourceRevision,
         commitGeneration: UInt64
     ) throws -> Verified {
-        let verifiedFingerprint: FileFingerprint
-        if let fingerprint {
-            verifiedFingerprint = fingerprint
-        } else {
-            verifiedFingerprint = try SafeFileCommitter.fingerprint(
-                for: target.targetURL,
-                data: data
-            )
-        }
+        try TextFileCodec.validateSupportedSize(data)
         let snapshot = try? TextFileCodec.decode(data)
         let stampedSourceRevision: SourceRevision?
         if let snapshot {
@@ -254,7 +211,7 @@ enum DocumentSyncAttachmentInspection: Sendable {
             try? TextFileCodec.durableBaseline(
                 data: data,
                 targetURL: target.targetURL,
-                fingerprint: verifiedFingerprint,
+                fingerprint: fingerprint,
                 documentIdentity: target.identity,
                 sourceRevision: revision,
                 commitGeneration: commitGeneration

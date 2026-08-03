@@ -87,9 +87,12 @@ extension DocumentSyncReducer {
             else {
                 return unchanged(state)
             }
-            invalidateAutomatedWork(&updated, recoveryShouldReload: true)
+            var effects = invalidateAutomatedWork(
+                &updated,
+                recoveryShouldReload: true
+            )
             updated.issue = issue(for: .closeDeadline)
-            var effects: [DocumentSyncEffect] = [.cancelAllDeadlines]
+            effects.append(.cancelAllDeadlines)
             if let attachment = state.fileAttachment,
                 attachment.identity.matches(url: attachment.url)
             {
@@ -194,7 +197,10 @@ extension DocumentSyncReducer {
 
     private static func close(_ state: DocumentSyncState) -> DocumentSyncTransition {
         var updated = state
-        var effects: [DocumentSyncEffect] = [.cancelAllDeadlines]
+        var effects: [DocumentSyncEffect] = [
+            .cancelAllOperations,
+            .cancelAllDeadlines,
+        ]
         if let attachment = state.fileAttachment {
             effects += stopMonitor(for: state, attachment: attachment)
         }
@@ -405,7 +411,7 @@ extension DocumentSyncReducer {
         } else {
             closeAttempt = nil
         }
-        invalidateAutomatedWork(&updated)
+        var effects = invalidateAutomatedWork(&updated)
         if updated.recoveryMutationBarrier == nil,
             case .migrationPending(var migration) = updated.recovery
         {
@@ -415,7 +421,7 @@ extension DocumentSyncReducer {
         }
         updated.recoveryAccess = .failed(failure)
         updated.issue = issue(for: .recovery)
-        var effects: [DocumentSyncEffect] = [.cancelAllDeadlines]
+        effects.append(.cancelAllDeadlines)
         if let attachment = state.fileAttachment {
             effects += stopMonitor(for: state, attachment: attachment)
         }
@@ -437,7 +443,8 @@ extension DocumentSyncReducer {
         _ state: inout DocumentSyncState,
         recoveryShouldReload: Bool = false,
         preservingSaveCommit: Bool = true
-    ) {
+    ) -> [DocumentSyncEffect] {
+        let cancellationEffects = cancelCancellableOperations(in: state)
         let interruptedRecovery = state.activeTokens[.recovery] != nil
         let interruptedRecoveryBarrier =
             state.recoveryMutationBarrier
@@ -488,8 +495,24 @@ extension DocumentSyncReducer {
                 )
             )
         }
-        guard recoveryShouldReload, interruptedRecovery else { return }
+        guard recoveryShouldReload, interruptedRecovery else {
+            return cancellationEffects
+        }
         resetInterruptedRecoveryForRetry(&state)
+        return cancellationEffects
+    }
+
+    static func cancelCancellableOperations(
+        in state: DocumentSyncState
+    ) -> [DocumentSyncEffect] {
+        var effects: [DocumentSyncEffect] = []
+        if case .preparing(let attempt) = state.local {
+            effects.append(.cancelOperation(attempt.token))
+        }
+        if let merge = state.mergeAttempt {
+            effects.append(.cancelOperation(merge.token))
+        }
+        return effects
     }
 
     private static func resetInterruptedRecoveryForRetry(

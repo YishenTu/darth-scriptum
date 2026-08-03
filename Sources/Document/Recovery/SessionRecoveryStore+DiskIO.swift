@@ -71,7 +71,10 @@ extension SessionRecoveryStore {
             }
         }
         for url in urls where url.lastPathComponent.hasSuffix(".snapshot.json") {
-            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            let data = try TextFileCodec.readSupportedData(
+                at: url,
+                followingSymbolicLinks: false
+            )
             let persisted: PersistedRecoveryEntry
             do {
                 persisted = try JSONDecoder().decode(PersistedRecoveryEntry.self, from: data)
@@ -94,7 +97,10 @@ extension SessionRecoveryStore {
             state.entries.append(entry)
         }
         for url in urls where url.lastPathComponent.hasSuffix(".raw.json") {
-            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            let data = try TextFileCodec.readSupportedData(
+                at: url,
+                followingSymbolicLinks: false
+            )
             let persisted: PersistedRawRecoveryEntry
             do {
                 persisted = try JSONDecoder().decode(PersistedRawRecoveryEntry.self, from: data)
@@ -110,20 +116,17 @@ extension SessionRecoveryStore {
             else {
                 throw RecoveryStoreIssue.malformedData
             }
-            let values = try dataURL.resourceValues(
-                forKeys: [.fileSizeKey, .isRegularFileKey]
+            let rawData = try TextFileCodec.readSupportedData(
+                at: dataURL,
+                followingSymbolicLinks: false
             )
-            guard values.isRegularFile == true,
-                let size = values.fileSize,
-                persisted.byteCount == nil || persisted.byteCount == size
-            else {
-                throw RecoveryStoreIssue.malformedData
-            }
-            let rawData = try Data(contentsOf: dataURL, options: [.mappedIfSafe])
             let digest =
                 persisted.contentDigest
                 ?? FileFingerprint.make(data: rawData).contentDigest
-            guard FileFingerprint.make(data: rawData).contentDigest == digest,
+            guard
+                persisted.byteCount == nil
+                    || persisted.byteCount == rawData.count,
+                FileFingerprint.make(data: rawData).contentDigest == digest,
                 !state.entries.contains(where: { $0.id == persisted.id }),
                 !state.rawEntries.contains(where: { $0.id == persisted.id })
             else {
@@ -134,7 +137,7 @@ extension SessionRecoveryStore {
                     id: persisted.id,
                     documentIdentity: DocumentIdentity(stableKey: persisted.stableKey),
                     dataURL: dataURL,
-                    byteCount: persisted.byteCount ?? size,
+                    byteCount: persisted.byteCount ?? rawData.count,
                     contentDigest: digest,
                     createdAt: persisted.createdAt,
                     residentData: nil,
@@ -205,7 +208,10 @@ extension SessionRecoveryStore {
     static func loadGenerationIndex(in directory: URL) throws -> [String: UInt64] {
         let url = generationIndexURL(in: directory)
         guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
-        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let data = try TextFileCodec.readSupportedData(
+            at: url,
+            followingSymbolicLinks: false
+        )
         let persisted: PersistedRecoveryGenerationIndex
         do {
             persisted = try JSONDecoder().decode(
@@ -241,14 +247,14 @@ extension SessionRecoveryStore {
             if pending.swapCompleted {
                 let data: Data
                 if let existing {
-                    data = try Data(
-                        contentsOf: try required(existing.dataURL),
-                        options: [.mappedIfSafe]
+                    data = try TextFileCodec.readSupportedData(
+                        at: try required(existing.dataURL),
+                        followingSymbolicLinks: false
                     )
                 } else {
-                    data = try Data(
-                        contentsOf: pending.artifact.candidateURL,
-                        options: [.mappedIfSafe]
+                    data = try TextFileCodec.readSupportedData(
+                        at: pending.artifact.candidateURL,
+                        followingSymbolicLinks: false
                     )
                 }
                 if FileFingerprint.make(data: data).contentDigest

@@ -4,6 +4,8 @@ enum RecoveryJSONEncoding {
     static func encode<Value: Encodable>(_ value: Value) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        return try encoder.encode(value)
+        let data = try encoder.encode(value)
+        try TextFileCodec.validateSupportedSize(data)
+        return data
     }
 }

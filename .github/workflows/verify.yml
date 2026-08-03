@@ -21,7 +21,8 @@ jobs:
       DESTINATION: platform=macOS,arch=arm64
       DERIVED_DATA_PATH: ${{ github.workspace }}/DerivedData/verify
       SOURCE_PACKAGES_PATH: ${{ github.workspace }}/DerivedData/SourcePackages
-      RESULT_BUNDLE_PATH: ${{ github.workspace }}/DerivedData/verify-tests.xcresult
+      UNIT_RESULT_BUNDLE_PATH: ${{ github.workspace }}/DerivedData/unit-tests.xcresult
+      E2E_RESULT_BUNDLE_PATH: ${{ github.workspace }}/DerivedData/e2e-tests.xcresult
       VERIFICATION_XCCONFIG: Sources/Configuration/Verification.xcconfig
 
     steps:
@@ -95,7 +96,7 @@ jobs:
             -onlyUsePackageVersionsFromResolvedFile \
             build
 
-      - name: Test non-performance suite
+      - name: Test unit suite
         run: |
           xcodebuild \
             -project DarthScriptum.xcodeproj \
@@ -104,10 +105,25 @@ jobs:
             -destination "$DESTINATION" \
             -derivedDataPath "$DERIVED_DATA_PATH" \
             -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_PATH" \
-            -resultBundlePath "$RESULT_BUNDLE_PATH" \
+            -resultBundlePath "$UNIT_RESULT_BUNDLE_PATH" \
             -xcconfig "$VERIFICATION_XCCONFIG" \
             -onlyUsePackageVersionsFromResolvedFile \
-            -skip-testing:DarthScriptumTests/PerformanceTests \
+            -only-testing:DarthScriptumUnitTests \
+            test
+
+      - name: Test E2E suite
+        run: |
+          xcodebuild \
+            -project DarthScriptum.xcodeproj \
+            -scheme DarthScriptumE2E \
+            -configuration Debug \
+            -destination "$DESTINATION" \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -clonedSourcePackagesDirPath "$SOURCE_PACKAGES_PATH" \
+            -resultBundlePath "$E2E_RESULT_BUNDLE_PATH" \
+            -xcconfig "$VERIFICATION_XCCONFIG" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -only-testing:DarthScriptumE2ETests \
             test
 
       - name: Upload test result bundle
@@ -115,5 +131,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: verify-test-results
-          path: ${{ env.RESULT_BUNDLE_PATH }}
+          path: |
+            ${{ env.UNIT_RESULT_BUNDLE_PATH }}
+            ${{ env.E2E_RESULT_BUNDLE_PATH }}
           if-no-files-found: ignore

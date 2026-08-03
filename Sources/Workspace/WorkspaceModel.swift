@@ -9,6 +9,7 @@ final class WorkspaceModel: ObservableObject {
 
     let primaryPane: EditorPaneModel
     let secondaryPane: EditorPaneModel
+    private let sharedImageProvider: MarkdownImageProvider
 
     init(onOpenMarkdownFile: ((URL) -> Void)? = nil) {
         let latexRenderer = AdaptiveLaTeXRenderer(
@@ -21,7 +22,10 @@ final class WorkspaceModel: ObservableObject {
                 "DarthScriptum.MermaidRendererDidUpdate.\(UUID().uuidString)"
             )
         )
-        let imageProvider = MarkdownImageProvider(documentURL: nil)
+        let imageProvider = MarkdownImageProvider(
+            documentURL: nil,
+            updateNotification: latexRenderer.updateNotification
+        )
         let primaryPane = EditorPaneModel(
             latexRenderer: latexRenderer,
             mermaidRenderer: mermaidRenderer,
@@ -29,6 +33,7 @@ final class WorkspaceModel: ObservableObject {
             onOpenMarkdownFile: onOpenMarkdownFile
         )
         self.primaryPane = primaryPane
+        sharedImageProvider = imageProvider
         secondaryPane = EditorPaneModel(
             latexRenderer: latexRenderer,
             mermaidRenderer: mermaidRenderer,
@@ -43,6 +48,38 @@ final class WorkspaceModel: ObservableObject {
             return secondaryPane
         }
         return primaryPane
+    }
+
+    var restorationState: WorkspaceRestorationState {
+        let fontSize =
+            self.fontSize.isFinite
+            ? min(max(self.fontSize, 10), 32)
+            : 14
+        let isSecondaryActive = isSplit && activePaneID == secondaryPane.id
+        return WorkspaceRestorationState(
+            isSplit: isSplit,
+            sourceMode: sourceMode,
+            fontSize: fontSize,
+            activePane: isSecondaryActive ? .secondary : .primary,
+            primarySelection: Self.restorable(primaryPane.selectedRange),
+            primaryVisibleOrigin: Self.restorable(primaryPane.visibleOrigin),
+            secondarySelection: Self.restorable(secondaryPane.selectedRange),
+            secondaryVisibleOrigin: Self.restorable(secondaryPane.visibleOrigin)
+        )!
+    }
+
+    func restore(_ state: WorkspaceRestorationState) {
+        isSplit = state.isSplit
+        sourceMode = state.sourceMode
+        fontSize = state.fontSize
+        primaryPane.selectedRange = state.primarySelection
+        primaryPane.visibleOrigin = state.primaryVisibleOrigin
+        secondaryPane.selectedRange = state.secondarySelection
+        secondaryPane.visibleOrigin = state.secondaryVisibleOrigin
+        activePaneID =
+            state.activePane == .secondary
+            ? secondaryPane.id
+            : primaryPane.id
     }
 
     func toggleSplit() {
@@ -87,5 +124,26 @@ final class WorkspaceModel: ObservableObject {
 
     func resetZoom() {
         fontSize = 14
+    }
+
+    private static func restorable(_ range: NSRange) -> NSRange {
+        let maximum = 1_073_741_824
+        let location = min(max(range.location, 0), maximum)
+        return NSRange(
+            location: location,
+            length: min(max(range.length, 0), maximum - location)
+        )
+    }
+
+    private static func restorable(_ point: NSPoint) -> NSPoint {
+        let maximum: CGFloat = 10_000_000
+        return NSPoint(
+            x: point.x.isFinite ? min(max(point.x, 0), maximum) : 0,
+            y: point.y.isFinite ? min(max(point.y, 0), maximum) : 0
+        )
+    }
+
+    deinit {
+        sharedImageProvider.dispose()
     }
 }

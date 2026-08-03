@@ -1,5 +1,4 @@
 import AppKit
-import ImageIO
 import MarkdownEngine
 import MarkdownEngineCodeBlocks
 import MarkdownEngineLatex
@@ -8,9 +7,9 @@ import MarkdownEngineLatex
 enum MarkdownConfigurationFactory {
     private static let latexRenderer = AdaptiveLaTeXRenderer()
     private static let syntaxHighlighter = HighlighterSwiftBridge(
-        lightTheme: "atom-one-dark",
+        lightTheme: "atom-one-light",
         darkTheme: "atom-one-dark",
-        autoSwitchAppearance: false,
+        autoSwitchAppearance: true,
         lightBackground: AppTheme.codeBackground,
         darkBackground: AppTheme.codeBackground,
         preferredFontNames: [
@@ -46,7 +45,10 @@ enum MarkdownConfigurationFactory {
         configuration.theme = theme
         configuration.services = MarkdownEditorServices(
             images: imageProvider
-                ?? MarkdownImageProvider(documentURL: documentURL),
+                ?? MarkdownImageProvider(
+                    documentURL: documentURL,
+                    updateNotification: activeLaTeXRenderer.updateNotification
+                ),
             syntaxHighlighter: CodeSyntaxHighlighter(
                 highlighter: syntaxHighlighter,
                 appearanceDidChangeNotification:
@@ -85,7 +87,7 @@ private struct CodeSyntaxHighlighter: SyntaxHighlighter {
     }
 
     func backgroundColor() -> NSColor {
-        highlighter.backgroundColor()
+        AppTheme.codeBackground
     }
 
     func highlight(
@@ -193,111 +195,5 @@ enum SyntaxHighlightingPolicy {
             in: .whitespacesAndNewlines
         )
         return normalized.isEmpty || supportedLanguage(normalized) != nil
-    }
-}
-
-final class MarkdownImageProvider: EmbeddedImageProvider, @unchecked Sendable {
-    private static let maximumImageFileBytes = 8 * 1_024 * 1_024
-    private static let maximumDecodedImageCost = 32 * 1_024 * 1_024
-
-    private let stateLock = NSLock()
-    private var documentURL: URL?
-    private let cache = NSCache<NSURL, NSImage>()
-
-    init(documentURL: URL?) {
-        self.documentURL = documentURL?.standardizedFileURL
-        cache.totalCostLimit = Self.maximumDecodedImageCost
-    }
-
-    func update(documentURL: URL?) {
-        let standardizedURL = documentURL?.standardizedFileURL
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        guard self.documentURL != standardizedURL else { return }
-        self.documentURL = standardizedURL
-        cache.removeAllObjects()
-    }
-
-    func image(for reference: EmbeddedImageRequest) -> NSImage? {
-        stateLock.lock()
-        let currentDocumentURL = documentURL
-        stateLock.unlock()
-        guard
-            let url = MarkdownLinkResolver.resolveLocalFile(
-                reference.name,
-                relativeTo: currentDocumentURL
-            )
-        else {
-            return nil
-        }
-        if let cached = cache.object(forKey: url as NSURL) {
-            return cached
-        }
-        guard
-            let values = try? url.resourceValues(
-                forKeys: [.isRegularFileKey, .fileSizeKey]
-            ),
-            values.isRegularFile == true,
-            let fileSize = values.fileSize,
-            fileSize <= Self.maximumImageFileBytes,
-            let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil),
-            let decodedCost = decodedCost(of: imageSource),
-            decodedCost <= Self.maximumDecodedImageCost,
-            let decodedImage = CGImageSourceCreateImageAtIndex(
-                imageSource,
-                0,
-                [
-                    kCGImageSourceShouldCache: true,
-                    kCGImageSourceShouldCacheImmediately: true,
-                ] as CFDictionary
-            )
-        else {
-            return nil
-        }
-        let image = NSImage(
-            cgImage: decodedImage,
-            size: NSSize(
-                width: decodedImage.width,
-                height: decodedImage.height
-            )
-        )
-        cache.setObject(image, forKey: url as NSURL, cost: decodedCost)
-        return image
-    }
-
-    func fingerprint() -> AnyHashable {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return documentURL?.path ?? "untitled"
-    }
-
-    private func decodedCost(of source: CGImageSource) -> Int? {
-        var total = 0
-        for index in 0..<CGImageSourceGetCount(source) {
-            guard
-                let properties = CGImageSourceCopyPropertiesAtIndex(
-                    source,
-                    index,
-                    nil
-                ) as? [CFString: Any],
-                let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
-                let height = properties[kCGImagePropertyPixelHeight] as? NSNumber
-            else {
-                return nil
-            }
-            let (pixels, pixelOverflow) = width.intValue
-                .multipliedReportingOverflow(by: height.intValue)
-            guard !pixelOverflow else { return nil }
-            let (bytes, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
-            guard !byteOverflow else { return nil }
-            let (nextTotal, totalOverflow) = total.addingReportingOverflow(bytes)
-            guard !totalOverflow,
-                nextTotal <= Self.maximumDecodedImageCost
-            else {
-                return nil
-            }
-            total = nextTotal
-        }
-        return total
     }
 }

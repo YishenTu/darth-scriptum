@@ -4,23 +4,18 @@ enum DocumentFileAccessError: Error, Sendable, Equatable {
     case synchronousAccessFromMainThread
 }
 
-/// The sole asynchronous boundary for blocking document and recovery I/O.
-///
-/// Foundation file APIs and Darwin durability calls can block for arbitrary
-/// durations. Work submitted here runs on a dedicated utility queue instead
-/// of the main actor or Swift's cooperative executor.
-enum DocumentFileAccess {
-    private static let queueKey = DispatchSpecificKey<UInt8>()
-    private static let queue: DispatchQueue = {
-        let queue = DispatchQueue(
-            label: "com.darthscriptum.document-file-access",
-            qos: .utility
-        )
-        queue.setSpecific(key: queueKey, value: 1)
-        return queue
-    }()
+/// A serial ownership boundary for blocking file work belonging to one
+/// document or one globally ordered persistence domain.
+final class DocumentFileAccessLane: @unchecked Sendable {
+    private let queueKey = DispatchSpecificKey<UInt8>()
+    private let queue: DispatchQueue
 
-    static func perform<Value: Sendable>(
+    init(label: String, qos: DispatchQoS = .utility) {
+        queue = DispatchQueue(label: label, qos: qos)
+        queue.setSpecific(key: queueKey, value: 1)
+    }
+
+    func perform<Value: Sendable>(
         _ operation: @escaping @Sendable () throws -> Value
     ) async throws -> Value {
         try await withCheckedThrowingContinuation { continuation in
@@ -34,10 +29,10 @@ enum DocumentFileAccess {
         }
     }
 
-    /// NSDocument invokes an asynchronous write on its write worker after
-    /// `canAsynchronouslyWrite` returns true. Its synchronous override shape
-    /// cannot await, so it is explicitly routed through the same owned queue.
-    static func performSynchronously<Value: Sendable>(
+    /// `NSDocument` exposes a synchronous write override even when AppKit runs
+    /// it on a worker. Reentrant calls execute inline to preserve FIFO without
+    /// deadlocking the lane.
+    func performSynchronously<Value: Sendable>(
         _ operation: @escaping @Sendable () throws -> Value
     ) throws -> Value {
         guard !Thread.isMainThread else {
@@ -47,5 +42,33 @@ enum DocumentFileAccess {
             return try operation()
         }
         return try queue.sync(execute: operation)
+    }
+}
+
+enum DocumentFileAccess {
+    /// Recovery has one durable journal and therefore deliberately shares one
+    /// FIFO lane across store instances.
+    static let recovery = DocumentFileAccessLane(
+        label: "com.darthscriptum.recovery-file-access"
+    )
+
+    static func makeDocumentLane() -> DocumentFileAccessLane {
+        DocumentFileAccessLane(
+            label: "com.darthscriptum.document-file-access.\(UUID().uuidString)"
+        )
+    }
+
+    /// Compatibility for recovery-owned call sites while document call sites
+    /// migrate to an injected lane.
+    static func perform<Value: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Value
+    ) async throws -> Value {
+        try await recovery.perform(operation)
+    }
+
+    static func performSynchronously<Value: Sendable>(
+        _ operation: @escaping @Sendable () throws -> Value
+    ) throws -> Value {
+        try recovery.performSynchronously(operation)
     }
 }

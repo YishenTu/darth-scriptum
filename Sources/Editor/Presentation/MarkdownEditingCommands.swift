@@ -33,12 +33,42 @@ enum MarkdownLinkResolver {
         _ destination: String,
         relativeTo documentURL: URL?
     ) -> URL? {
-        guard let url = resolve(destination, relativeTo: documentURL),
-            url.isFileURL
+        let trimmed = destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+            let documentURL,
+            documentURL.isFileURL,
+            let components = URLComponents(string: trimmed),
+            components.scheme == nil,
+            components.host == nil,
+            components.query == nil,
+            components.fragment == nil,
+            !components.percentEncodedPath.hasPrefix("/"),
+            let decodedPath = components.percentEncodedPath.removingPercentEncoding,
+            !decodedPath.isEmpty,
+            !decodedPath.unicodeScalars.contains("\0"),
+            !decodedPath.split(separator: "/", omittingEmptySubsequences: false)
+                .contains("..")
         else {
             return nil
         }
-        return url
+        let rootURL = documentURL
+            .standardizedFileURL
+            .deletingLastPathComponent()
+        let candidateURL = URL(
+            fileURLWithPath: decodedPath,
+            relativeTo: rootURL
+        )
+        .absoluteURL
+        .standardizedFileURL
+        guard isDescendant(candidateURL, of: rootURL) else { return nil }
+        return candidateURL
+    }
+
+    private static func isDescendant(_ url: URL, of rootURL: URL) -> Bool {
+        let components = url.pathComponents
+        let rootComponents = rootURL.pathComponents
+        return components.count > rootComponents.count
+            && zip(components, rootComponents).allSatisfy(==)
     }
 }
 

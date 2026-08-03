@@ -34,15 +34,26 @@ struct RawRecoveryEntry: Identifiable, Sendable, Equatable {
     /// entry must never cause a view or the main actor to synchronously read a
     /// potentially large file.
     func loadData() async throws -> Data {
+        let data: Data
         if let residentData {
-            return residentData
+            data = residentData
+        } else {
+            guard let dataURL else {
+                throw RecoveryStoreIssue.missingRecoveryEntry
+            }
+            data = try await DocumentFileAccess.recovery.perform {
+                try TextFileCodec.readSupportedData(
+                    at: dataURL,
+                    followingSymbolicLinks: false
+                )
+            }
         }
-        guard let dataURL else {
-            throw RecoveryStoreIssue.missingRecoveryEntry
+        guard data.count == byteCount,
+            FileFingerprint.make(data: data).contentDigest == contentDigest
+        else {
+            throw RecoveryStoreIssue.malformedData
         }
-        return try await DocumentFileAccess.perform {
-            try Data(contentsOf: dataURL, options: [.mappedIfSafe])
-        }
+        return data
     }
 
     var isDataResident: Bool {

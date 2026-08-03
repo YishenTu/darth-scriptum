@@ -140,7 +140,7 @@ final class DocumentSyncRecoveryEffectExecutor {
         identity: DocumentIdentity
     ) async -> DocumentSyncDisplacedPreimageDecodeOutcome {
         do {
-            let change = try await DocumentFileAccess.perform {
+            let change = try await DocumentFileAccess.recovery.perform {
                 try TextFileCodec.decodeExternalChange(
                     data: payload.data,
                     targetURL: payload.targetURL,

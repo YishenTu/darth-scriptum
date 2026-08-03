@@ -35,18 +35,41 @@ final class DirectoryFileMonitor: @unchecked Sendable {
 
         directoryDescriptor = open(
             targetURL.deletingLastPathComponent().path,
-            O_EVTONLY
+            O_EVTONLY | O_NONBLOCK | O_CLOEXEC
         )
         guard directoryDescriptor >= 0 else {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
 
-        fileDescriptor = open(targetURL.path, O_EVTONLY)
+        fileDescriptor = open(
+            targetURL.path,
+            O_EVTONLY | O_NONBLOCK | O_CLOEXEC
+        )
         if fileDescriptor < 0, errno != ENOENT {
             let fileError = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             _ = close(directoryDescriptor)
             directoryDescriptor = -1
             throw fileError
+        }
+        if fileDescriptor >= 0 {
+            var metadata = stat()
+            guard fstat(fileDescriptor, &metadata) == 0 else {
+                let fileError = POSIXError(
+                    POSIXErrorCode(rawValue: errno) ?? .EIO
+                )
+                _ = close(fileDescriptor)
+                _ = close(directoryDescriptor)
+                fileDescriptor = -1
+                directoryDescriptor = -1
+                throw fileError
+            }
+            guard metadata.st_mode & S_IFMT == S_IFREG else {
+                _ = close(fileDescriptor)
+                _ = close(directoryDescriptor)
+                fileDescriptor = -1
+                directoryDescriptor = -1
+                throw TextFileCodec.CodecError.unsupportedFileType
+            }
         }
 
         let directorySource = DispatchSource.makeFileSystemObjectSource(

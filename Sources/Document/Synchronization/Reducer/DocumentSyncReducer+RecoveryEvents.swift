@@ -461,10 +461,11 @@ extension DocumentSyncReducer {
             return transition(updated, effects: effects)
         }
 
+        var effects: [DocumentSyncEffect] = []
         if let merge = updated.mergeAttempt,
             merge.baseline != continuation.committedBaseline
         {
-            invalidateMerge(&updated)
+            effects += invalidateMerge(&updated)
         }
         if continuation.pendingRevision == continuation.localSourceRevision,
             continuation.localSourceRevision
@@ -490,7 +491,7 @@ extension DocumentSyncReducer {
         case .undecodable:
             updated.unresolvedDisplacedPreimage = continuation
             updated.issue = issue(for: .recovery)
-            let effects = refuseCloseIfNeeded(&updated)
+            effects += refuseCloseIfNeeded(&updated)
             return transition(updated, effects: effects)
         case .decoded(let external):
             guard external.identity == continuation.originIdentity,
@@ -500,7 +501,7 @@ extension DocumentSyncReducer {
             else {
                 updated.unresolvedDisplacedPreimage = continuation
                 updated.issue = issue(for: .recovery)
-                let effects = refuseCloseIfNeeded(&updated)
+                effects += refuseCloseIfNeeded(&updated)
                 return transition(updated, effects: effects)
             }
             updated.unresolvedDisplacedPreimage = continuation
@@ -521,7 +522,7 @@ extension DocumentSyncReducer {
             updated.mergeAttempt = merge
             return transition(
                 updated,
-                effects: [
+                effects: effects + [
                     .merge(
                         DocumentSyncMergeRequest(
                             token: mergeToken,

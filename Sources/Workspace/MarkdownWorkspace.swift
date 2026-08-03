@@ -11,11 +11,7 @@ struct MarkdownWorkspace: View {
             MaterialView()
                 .ignoresSafeArea()
             Color(nsColor: AppTheme.background)
-                .opacity(
-                    NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
-                        ? 1
-                        : AppTheme.backgroundOverlayOpacity
-                )
+                .opacity(AppTheme.backgroundOverlayOpacity)
                 .ignoresSafeArea()
             VStack(spacing: 0) {
                 editorSurface
@@ -23,7 +19,6 @@ struct MarkdownWorkspace: View {
                 statusBar
             }
         }
-        .preferredColorScheme(.dark)
         .frame(minWidth: 680, minHeight: 440)
     }
 

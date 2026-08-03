@@ -64,7 +64,7 @@ final class MarkdownSourceBuffer: ObservableObject {
         switch edit.origin {
         case .localEditor:
             recordHistory(edit, in: previous.text)
-        case .undoRedo:
+        case .undo, .redo:
             break
         case .initialLoad, .externalReload, .merge, .recovery:
             clearHistory()
@@ -86,7 +86,7 @@ final class MarkdownSourceBuffer: ObservableObject {
         let updated = text as NSString
         let requiresIncrementalEdit: Bool
         switch origin {
-        case .localEditor, .undoRedo:
+        case .localEditor, .undo, .redo:
             requiresIncrementalEdit = true
         case .initialLoad, .externalReload, .merge, .recovery:
             requiresIncrementalEdit = false
@@ -135,7 +135,8 @@ final class MarkdownSourceBuffer: ObservableObject {
             applyHistoryMutation(
                 range: entry.undoRange,
                 replacement: entry.undoReplacement,
-                expectedText: entry.undoExpectedText
+                expectedText: entry.undoExpectedText,
+                origin: .undo
             )
         else {
             clearHistory()
@@ -154,7 +155,8 @@ final class MarkdownSourceBuffer: ObservableObject {
             applyHistoryMutation(
                 range: entry.redoRange,
                 replacement: entry.redoReplacement,
-                expectedText: entry.redoExpectedText
+                expectedText: entry.redoExpectedText,
+                origin: .redo
             )
         else {
             clearHistory()
@@ -205,7 +207,7 @@ final class MarkdownSourceBuffer: ObservableObject {
         switch origin {
         case .localEditor:
             recordHistory(from: revision.text, to: next.text)
-        case .undoRedo:
+        case .undo, .redo:
             break
         case .initialLoad, .externalReload, .merge, .recovery:
             clearHistory()
@@ -334,7 +336,8 @@ final class MarkdownSourceBuffer: ObservableObject {
     private func applyHistoryMutation(
         range: NSRange,
         replacement: String,
-        expectedText: String
+        expectedText: String,
+        origin: DocumentChangeOrigin
     ) -> Bool {
         let current = revision.text as NSString
         guard range.location >= 0,
@@ -348,7 +351,7 @@ final class MarkdownSourceBuffer: ObservableObject {
             range: range,
             replacement: replacement,
             expectedRevision: revision.number,
-            origin: .undoRedo
+            origin: origin
         )
         return (try? apply(edit)) != nil
     }

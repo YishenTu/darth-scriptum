@@ -1,4 +1,5 @@
 import Foundation
+import MarkdownEngine
 import XCTest
 
 @testable import DarthScriptum
@@ -92,6 +93,100 @@ final class EditPipelinePerformanceAuditTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testUncachedMaximumSizeImageLookupStaysWithinSynchronousBudget()
+        throws
+    {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: rootURL,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: rootURL) }
+        let documentURL = rootURL.appendingPathComponent("document.md")
+        try Data().write(to: documentURL)
+        let fixtureURL = rootURL.appendingPathComponent("image-0.png")
+        XCTAssertTrue(
+            FileManager.default.createFile(
+                atPath: fixtureURL.path,
+                contents: nil
+            )
+        )
+        let fixtureHandle = try FileHandle(forWritingTo: fixtureURL)
+        try fixtureHandle.truncate(
+            atOffset: UInt64(MarkdownImageLoader.maximumEncodedImageBytes)
+        )
+        try fixtureHandle.close()
+
+        let requestCount = 11
+        for index in 1..<requestCount {
+            try FileManager.default.linkItem(
+                at: fixtureURL,
+                to: rootURL.appendingPathComponent("image-\(index).png")
+            )
+        }
+        let loader = PerformanceBlockingImageLoader()
+        let provider = MarkdownImageProvider(
+            documentURL: documentURL,
+            loader: loader,
+            publishUpdate: {}
+        )
+        defer {
+            loader.releaseAll()
+            provider.dispose()
+        }
+        var requestIndex = 0
+
+        let samples = try measureSamples {
+            let request = EmbeddedImageRequest(
+                name: "image-\(requestIndex).png"
+            )
+            requestIndex += 1
+            XCTAssertNil(provider.image(for: request))
+        }
+
+        XCTAssertEqual(requestIndex, requestCount)
+        XCTAssertEqual(provider.pendingLoadCountForTesting, requestCount)
+        let p95 = report(
+            name: "uncached-image-scheduling-32mib",
+            samples: samples
+        )
+        XCTAssertLessThanOrEqual(
+            p95,
+            5,
+            "An uncached image lookup must never synchronously read or decode."
+        )
+    }
+
+    func testAboveLimitMergeRejectionStaysWithinBudget() throws {
+        let oversizedCore = String(
+            repeating: "x",
+            count: ThreeWayTextMerger.maximumChangedCoreUTF8ByteCount + 1
+        )
+        let merger = ThreeWayTextMerger()
+        var result: ThreeWayMergeResult?
+
+        let samples = try measureSamples {
+            result = merger.merge(
+                base: "base",
+                local: oversizedCore,
+                external: "external"
+            )
+        }
+
+        XCTAssertEqual(result, .conflict)
+        let p95 = report(
+            name: "oversized-merge-rejection-8mib",
+            samples: samples
+        )
+        XCTAssertLessThanOrEqual(
+            p95,
+            100,
+            "Unsupported merge inputs must fail closed before expensive diffing."
+        )
+    }
+
     private var workloads: [Workload] {
         [
             Workload(
@@ -157,5 +252,29 @@ final class EditPipelinePerformanceAuditTests: XCTestCase {
             )
         )
         return p95
+    }
+}
+
+private final class PerformanceBlockingImageLoader: MarkdownImageLoading,
+    @unchecked Sendable
+{
+    private let condition = NSCondition()
+    private var isReleased = false
+
+    func load(_ request: MarkdownImageLoadRequest) -> MarkdownDecodedImage? {
+        _ = request
+        condition.lock()
+        while !isReleased {
+            condition.wait()
+        }
+        condition.unlock()
+        return nil
+    }
+
+    func releaseAll() {
+        condition.lock()
+        isReleased = true
+        condition.broadcast()
+        condition.unlock()
     }
 }

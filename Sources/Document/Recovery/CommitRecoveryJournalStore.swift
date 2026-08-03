@@ -38,6 +38,9 @@ enum CommitRecoveryJournalStore {
         case unsupportedSchema
     }
 
+    private static let transactionLock = NSRecursiveLock()
+    nonisolated(unsafe) private static var liveCommitIDs: Set<UUID> = []
+
     static let defaultRecoveryDirectory: URL = {
         FileManager.default.urls(
             for: .applicationSupportDirectory,
@@ -57,8 +60,11 @@ enum CommitRecoveryJournalStore {
         commitGeneration: UInt64,
         expectedPreimageFingerprint: FileFingerprint,
         committedPayloadFingerprint: FileFingerprint,
-        recoveryDirectory: URL
+        recoveryDirectory: URL,
+        registeringLiveCommit: Bool = false
     ) throws -> CommitRecoveryArtifact {
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
         let id = UUID()
         let journalDirectory = recoveryDirectory.appendingPathComponent(
             "commit-journals",
@@ -110,7 +116,7 @@ enum CommitRecoveryJournalStore {
             try encoder.encode(journal),
             to: journalURL
         )
-        return CommitRecoveryArtifact(
+        let artifact = CommitRecoveryArtifact(
             id: id,
             journalURL: journalURL,
             candidateURL: candidateURL,
@@ -124,6 +130,16 @@ enum CommitRecoveryJournalStore {
                 committedPayloadFingerprint: committedPayloadFingerprint
             )
         )
+        if registeringLiveCommit {
+            liveCommitIDs.insert(id)
+        }
+        return artifact
+    }
+
+    static func finishLiveCommit(_ artifact: CommitRecoveryArtifact) {
+        transactionLock.lock()
+        liveCommitIDs.remove(artifact.id)
+        transactionLock.unlock()
     }
 
     /// Reads pending durable commit evidence without modifying it. A malformed
@@ -131,8 +147,11 @@ enum CommitRecoveryJournalStore {
     /// async recovery actor reports it and leaves its bytes untouched for
     /// Retry or a newer application version.
     static func pendingRecoveries(
-        in recoveryDirectory: URL
+        in recoveryDirectory: URL,
+        beforeReadingJournals: (@Sendable () -> Void)? = nil
     ) throws -> [PendingCommitRecovery] {
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
         let journalDirectory = recoveryDirectory.appendingPathComponent(
             "commit-journals",
             isDirectory: true
@@ -144,12 +163,24 @@ enum CommitRecoveryJournalStore {
             at: journalDirectory,
             includingPropertiesForKeys: nil
         )
+        beforeReadingJournals?()
         var pending: [PendingCommitRecovery] = []
         for journalURL in journalURLs {
             guard journalURL.lastPathComponent.hasSuffix(".commit.json") else {
                 continue
             }
-            let encoded = try Data(contentsOf: journalURL, options: [.mappedIfSafe])
+            let identifierText = String(
+                journalURL.lastPathComponent.dropLast(".commit.json".count)
+            )
+            if let identifier = UUID(uuidString: identifierText),
+                liveCommitIDs.contains(identifier)
+            {
+                continue
+            }
+            let encoded = try TextFileCodec.readSupportedData(
+                at: journalURL,
+                followingSymbolicLinks: false
+            )
             let journal: PersistedCommitRecoveryJournal
             do {
                 journal = try JSONDecoder().decode(
@@ -281,6 +312,8 @@ enum CommitRecoveryJournalStore {
             ) throws -> Void
         )? = nil
     ) throws -> DocumentSyncCommitReconciliationResult {
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
         guard request.token.operation == .commitReconciliation,
             request.originalCommitToken.operation == .saveCommit,
             request.token.lifetime == request.originalCommitToken.lifetime,
@@ -318,14 +351,11 @@ enum CommitRecoveryJournalStore {
             return .unresolved
         }
 
-        let targetData = try Data(
-            contentsOf: request.targetURL,
-            options: [.mappedIfSafe]
+        let targetPayload = try TextFileCodec.readVerifiedFilePayload(
+            at: request.targetURL
         )
-        let targetFingerprint = try SafeFileCommitter.fingerprint(
-            for: request.targetURL,
-            data: targetData
-        )
+        let targetData = targetPayload.data
+        let targetFingerprint = targetPayload.fingerprint
         let targetObservation = try TextFileCodec.externalReadObservation(
             data: targetData,
             targetURL: request.targetURL,
@@ -401,18 +431,11 @@ enum CommitRecoveryJournalStore {
             try DurableFileIO.synchronizeDirectory(
                 pending.artifact.replacementDirectoryURL
             )
-            let displacedData = try Data(
-                contentsOf: pending.artifact.candidateURL,
-                options: [.mappedIfSafe]
-            )
-            let displacedFingerprint = try SafeFileCommitter.fingerprint(
-                for: pending.artifact.candidateURL,
-                data: displacedData
-            )
-            let displacedPreimage = VerifiedFilePayload(
-                data: displacedData,
-                resourceIdentifier: displacedFingerprint.resourceIdentifier
-            )
+            let displacedPreimage =
+                try TextFileCodec.readVerifiedFilePayload(
+                    at: pending.artifact.candidateURL,
+                    followingSymbolicLinks: false
+                )
             let hasExpectedPreimage =
                 displacedPreimage.fingerprint.byteCount
                 == expectedBaseline.fingerprint.byteCount
@@ -494,6 +517,8 @@ enum CommitRecoveryJournalStore {
             ) throws -> Void
         )?
     ) throws {
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
         let replacementDirectory =
             artifact.replacementDirectoryURL.standardizedFileURL
         guard
@@ -635,9 +660,9 @@ enum CommitRecoveryJournalStore {
         for artifact: CommitRecoveryArtifact,
         replacementDirectory: URL
     ) throws -> PersistedCommitRecoveryJournal {
-        let data = try Data(
-            contentsOf: artifact.journalURL,
-            options: [.mappedIfSafe]
+        let data = try TextFileCodec.readSupportedData(
+            at: artifact.journalURL,
+            followingSymbolicLinks: false
         )
         let journal: PersistedCommitRecoveryJournal
         do {
@@ -695,21 +720,37 @@ enum CommitRecoveryJournalStore {
         artifact: CommitRecoveryArtifact
     ) throws -> CommitRecoveryTerminalState {
         let targetURL = URL(fileURLWithPath: journal.targetPath)
-        let targetIdentifier =
-            try? DurableFileIO.resourceIdentifier(for: targetURL)
-        let candidateIdentifier =
-            try? DurableFileIO.resourceIdentifier(for: artifact.candidateURL)
+        let targetIdentifierResult = Result<String, Error> {
+            try TextFileCodec.resourceIdentifier(
+                at: targetURL,
+                followingSymbolicLinks: false
+            )
+        }
+        let candidateIdentifierResult = Result<String, Error> {
+            try TextFileCodec.resourceIdentifier(
+                at: artifact.candidateURL,
+                followingSymbolicLinks: false
+            )
+        }
+        let targetIdentifier = try? targetIdentifierResult.get()
+        let candidateIdentifier = try? candidateIdentifierResult.get()
         if targetIdentifier == journal.preparedCandidateResourceIdentifier,
             candidateIdentifier
                 != journal.preparedCandidateResourceIdentifier
         {
-            let candidateData = try Data(
-                contentsOf: artifact.candidateURL,
-                options: [.mappedIfSafe]
+            let candidatePayload = try TextFileCodec.readVerifiedFilePayload(
+                at: artifact.candidateURL,
+                followingSymbolicLinks: false
             )
-            let candidateFingerprint = FileFingerprint.make(
-                data: candidateData
-            )
+            guard
+                candidatePayload.fingerprint.resourceIdentifier
+                    == candidateIdentifier,
+                candidatePayload.data.count
+                    == journal.expectedPreimageByteCount
+            else {
+                return .cleanupAuthorized
+            }
+            let candidateFingerprint = candidatePayload.fingerprint
             if candidateFingerprint.byteCount
                 == journal.expectedPreimageByteCount,
                 candidateFingerprint.contentDigest
@@ -722,14 +763,19 @@ enum CommitRecoveryJournalStore {
         if candidateIdentifier == journal.preparedCandidateResourceIdentifier,
             targetIdentifier != journal.preparedCandidateResourceIdentifier
         {
-            let targetData = try Data(
-                contentsOf: targetURL,
-                options: [.mappedIfSafe]
+            let targetPayload = try TextFileCodec.readVerifiedFilePayload(
+                at: targetURL,
+                followingSymbolicLinks: false
             )
-            let targetFingerprint = try SafeFileCommitter.fingerprint(
-                for: targetURL,
-                data: targetData
-            )
+            guard
+                targetPayload.fingerprint.resourceIdentifier
+                    == targetIdentifier,
+                targetPayload.data.count
+                    == journal.expectedPreimageByteCount
+            else {
+                return .cleanupAuthorized
+            }
+            let targetFingerprint = targetPayload.fingerprint
             if targetFingerprint.byteCount
                 == journal.expectedPreimageByteCount,
                 targetFingerprint.contentDigest

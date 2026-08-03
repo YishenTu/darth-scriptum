@@ -36,6 +36,10 @@ protocol DocumentSyncCoordinatorEffectExecuting: AnyObject {
         _ request: DocumentSyncCommitReconciliationRequest,
         completion: @escaping @MainActor (DocumentSyncCommitReconciliationResult) -> Void
     )
+
+    func cancel(token: SyncEffectToken)
+
+    func cancelAll()
 }
 
 /// Executes CPU and file work solely from immutable effect request values.
@@ -44,21 +48,50 @@ protocol DocumentSyncCoordinatorEffectExecuting: AnyObject {
 final class DocumentSyncDefaultEffectExecutor:
     DocumentSyncCoordinatorEffectExecuting
 {
-    private let recoveryStore: SessionRecoveryStore
+    private struct CPUOperation {
+        let cancel: @MainActor () -> Void
+    }
 
-    init(recoveryStore: SessionRecoveryStore) {
+    private let recoveryStore: SessionRecoveryStore
+    private let fileAccessLane: DocumentFileAccessLane
+    private let cpuOperationStartedHook: (@Sendable (SyncEffectToken) -> Void)?
+    private var cpuOperations: [SyncEffectToken: CPUOperation] = [:]
+
+    var activeCPUOperationTokens: Set<SyncEffectToken> {
+        Set(cpuOperations.keys)
+    }
+
+    init(
+        recoveryStore: SessionRecoveryStore,
+        fileAccessLane: DocumentFileAccessLane =
+            DocumentFileAccess.makeDocumentLane(),
+        cpuOperationStartedHook: (@Sendable (SyncEffectToken) -> Void)? = nil
+    ) {
         self.recoveryStore = recoveryStore
+        self.fileAccessLane = fileAccessLane
+        self.cpuOperationStartedHook = cpuOperationStartedHook
     }
 
     func prepareSave(
         _ request: DocumentSyncSavePreparationRequest,
         completion: @escaping @MainActor (DocumentSyncSavePreparationExecution) -> Void
     ) {
-        Task {
-            let result = await Task.detached(priority: .utility) {
-                Self.prepareSave(request)
-            }.value
-            completion(result)
+        cancel(token: request.token)
+        let startedHook = cpuOperationStartedHook
+        let worker = Task.detached(priority: .utility) {
+            startedHook?(request.token)
+            return Self.prepareSave(request)
+        }
+        let delivery = Task { @MainActor [weak self] in
+            let execution = await worker.value
+            guard let self else { return }
+            self.cpuOperations.removeValue(forKey: request.token)
+            guard !Task.isCancelled, let execution else { return }
+            completion(execution)
+        }
+        cpuOperations[request.token] = CPUOperation {
+            worker.cancel()
+            delivery.cancel()
         }
     }
 
@@ -69,7 +102,7 @@ final class DocumentSyncDefaultEffectExecutor:
         Task {
             let result: DocumentSyncExternalReadExecution
             do {
-                result = try await DocumentFileAccess.perform {
+                result = try await fileAccessLane.perform {
                     Self.readExternal(request)
                 }
             } catch {
@@ -83,13 +116,22 @@ final class DocumentSyncDefaultEffectExecutor:
         _ request: DocumentSyncMergeRequest,
         completion: @escaping @MainActor (DocumentSyncMergeExecution) -> Void
     ) {
-        Task {
-            let result: DocumentSyncMergeExecution = await Task.detached(
-                priority: .utility
-            ) { () -> DocumentSyncMergeExecution in
-                .finished(ThreeWayTextMerger().result(for: request))
-            }.value
-            completion(result)
+        cancel(token: request.token)
+        let startedHook = cpuOperationStartedHook
+        let worker = Task.detached(priority: .utility) {
+            startedHook?(request.token)
+            return Self.merge(request)
+        }
+        let delivery = Task { @MainActor [weak self] in
+            let execution = await worker.value
+            guard let self else { return }
+            self.cpuOperations.removeValue(forKey: request.token)
+            guard !Task.isCancelled, let execution else { return }
+            completion(execution)
+        }
+        cpuOperations[request.token] = CPUOperation {
+            worker.cancel()
+            delivery.cancel()
         }
     }
 
@@ -103,13 +145,27 @@ final class DocumentSyncDefaultEffectExecutor:
         }
     }
 
+    func cancel(token: SyncEffectToken) {
+        cpuOperations.removeValue(forKey: token)?.cancel()
+    }
+
+    func cancelAll() {
+        let operations = cpuOperations.values
+        cpuOperations.removeAll()
+        for operation in operations {
+            operation.cancel()
+        }
+    }
+
     private nonisolated static func prepareSave(
         _ request: DocumentSyncSavePreparationRequest
-    ) -> DocumentSyncSavePreparationExecution {
+    ) -> DocumentSyncSavePreparationExecution? {
         do {
+            try Task.checkCancellation()
             let payload = try TextFileCodec.prepareSavePayload(
                 for: request.snapshot
             )
+            try Task.checkCancellation()
             return .prepared(
                 PendingSaveToken(
                     generation: request.commitGeneration,
@@ -120,8 +176,24 @@ final class DocumentSyncDefaultEffectExecutor:
                     targetURL: request.targetURL
                 )
             )
+        } catch is CancellationError {
+            return nil
         } catch {
             return .failed(.localSave)
+        }
+    }
+
+    private nonisolated static func merge(
+        _ request: DocumentSyncMergeRequest
+    ) -> DocumentSyncMergeExecution? {
+        do {
+            return .finished(
+                try ThreeWayTextMerger().cancellableResult(for: request)
+            )
+        } catch is CancellationError {
+            return nil
+        } catch {
+            return .failed(.merge)
         }
     }
 
@@ -129,14 +201,11 @@ final class DocumentSyncDefaultEffectExecutor:
         _ request: DocumentSyncExternalReadRequest
     ) -> DocumentSyncExternalReadExecution {
         do {
-            let data = try Data(
-                contentsOf: request.targetURL,
-                options: [.mappedIfSafe]
+            let payload = try TextFileCodec.readVerifiedFilePayload(
+                at: request.targetURL
             )
-            let fingerprint = try SafeFileCommitter.fingerprint(
-                for: request.targetURL,
-                data: data
-            )
+            let data = payload.data
+            let fingerprint = payload.fingerprint
             if request.expectedBaseline?.fingerprint == fingerprint {
                 return .finished(
                     .unchanged(
@@ -159,6 +228,8 @@ final class DocumentSyncDefaultEffectExecutor:
                     )
                 )
             )
+        } catch let error as POSIXError where error.code == .ENOENT {
+            return .finished(.missing)
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             return .finished(.missing)
         } catch {

@@ -357,15 +357,17 @@ extension DocumentSyncReducer {
         )
     }
 
-    static func invalidateMerge(_ state: inout DocumentSyncState) {
-        if let merge = state.mergeAttempt,
-            case .displacedPreimage(_, _, let continuation) = merge.origin
-        {
+    static func invalidateMerge(
+        _ state: inout DocumentSyncState
+    ) -> [DocumentSyncEffect] {
+        guard let merge = state.mergeAttempt else { return [] }
+        if case .displacedPreimage(_, _, let continuation) = merge.origin {
             state.unresolvedDisplacedPreimage = continuation
             state.issue = issue(for: .recovery)
         }
         state.activeTokens.removeValue(forKey: .merge)
         state.mergeAttempt = nil
         state.externalSignalPending = true
+        return [.cancelOperation(merge.token)]
     }
 }

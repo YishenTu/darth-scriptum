@@ -1,4 +1,5 @@
 import AppKit
+import ObjectiveC
 import UniformTypeIdentifiers
 
 enum MarkdownDocumentSaveError: LocalizedError, Equatable {
@@ -15,41 +16,173 @@ enum MarkdownDocumentSaveError: LocalizedError, Equatable {
     }
 }
 
-@MainActor
-final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
-    private struct EncodedDocument {
-        let data: Data
-        let snapshot: DocumentSnapshot
-        let sourceRevision: SourceRevision
+private struct MarkdownEncodedDocument {
+    let data: Data
+    let snapshot: DocumentSnapshot
+    let sourceRevision: SourceRevision
+}
+
+private struct MarkdownPendingCloseCallback {
+    let delegate: Any
+    let selector: Selector?
+    let contextInfo: UnsafeMutableRawPointer?
+}
+
+/// `NSDocumentController` constructs concurrently-readable documents on its
+/// opening queue. Keeping Swift state behind an associated reference lets the
+/// subclass inherit AppKit's Objective-C `init` implementation, avoiding a
+/// generated main-actor thunk while preserving main-actor ownership of live
+/// document state.
+private final class MarkdownDocumentState: @unchecked Sendable {
+    let recoveryStore: SessionRecoveryStore
+    let fileAccessLane: DocumentFileAccessLane
+    let fileCommitter: any DocumentFileCommitting
+    let managedWriteDidUnblock: (@Sendable () -> Void)?
+    let initialContentStore = DocumentInitialContentStore()
+    let saveBridge = SaveTransactionBridge()
+    var syncCoordinatorStorage: DocumentSyncCoordinator?
+    var sourceObservation: UUID?
+    var lastEncodedDocument: MarkdownEncodedDocument?
+    var pendingCloseCallbacks: [MarkdownPendingCloseCallback] = []
+    var nativeCloseToken: SyncEffectToken?
+    var committedCloseToken: SyncEffectToken?
+
+    init(
+        recoveryStore: SessionRecoveryStore = .shared,
+        fileAccessLane: DocumentFileAccessLane =
+            DocumentFileAccess.makeDocumentLane(),
+        fileCommitter: any DocumentFileCommitting = SafeFileCommitter(),
+        managedWriteDidUnblock: (@Sendable () -> Void)? = nil
+    ) {
+        self.recoveryStore = recoveryStore
+        self.fileAccessLane = fileAccessLane
+        self.fileCommitter = fileCommitter
+        self.managedWriteDidUnblock = managedWriteDidUnblock
+    }
+}
+
+private enum MarkdownDocumentStateAssociation {
+    static let lock = NSLock()
+    nonisolated(unsafe) static var key: UInt8 = 0
+
+    nonisolated static func state(
+        for document: MarkdownDocument
+    ) -> MarkdownDocumentState {
+        lock.withLock {
+            if let state = objc_getAssociatedObject(document, &key)
+                as? MarkdownDocumentState
+            {
+                return state
+            }
+            let state = MarkdownDocumentState()
+            objc_setAssociatedObject(
+                document,
+                &key,
+                state,
+                .OBJC_ASSOCIATION_RETAIN
+            )
+            return state
+        }
     }
 
-    private struct PendingCloseCallback {
-        let delegate: Any
-        let selector: Selector?
-        let contextInfo: UnsafeMutableRawPointer?
+    static func install(
+        _ state: MarkdownDocumentState,
+        on document: MarkdownDocument
+    ) {
+        lock.withLock {
+            precondition(objc_getAssociatedObject(document, &key) == nil)
+            objc_setAssociatedObject(
+                document,
+                &key,
+                state,
+                .OBJC_ASSOCIATION_RETAIN
+            )
+        }
+    }
+}
+
+nonisolated final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
+    private nonisolated var documentState: MarkdownDocumentState {
+        MarkdownDocumentStateAssociation.state(for: self)
     }
 
-    let syncCoordinator: DocumentSyncCoordinator
-    private let saveBridge: SaveTransactionBridge
-    private var sourceObservation: UUID?
-    private var lastEncodedDocument: EncodedDocument?
-    private var pendingCloseCallbacks: [PendingCloseCallback] = []
-    private var nativeCloseToken: SyncEffectToken?
-    private var committedCloseToken: SyncEffectToken?
+    private nonisolated var recoveryStore: SessionRecoveryStore {
+        documentState.recoveryStore
+    }
 
-    var markdownWindowController: MarkdownWindowController? {
+    private nonisolated var fileAccessLane: DocumentFileAccessLane {
+        documentState.fileAccessLane
+    }
+
+    private nonisolated var fileCommitter: any DocumentFileCommitting {
+        documentState.fileCommitter
+    }
+
+    private nonisolated var managedWriteDidUnblock: (@Sendable () -> Void)? {
+        documentState.managedWriteDidUnblock
+    }
+
+    private nonisolated var initialContentStore: DocumentInitialContentStore {
+        documentState.initialContentStore
+    }
+
+    private nonisolated var saveBridge: SaveTransactionBridge {
+        documentState.saveBridge
+    }
+
+    @MainActor private var syncCoordinatorStorage: DocumentSyncCoordinator? {
+        get { documentState.syncCoordinatorStorage }
+        set { documentState.syncCoordinatorStorage = newValue }
+    }
+
+    @MainActor private var sourceObservation: UUID? {
+        get { documentState.sourceObservation }
+        set { documentState.sourceObservation = newValue }
+    }
+
+    @MainActor private var lastEncodedDocument: MarkdownEncodedDocument? {
+        get { documentState.lastEncodedDocument }
+        set { documentState.lastEncodedDocument = newValue }
+    }
+
+    @MainActor private var pendingCloseCallbacks: [MarkdownPendingCloseCallback] {
+        get { documentState.pendingCloseCallbacks }
+        set { documentState.pendingCloseCallbacks = newValue }
+    }
+
+    @MainActor private var nativeCloseToken: SyncEffectToken? {
+        get { documentState.nativeCloseToken }
+        set { documentState.nativeCloseToken = newValue }
+    }
+
+    @MainActor private var committedCloseToken: SyncEffectToken? {
+        get { documentState.committedCloseToken }
+        set { documentState.committedCloseToken = newValue }
+    }
+
+    @MainActor var syncCoordinator: DocumentSyncCoordinator {
+        let coordinator = initializeSyncCoordinatorIfNeeded()
+        installStagedContentIfNeeded(into: coordinator)
+        return coordinator
+    }
+
+    @MainActor var hasInitializedSynchronization: Bool {
+        syncCoordinatorStorage != nil
+    }
+
+    @MainActor var markdownWindowController: MarkdownWindowController? {
         windowControllers.first as? MarkdownWindowController
     }
 
-    var synchronizationFileURL: URL? {
+    @MainActor var synchronizationFileURL: URL? {
         fileURL
     }
 
-    var hasUnsavedUntitledContent: Bool {
+    @MainActor var hasUnsavedUntitledContent: Bool {
         fileURL == nil && !syncCoordinator.sourceBuffer.revision.text.isEmpty
     }
 
-    var isReplaceableEmptyUntitledDocument: Bool {
+    @MainActor var isReplaceableEmptyUntitledDocument: Bool {
         fileURL == nil && !hasUnsavedUntitledContent
     }
 
@@ -57,32 +190,33 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
     nonisolated override class var preservesVersions: Bool { false }
     nonisolated override class var autosavesDrafts: Bool { false }
 
-    override convenience init() {
-        self.init(recoveryStore: .shared)
+    nonisolated override class func canConcurrentlyReadDocuments(
+        ofType typeName: String
+    ) -> Bool {
+        typeName == "net.daringfireball.markdown"
+            || typeName == "public.plain-text"
     }
 
-    init(recoveryStore: SessionRecoveryStore) {
-        let bridge = SaveTransactionBridge()
-        saveBridge = bridge
-        syncCoordinator = DocumentSyncCoordinator(
-            snapshot: DocumentSnapshot(text: "", format: .newDocument),
-            bridge: bridge,
-            recoveryStore: recoveryStore
+    @MainActor convenience init(
+        recoveryStore: SessionRecoveryStore,
+        fileAccessLane: DocumentFileAccessLane =
+            DocumentFileAccess.makeDocumentLane(),
+        fileCommitter: any DocumentFileCommitting = SafeFileCommitter(),
+        managedWriteDidUnblock: (@Sendable () -> Void)? = nil
+    ) {
+        self.init()
+        MarkdownDocumentStateAssociation.install(
+            MarkdownDocumentState(
+                recoveryStore: recoveryStore,
+                fileAccessLane: fileAccessLane,
+                fileCommitter: fileCommitter,
+                managedWriteDidUnblock: managedWriteDidUnblock
+            ),
+            on: self
         )
-        super.init()
-        hasUndoManager = true
-        syncCoordinator.delegate = self
-        sourceObservation = syncCoordinator.sourceBuffer.observe { [weak self] _, origin in
-            switch origin {
-            case .localEditor, .undoRedo, .merge, .recovery:
-                self?.updateChangeCount(.changeDone)
-            case .initialLoad, .externalReload:
-                return
-            }
-        }
     }
 
-    override func makeWindowControllers() {
+    @MainActor override func makeWindowControllers() {
         if let fileURL,
             syncCoordinator.fileURL?.standardizedFileURL
                 != fileURL.standardizedFileURL
@@ -119,7 +253,7 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         return try MainActor.assumeIsolated {
             let snapshot = syncCoordinator.currentSnapshot
             let data = try TextFileCodec.encode(snapshot)
-            lastEncodedDocument = EncodedDocument(
+            lastEncodedDocument = MarkdownEncodedDocument(
                 data: data,
                 snapshot: snapshot,
                 sourceRevision: syncCoordinator.sourceBuffer.revision
@@ -130,9 +264,9 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
 
     override nonisolated func read(from data: Data, ofType typeName: String) throws {
         let decoded = try TextFileCodec.decode(data)
-        MainActor.assumeIsolated {
-            syncCoordinator.loadInitial(decoded, data: data, from: fileURL)
-        }
+        initialContentStore.stage(
+            .init(snapshot: decoded, data: data)
+        )
     }
 
     override nonisolated func canAsynchronouslyWrite(
@@ -167,8 +301,12 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
             guard !Thread.isMainThread else {
                 throw MarkdownDocumentSaveError.synchronousWriteOnMainThread
             }
-            try DocumentFileAccess.performSynchronously {
-                let result = try SafeFileCommitter().commit(request.pendingSave)
+            unblockUserInteraction()
+            managedWriteDidUnblock?()
+            try fileAccessLane.performSynchronously {
+                let result = try self.fileCommitter.commit(
+                    request.pendingSave
+                )
                 try self.saveBridge.store(result, for: request.token)
             }
             return
@@ -176,7 +314,7 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         try super.writeSafely(to: url, ofType: typeName, for: saveOperation)
     }
 
-    override func save(
+    @MainActor override func save(
         to url: URL,
         ofType typeName: String,
         for saveOperation: NSDocument.SaveOperationType,
@@ -217,11 +355,18 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         }
     }
 
-    func syncCoordinator(
+    @MainActor override func revert(
+        toContentsOf url: URL,
+        ofType typeName: String
+    ) throws {
+        try super.revert(toContentsOf: url, ofType: typeName)
+        installStagedContentIfNeeded(into: initializeSyncCoordinatorIfNeeded())
+    }
+
+    @MainActor func syncCoordinator(
         _ coordinator: DocumentSyncCoordinator,
         requestSave request: DocumentSyncSaveCommitRequest
     ) {
-        updateChangeCount(.changeDone)
         save(
             to: request.targetURL,
             ofType: fileType ?? "net.daringfireball.markdown",
@@ -240,23 +385,31 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         }
     }
 
-    func syncCoordinator(
+    @MainActor func syncCoordinator(
         _ coordinator: DocumentSyncCoordinator,
         acceptedExternalFileAt url: URL,
         hasLocalChanges: Bool
     ) {
+        if !hasLocalChanges {
+            updateChangeCount(.changeCleared)
+        }
+
+        let acceptedURL = url.standardizedFileURL
+        let lane = fileAccessLane
         Task { [weak self] in
-            let modificationDate = try? await DocumentFileAccess.perform {
-                try url.resourceValues(
+            let modificationDate = try? await lane.perform {
+                try acceptedURL.resourceValues(
                     forKeys: [.contentModificationDateKey]
                 ).contentModificationDate
             }
-            guard let self else { return }
+            guard
+                let self,
+                self.fileURL?.standardizedFileURL == acceptedURL
+            else {
+                return
+            }
             if let modificationDate {
                 self.fileModificationDate = modificationDate
-            }
-            if !hasLocalChanges {
-                self.updateChangeCount(.changeCleared)
             }
         }
     }
@@ -274,7 +427,7 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         }
     }
 
-    override func close() {
+    @MainActor override func close() {
         let closeToken = committedCloseToken ?? authorizedCloseToken()
         super.close()
         if let closeToken {
@@ -288,13 +441,13 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         sourceObservation = nil
     }
 
-    override func canClose(
+    @MainActor override func canClose(
         withDelegate delegate: Any,
         shouldClose shouldCloseSelector: Selector?,
         contextInfo: UnsafeMutableRawPointer?
     ) {
         pendingCloseCallbacks.append(
-            PendingCloseCallback(
+            MarkdownPendingCloseCallback(
                 delegate: delegate,
                 selector: shouldCloseSelector,
                 contextInfo: contextInfo
@@ -303,12 +456,48 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         syncCoordinator.requestClose()
     }
 
-    func flushNow() {
+    @MainActor func flushNow() {
         guard fileURL != nil else { return }
         syncCoordinator.flushNow()
     }
 
-    func syncCoordinator(
+    @MainActor override func save(_ sender: Any?) {
+        guard fileURL != nil else {
+            super.save(sender)
+            return
+        }
+        flushNow()
+    }
+
+    @MainActor @objc func undoDocument(_ sender: Any?) {
+        _ = sender
+        syncCoordinator.sourceBuffer.undo()
+    }
+
+    @MainActor @objc func redoDocument(_ sender: Any?) {
+        _ = sender
+        syncCoordinator.sourceBuffer.redo()
+    }
+
+    @MainActor override func validateUserInterfaceItem(
+        _ item: any NSValidatedUserInterfaceItem
+    ) -> Bool {
+        if item.action == #selector(NSDocument.save(_:)) {
+            guard fileURL != nil else {
+                return super.validateUserInterfaceItem(item)
+            }
+            return syncCoordinator.hasLocalChanges
+        }
+        if item.action == #selector(undoDocument(_:)) {
+            return syncCoordinator.sourceBuffer.canUndo
+        }
+        if item.action == #selector(redoDocument(_:)) {
+            return syncCoordinator.sourceBuffer.canRedo
+        }
+        return super.validateUserInterfaceItem(item)
+    }
+
+    @MainActor func syncCoordinator(
         _ coordinator: DocumentSyncCoordinator,
         resolveClose resolution: DocumentSyncCloseResolution
     ) {
@@ -336,7 +525,7 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         }
     }
 
-    private func beginNativeCloseReview(for token: SyncEffectToken) {
+    @MainActor private func beginNativeCloseReview(for token: SyncEffectToken) {
         guard nativeCloseToken == nil else { return }
         nativeCloseToken = token
         super.canClose(
@@ -348,7 +537,7 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         )
     }
 
-    @objc private func nativeCanClose(
+    @MainActor @objc private func nativeCanClose(
         _ document: NSDocument,
         shouldClose: Bool,
         contextInfo: UnsafeMutableRawPointer?
@@ -369,7 +558,7 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         }
     }
 
-    private func authorizedCloseToken() -> SyncEffectToken? {
+    @MainActor private func authorizedCloseToken() -> SyncEffectToken? {
         guard case .closing(let attempt) = syncCoordinator.reducerState.lifecycle,
             attempt.resolution == .allowManagedClose
                 || attempt.resolution == .deferToNativeUntitledReview
@@ -379,7 +568,7 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         return attempt.token
     }
 
-    private func resolvePendingCloseCallbacks(_ shouldClose: Bool) {
+    @MainActor private func resolvePendingCloseCallbacks(_ shouldClose: Bool) {
         let callbacks = pendingCloseCallbacks
         pendingCloseCallbacks.removeAll()
         for callback in callbacks {
@@ -392,7 +581,7 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
         }
     }
 
-    private func sendShouldClose(
+    @MainActor private func sendShouldClose(
         _ shouldClose: Bool,
         to delegate: Any,
         selector: Selector?,
@@ -416,5 +605,56 @@ final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHost {
             to: CloseCallback.self
         )
         callback(object, selector, self, shouldClose, contextInfo)
+    }
+
+    @MainActor private func initializeSyncCoordinatorIfNeeded()
+        -> DocumentSyncCoordinator
+    {
+        if let syncCoordinatorStorage {
+            return syncCoordinatorStorage
+        }
+        hasUndoManager = true
+        let stagedContent = initialContentStore.take()
+        let coordinator = DocumentSyncCoordinator(
+            snapshot: stagedContent?.snapshot
+                ?? DocumentSnapshot(text: "", format: .newDocument),
+            bridge: saveBridge,
+            recoveryStore: recoveryStore,
+            fileAccessLane: fileAccessLane
+        )
+        syncCoordinatorStorage = coordinator
+        coordinator.delegate = self
+        sourceObservation = coordinator.sourceBuffer.observe {
+            [weak self] _, origin in
+            switch origin {
+            case .localEditor, .merge, .recovery:
+                self?.updateChangeCount(.changeDone)
+            case .undo:
+                self?.updateChangeCount(.changeUndone)
+            case .redo:
+                self?.updateChangeCount(.changeRedone)
+            case .initialLoad, .externalReload:
+                return
+            }
+        }
+        if let stagedContent {
+            coordinator.loadInitial(
+                stagedContent.snapshot,
+                data: stagedContent.data,
+                from: fileURL
+            )
+        }
+        return coordinator
+    }
+
+    @MainActor private func installStagedContentIfNeeded(
+        into coordinator: DocumentSyncCoordinator
+    ) {
+        guard let stagedContent = initialContentStore.take() else { return }
+        coordinator.loadInitial(
+            stagedContent.snapshot,
+            data: stagedContent.data,
+            from: fileURL
+        )
     }
 }

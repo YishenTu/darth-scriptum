@@ -205,6 +205,15 @@ enum MarkdownEngineCompatibility {
         )
     }
 
+    /// Broadcasts the same public restyle request when an asynchronous service
+    /// has new output but does not own a concrete text view.
+    static func requestFullRestyle(
+        notificationCenter: NotificationCenter = .default,
+        notification: Notification.Name
+    ) {
+        notificationCenter.post(name: notification, object: nil)
+    }
+
     /// Detects the outer-pipe table syntax supported by MarkdownEngine 0.11.0.
     ///
     /// This reads source text instead of rendered attributes, which may not

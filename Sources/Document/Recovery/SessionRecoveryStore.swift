@@ -97,6 +97,7 @@ actor SessionRecoveryStore {
     private let perDocumentLimit: Int
     private let totalByteLimit: Int
     private let persistenceDirectory: URL?
+    private let fileAccessLane: DocumentFileAccessLane
     private let migrationWriteHook: MigrationWriteHookBox?
     private let startupReadHook: StartupReadHookBox?
     private let startupCompletionHook: StartupCompletionHookBox?
@@ -113,6 +114,7 @@ actor SessionRecoveryStore {
 
     init(
         persistenceDirectory: URL? = nil,
+        fileAccessLane: DocumentFileAccessLane = DocumentFileAccess.recovery,
         perDocumentLimit: Int = 5,
         totalByteLimit: Int = 10 * 1_024 * 1_024,
         migrationWriteHook: (@Sendable (Int) throws -> Void)? = nil,
@@ -126,6 +128,7 @@ actor SessionRecoveryStore {
         )? = nil
     ) {
         self.persistenceDirectory = persistenceDirectory
+        self.fileAccessLane = fileAccessLane
         self.perDocumentLimit = perDocumentLimit
         self.totalByteLimit = totalByteLimit
         self.migrationWriteHook = migrationWriteHook.map(MigrationWriteHookBox.init)
@@ -716,7 +719,7 @@ actor SessionRecoveryStore {
         let migrationHook = migrationWriteHook
         let startupHook = startupReadHook
         let persistenceDirectory = persistenceDirectory
-        return try await DocumentFileAccess.perform {
+        return try await fileAccessLane.perform {
             try startupHook?.hook()
             guard let persistenceDirectory else {
                 return PersistedState(
@@ -781,7 +784,7 @@ actor SessionRecoveryStore {
             let removedURLs = trim.removed.map {
                 Self.snapshotURL(for: $0.id, in: persistenceDirectory)
             }
-            try await DocumentFileAccess.perform {
+            try await fileAccessLane.perform {
                 try Self.persist(entry, in: persistenceDirectory)
                 try Self.commitDeletion(
                     of: removedURLs,
@@ -800,6 +803,7 @@ actor SessionRecoveryStore {
         _ request: RawPersistenceCommand
     ) async throws -> SessionRecoveryStoreRawMutationReceipt {
         try requireReady()
+        try TextFileCodec.validateSupportedSize(request.data)
         try await reconcilePendingTransactionsIfNeeded()
         try validateMutation(
             identity: request.identity,
@@ -837,7 +841,7 @@ actor SessionRecoveryStore {
         if let persistenceDirectory {
             let artifact = request.recoveryArtifact
             let rawPersistenceHook = rawPersistenceHook
-            try await DocumentFileAccess.perform {
+            try await fileAccessLane.perform {
                 try rawPersistenceHook?.hook(.beforeRawPersistence)
                 try Self.persistRaw(
                     entry,
@@ -897,7 +901,7 @@ actor SessionRecoveryStore {
             )
             let previous = currentGeneration(for: request.sourceIdentity)
             if let persistenceDirectory {
-                try await DocumentFileAccess.perform {
+                try await fileAccessLane.perform {
                     try Self.persistGenerationIndex(
                         nextGenerations,
                         in: persistenceDirectory
@@ -987,7 +991,7 @@ actor SessionRecoveryStore {
                 nextGenerations: nextGenerations
             )
             let hook = migrationWriteHook
-            try await DocumentFileAccess.perform {
+            try await fileAccessLane.perform {
                 try Self.persistMigration(migration, in: persistenceDirectory)
                 var writeCount = 0
                 for entry in movedEntries
@@ -1066,7 +1070,7 @@ actor SessionRecoveryStore {
                         Self.rawMetadataURL(for: id, in: persistenceDirectory),
                     ]
                 }
-            try await DocumentFileAccess.perform {
+            try await fileAccessLane.perform {
                 try Self.commitDeletion(
                     of: deletionURLs,
                     in: persistenceDirectory,
@@ -1088,7 +1092,7 @@ actor SessionRecoveryStore {
             return reconciliationReceipt(for: intent, acknowledgedArtifact: nil)
         }
         let hook = migrationWriteHook
-        let imported = try await DocumentFileAccess.perform {
+        let imported = try await fileAccessLane.perform {
             try Self.importPersistedState(
                 from: persistenceDirectory,
                 migrationWriteHook: hook
@@ -1124,7 +1128,7 @@ actor SessionRecoveryStore {
         guard let persistenceDirectory else {
             return .unresolved
         }
-        return try await DocumentFileAccess.perform {
+        return try await fileAccessLane.perform {
             try CommitRecoveryJournalStore.reconcileCommit(
                 request,
                 in: persistenceDirectory
@@ -1142,7 +1146,7 @@ actor SessionRecoveryStore {
         let migrationURL = Self.migrationURL(in: persistenceDirectory)
         let deletionURL = Self.deletionURL(in: persistenceDirectory)
         let pendingJournal: PendingRecoveryJournal? =
-            try await DocumentFileAccess.perform {
+            try await fileAccessLane.perform {
                 if FileManager.default.fileExists(atPath: migrationURL.path) {
                     return PendingRecoveryJournal.migration
                 }
@@ -1155,7 +1159,7 @@ actor SessionRecoveryStore {
 
         let hook = migrationWriteHook
         do {
-            let imported = try await DocumentFileAccess.perform {
+            let imported = try await fileAccessLane.perform {
                 try Self.importPersistedState(
                     from: persistenceDirectory,
                     migrationWriteHook: hook

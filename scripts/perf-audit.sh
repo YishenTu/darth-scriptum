@@ -10,11 +10,11 @@ cd "$repository_root"
 
 exec xcodebuild \
   -project DarthScriptum.xcodeproj \
-  -scheme DarthScriptum \
+  -scheme DarthScriptumPerformance \
   -configuration Benchmark \
   -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath DerivedData \
   -xcconfig "$verification_config" \
   -onlyUsePackageVersionsFromResolvedFile \
   test \
-  -only-testing:DarthScriptumTests/EditPipelinePerformanceAuditTests
+  -only-testing:DarthScriptumPerformanceTests/EditPipelinePerformanceAuditTests

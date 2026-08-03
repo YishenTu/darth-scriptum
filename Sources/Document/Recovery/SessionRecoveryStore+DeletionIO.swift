@@ -65,7 +65,10 @@ extension SessionRecoveryStore {
     ) throws {
         let url = deletionURL(in: directory)
         guard FileManager.default.fileExists(atPath: url.path) else { return }
-        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let data = try TextFileCodec.readSupportedData(
+            at: url,
+            followingSymbolicLinks: false
+        )
         let deletion: PersistedRecoveryDeletion
         do {
             deletion = try JSONDecoder().decode(PersistedRecoveryDeletion.self, from: data)

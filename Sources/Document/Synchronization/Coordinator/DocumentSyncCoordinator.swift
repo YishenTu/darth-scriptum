@@ -39,6 +39,7 @@ final class DocumentSyncCoordinator: ObservableObject {
     /// compatibility projection until a verified file attachment replaces it.
     private var unattachedDurableState: DurableFileState?
     private let fileMonitoringEnabled: Bool
+    private let fileAccessLane: DocumentFileAccessLane
     private let effectExecutor: DocumentSyncCoordinatorEffectExecuting
     private let recoveryEffectExecutor: DocumentSyncRecoveryEffectExecutor
     private let manualScheduler: ManualSyncScheduler?
@@ -53,6 +54,7 @@ final class DocumentSyncCoordinator: ObservableObject {
 
     private var sourceObservation: UUID?
     private var attachmentTask: Task<Void, Never>?
+    private var pendingEffectStartTasks: [SyncEffectToken: Task<Void, Never>] = [:]
     private var attachmentRequestID: UUID?
     private var attachmentCompletions: [UUID: (@MainActor (Bool) -> Void)] = [:]
     private var initialAttachmentPending = false
@@ -78,6 +80,8 @@ final class DocumentSyncCoordinator: ObservableObject {
         initialDurableState: DurableFileState? = nil,
         bridge: SaveTransactionBridge = SaveTransactionBridge(),
         recoveryStore: SessionRecoveryStore = .shared,
+        fileAccessLane: DocumentFileAccessLane =
+            DocumentFileAccess.makeDocumentLane(),
         fileMonitoringEnabled: Bool = true,
         savePreparationHook: (@MainActor () async -> Void)? = nil,
         externalReadHook: (@MainActor (UInt64) async -> Void)? = nil,
@@ -93,10 +97,14 @@ final class DocumentSyncCoordinator: ObservableObject {
         durableState = initialDurableState
         unattachedDurableState = initialDurableState
         self.bridge = bridge
+        self.fileAccessLane = fileAccessLane
         self.fileMonitoringEnabled = fileMonitoringEnabled
         self.effectExecutor =
             effectExecutor
-            ?? DocumentSyncDefaultEffectExecutor(recoveryStore: recoveryStore)
+            ?? DocumentSyncDefaultEffectExecutor(
+                recoveryStore: recoveryStore,
+                fileAccessLane: fileAccessLane
+            )
         recoveryEffectExecutor = DocumentSyncRecoveryEffectExecutor(
             recoveryStore: recoveryStore
         )
@@ -372,7 +380,7 @@ final class DocumentSyncCoordinator: ObservableObject {
         let commitGeneration = reducerState.durableBaseline?.commitGeneration ?? 0
         let verification: DocumentSyncAttachmentInspection
         do {
-            verification = try await DocumentFileAccess.perform {
+            verification = try await fileAccessLane.perform {
                 try DocumentSyncAttachmentInspection.inspectSaveAs(
                     at: targetURL,
                     expectedData: expectedData,
@@ -676,10 +684,11 @@ final class DocumentSyncCoordinator: ObservableObject {
         requiresFreshTargetObservation: Bool = false
     ) {
         let commitGeneration = reducerState.durableBaseline?.commitGeneration ?? 0
+        let fileAccessLane = fileAccessLane
         attachmentTask = Task { [weak self] in
             let inspection: DocumentSyncAttachmentInspection
             do {
-                inspection = try await DocumentFileAccess.perform {
+                inspection = try await fileAccessLane.perform {
                     DocumentSyncAttachmentInspection.inspect(
                         at: targetURL,
                         knownData: knownData,
@@ -969,6 +978,11 @@ final class DocumentSyncCoordinator: ObservableObject {
             } else {
                 scheduler.cancelAll()
             }
+        case .cancelOperation(let token):
+            pendingEffectStartTasks.removeValue(forKey: token)?.cancel()
+            effectExecutor.cancel(token: token)
+        case .cancelAllOperations:
+            cancelAllPendingOperations()
         case .prepareSave(let request):
             executeSavePreparation(request)
         case .commitSave(let request):
@@ -1014,11 +1028,14 @@ final class DocumentSyncCoordinator: ObservableObject {
             return
         }
 
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             await savePreparationHook()
-            guard let self, !self.isTornDown else { return }
+            guard let self else { return }
+            self.pendingEffectStartTasks.removeValue(forKey: request.token)
+            guard !Task.isCancelled, !self.isTornDown else { return }
             self.beginSavePreparationEffect(request)
         }
+        pendingEffectStartTasks[request.token] = task
     }
 
     private func beginSavePreparationEffect(
@@ -1081,11 +1098,14 @@ final class DocumentSyncCoordinator: ObservableObject {
             return
         }
 
-        Task { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             await externalReadHook(request.token.attempt)
-            guard let self, !self.isTornDown else { return }
+            guard let self else { return }
+            self.pendingEffectStartTasks.removeValue(forKey: request.token)
+            guard !Task.isCancelled, !self.isTornDown else { return }
             self.beginExternalReadEffect(request)
         }
+        pendingEffectStartTasks[request.token] = task
     }
 
     private func beginExternalReadEffect(
@@ -1125,9 +1145,10 @@ final class DocumentSyncCoordinator: ObservableObject {
                 onDescriptorClosed: monitorDescriptorClosedHook,
                 startupHook: monitorStartHook
             )
+            let fileAccessLane = fileAccessLane
             Task { [weak self] in
                 do {
-                    try await DocumentFileAccess.perform {
+                    try await fileAccessLane.perform {
                         try monitor.start()
                     }
                     guard let self,
@@ -1235,6 +1256,7 @@ final class DocumentSyncCoordinator: ObservableObject {
 
     private func tearDown() {
         isTornDown = true
+        cancelAllPendingOperations()
         pendingInitialPresenterSignal = nil
         resolvePendingVerifiedExternalRead(throwing: .verificationInterrupted)
         attachmentTask?.cancel()
@@ -1277,6 +1299,15 @@ final class DocumentSyncCoordinator: ObservableObject {
             }
         }
         resolveInitialAttachmentWaiters(didAttach: false)
+    }
+
+    private func cancelAllPendingOperations() {
+        let tasks = pendingEffectStartTasks.values
+        pendingEffectStartTasks.removeAll()
+        for task in tasks {
+            task.cancel()
+        }
+        effectExecutor.cancelAll()
     }
 
     private func replaceSource(_ text: String, origin: DocumentChangeOrigin) {

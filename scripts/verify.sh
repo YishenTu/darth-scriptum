@@ -50,18 +50,27 @@ xcodebuild \
   -derivedDataPath "$derived_data" \
   -xcconfig "$verification_config" \
   -onlyUsePackageVersionsFromResolvedFile \
-  -skip-testing:DarthScriptumTests/PerformanceTests \
-  -skip-testing:DarthScriptumTests/EditPipelinePerformanceAuditTests \
+  -only-testing:DarthScriptumUnitTests \
   test
 
 xcodebuild \
   -project "$project_path" \
-  -scheme "$scheme_name" \
+  -scheme DarthScriptumE2E \
+  -configuration Debug \
+  -destination "$destination_name" \
+  -derivedDataPath "$derived_data" \
+  -xcconfig "$verification_config" \
+  -onlyUsePackageVersionsFromResolvedFile \
+  -only-testing:DarthScriptumE2ETests \
+  test
+
+xcodebuild \
+  -project "$project_path" \
+  -scheme DarthScriptumPerformance \
   -configuration Benchmark \
   -destination "$destination_name" \
   -derivedDataPath "$derived_data" \
   -xcconfig "$verification_config" \
   -onlyUsePackageVersionsFromResolvedFile \
-  -only-testing:DarthScriptumTests/PerformanceTests \
-  -only-testing:DarthScriptumTests/EditPipelinePerformanceAuditTests \
+  -only-testing:DarthScriptumPerformanceTests \
   test

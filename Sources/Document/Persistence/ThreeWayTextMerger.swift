@@ -32,14 +32,49 @@ enum ThreeWayMergeResult: Sendable, Equatable {
 }
 
 struct ThreeWayTextMerger: Sendable {
+    static let maximumChangedCoreUTF8ByteCount = 8 * 1_024 * 1_024
+    static let maximumChangedLineCount = 20_000
+    static let maximumLineDifferenceWork = 4_000_000
+    private static let cancellationStride = 64 * 1_024
+
+    static func supportsLineDifference(
+        baseLineCount: Int,
+        updatedLineCount: Int
+    ) -> Bool {
+        guard baseLineCount >= 0, updatedLineCount >= 0 else {
+            return false
+        }
+        let (work, overflow) = baseLineCount.multipliedReportingOverflow(
+            by: updatedLineCount
+        )
+        return !overflow && work <= maximumLineDifferenceWork
+    }
+
     nonisolated func result(
         for request: DocumentSyncMergeRequest
     ) -> DocumentSyncMergeResult {
+        try! result(for: request, cancellationCheck: {})
+    }
+
+    nonisolated func cancellableResult(
+        for request: DocumentSyncMergeRequest
+    ) throws -> DocumentSyncMergeResult {
+        try result(
+            for: request,
+            cancellationCheck: { try Task.checkCancellation() }
+        )
+    }
+
+    private nonisolated func result(
+        for request: DocumentSyncMergeRequest,
+        cancellationCheck: () throws -> Void
+    ) throws -> DocumentSyncMergeResult {
         let outcome: DocumentSyncMergeResult.Outcome
-        switch merge(
+        switch try mergeCancellable(
             base: request.base?.text ?? "",
             local: request.local.text,
-            external: request.external.text
+            external: request.external.text,
+            cancellationCheck: cancellationCheck
         ) {
         case .conflict:
             outcome = .conflict
@@ -62,21 +97,94 @@ struct ThreeWayTextMerger: Sendable {
     }
 
     func merge(base: String, local: String, external: String) -> ThreeWayMergeResult {
-        if local == external { return .unchanged(local) }
-        if local == base { return .unchanged(external) }
-        if external == base { return .unchanged(local) }
-
-        let localChange = change(from: base, to: local)
-        let externalChange = change(from: base, to: external)
-        if localChange == externalChange { return .unchanged(local) }
-        if !overlaps(localChange, externalChange) {
-            return .merged(applying([localChange, externalChange], to: base))
-        }
-
-        return mergeLineHunks(base: base, local: local, external: external)
+        try! mergeCancellable(
+            base: base,
+            local: local,
+            external: external,
+            cancellationCheck: {}
+        )
     }
 
-    private func applying(_ changes: [Change], to base: String) -> String {
+    func mergeCancellable(
+        base: String,
+        local: String,
+        external: String,
+        cancellationCheck: () throws -> Void = {
+            try Task.checkCancellation()
+        }
+    ) throws -> ThreeWayMergeResult {
+        try cancellationCheck()
+        let localMatchesExternal = try stringsEqual(
+            local,
+            external,
+            cancellationCheck
+        )
+        let localMatchesBase = try stringsEqual(local, base, cancellationCheck)
+        let externalMatchesBase = try stringsEqual(
+            external,
+            base,
+            cancellationCheck
+        )
+
+        let localChange = try change(
+            from: base,
+            to: local,
+            cancellationCheck: cancellationCheck
+        )
+        let externalChange = try change(
+            from: base,
+            to: external,
+            cancellationCheck: cancellationCheck
+        )
+        guard
+            try changedCoreIsSupported(
+                in: base,
+                change: localChange,
+                cancellationCheck: cancellationCheck
+            ),
+            try changedCoreIsSupported(
+                in: base,
+                change: externalChange,
+                cancellationCheck: cancellationCheck
+            )
+        else {
+            return .conflict
+        }
+        if localMatchesExternal {
+            return .unchanged(local)
+        }
+        if localMatchesBase {
+            return .unchanged(external)
+        }
+        if externalMatchesBase {
+            return .unchanged(local)
+        }
+        if localChange == externalChange { return .unchanged(local) }
+        if !overlaps(localChange, externalChange) {
+            return .merged(
+                try applying(
+                    [localChange, externalChange],
+                    to: base,
+                    cancellationCheck: cancellationCheck
+                )
+            )
+        }
+
+        return try mergeLineHunks(
+            base: base,
+            local: local,
+            external: external,
+            localChange: localChange,
+            externalChange: externalChange,
+            cancellationCheck: cancellationCheck
+        )
+    }
+
+    private func applying(
+        _ changes: [Change],
+        to base: String,
+        cancellationCheck: () throws -> Void
+    ) throws -> String {
         let mutable = NSMutableString(string: base)
         for change in changes.sorted(by: {
             if $0.range.location == $1.range.location {
@@ -84,27 +192,106 @@ struct ThreeWayTextMerger: Sendable {
             }
             return $0.range.location > $1.range.location
         }) {
+            try cancellationCheck()
             mutable.replaceCharacters(in: change.range, with: change.replacement)
         }
+        try cancellationCheck()
         return mutable as String
     }
 
     private func mergeLineHunks(
         base: String,
         local: String,
-        external: String
-    ) -> ThreeWayMergeResult {
-        let baseLines = lineTokens(in: base)
-        let localChanges = lineChanges(from: baseLines, to: lineTokens(in: local))
-        let externalChanges = lineChanges(
-            from: baseLines,
-            to: lineTokens(in: external)
+        external: String,
+        localChange: Change,
+        externalChange: Change,
+        cancellationCheck: () throws -> Void
+    ) throws -> ThreeWayMergeResult {
+        let baseText = base as NSString
+        let localText = local as NSString
+        let externalText = external as NSString
+        let changedStart = min(
+            localChange.range.location,
+            externalChange.range.location
         )
+        let changedEnd = max(
+            NSMaxRange(localChange.range),
+            NSMaxRange(externalChange.range)
+        )
+        let baseWindow = try lineWindow(
+            in: baseText,
+            containing: NSRange(
+                location: changedStart,
+                length: changedEnd - changedStart
+            ),
+            cancellationCheck: cancellationCheck
+        )
+        let localWindow = NSRange(
+            location: baseWindow.location,
+            length: baseWindow.length - localChange.range.length
+                + (localChange.replacement as NSString).length
+        )
+        let externalWindow = NSRange(
+            location: baseWindow.location,
+            length: baseWindow.length - externalChange.range.length
+                + (externalChange.replacement as NSString).length
+        )
+        guard NSMaxRange(localWindow) <= localText.length,
+            NSMaxRange(externalWindow) <= externalText.length
+        else {
+            return .conflict
+        }
+
+        let baseCore = baseText.substring(with: baseWindow)
+        let localCore = localText.substring(with: localWindow)
+        let externalCore = externalText.substring(with: externalWindow)
+        guard
+            try textIsWithinChangedCoreLimits(
+                baseCore,
+                cancellationCheck: cancellationCheck
+            ),
+            try textIsWithinChangedCoreLimits(
+                localCore,
+                cancellationCheck: cancellationCheck
+            ),
+            try textIsWithinChangedCoreLimits(
+                externalCore,
+                cancellationCheck: cancellationCheck
+            )
+        else {
+            return .conflict
+        }
+
+        let baseLines = try lineTokens(
+            in: baseCore,
+            cancellationCheck: cancellationCheck
+        )
+        guard
+            let localChanges = try lineChanges(
+                from: baseLines,
+                to: lineTokens(
+                    in: localCore,
+                    cancellationCheck: cancellationCheck
+                ),
+                cancellationCheck: cancellationCheck
+            ),
+            let externalChanges = try lineChanges(
+                from: baseLines,
+                to: lineTokens(
+                    in: externalCore,
+                    cancellationCheck: cancellationCheck
+                ),
+                cancellationCheck: cancellationCheck
+            )
+        else {
+            return .conflict
+        }
 
         guard
-            let uniqueChanges = combineNonoverlapping(
+            let uniqueChanges = try combineNonoverlapping(
                 localChanges,
-                externalChanges
+                externalChanges,
+                cancellationCheck: cancellationCheck
             )
         else {
             return .conflict
@@ -116,36 +303,216 @@ struct ThreeWayTextMerger: Sendable {
             }
             return $0.range.lowerBound > $1.range.lowerBound
         }) {
+            try cancellationCheck()
             merged.replaceSubrange(change.range, with: change.replacement)
         }
-        return .merged(merged.joined())
+        try cancellationCheck()
+        let prefix = baseText.substring(
+            with: NSRange(location: 0, length: baseWindow.location)
+        )
+        let suffix = baseText.substring(
+            from: NSMaxRange(baseWindow)
+        )
+        return .merged(prefix + merged.joined() + suffix)
     }
 
-    private func change(from base: String, to updated: String) -> Change {
+    private func lineWindow(
+        in text: NSString,
+        containing range: NSRange,
+        cancellationCheck: () throws -> Void
+    ) throws -> NSRange {
+        var start = range.location
+        var scanned = 0
+        while start > 0, !isLineBoundary(start, in: text) {
+            start -= 1
+            scanned += 1
+            if scanned.isMultiple(of: Self.cancellationStride) {
+                try cancellationCheck()
+            }
+        }
+
+        var end = NSMaxRange(range)
+        while end < text.length, !isLineBoundary(end, in: text) {
+            end += 1
+            scanned += 1
+            if scanned.isMultiple(of: Self.cancellationStride) {
+                try cancellationCheck()
+            }
+        }
+        try cancellationCheck()
+        return NSRange(location: start, length: end - start)
+    }
+
+    private func isLineBoundary(_ location: Int, in text: NSString) -> Bool {
+        guard location > 0 else { return true }
+        guard location < text.length else { return true }
+        let previous = text.character(at: location - 1)
+        if previous == 0x000A { return true }
+        return previous == 0x000D && text.character(at: location) != 0x000A
+    }
+
+    private func change(
+        from base: String,
+        to updated: String,
+        cancellationCheck: () throws -> Void
+    ) throws -> Change {
         let baseText = base as NSString
         let updatedText = updated as NSString
-        let difference = UTF16TextDifference.between(
-            original: baseText,
-            updated: updatedText
+        var prefix = 0
+        let sharedLength = min(baseText.length, updatedText.length)
+        while prefix < sharedLength,
+            baseText.character(at: prefix) == updatedText.character(at: prefix)
+        {
+            prefix += 1
+            if prefix.isMultiple(of: Self.cancellationStride) {
+                try cancellationCheck()
+            }
+        }
+        if UTF16TextDifference.splitsSurrogatePair(at: prefix, in: baseText)
+            || UTF16TextDifference.splitsSurrogatePair(at: prefix, in: updatedText)
+        {
+            prefix -= 1
+        }
+
+        var suffix = 0
+        while suffix < baseText.length - prefix,
+            suffix < updatedText.length - prefix,
+            baseText.character(at: baseText.length - suffix - 1)
+                == updatedText.character(at: updatedText.length - suffix - 1)
+        {
+            suffix += 1
+            if suffix.isMultiple(of: Self.cancellationStride) {
+                try cancellationCheck()
+            }
+        }
+        if UTF16TextDifference.splitsSurrogatePair(
+            at: baseText.length - suffix,
+            in: baseText
+        )
+            || UTF16TextDifference.splitsSurrogatePair(
+                at: updatedText.length - suffix,
+                in: updatedText
+            )
+        {
+            suffix -= 1
+        }
+        try cancellationCheck()
+        let originalRange = NSRange(
+            location: prefix,
+            length: baseText.length - prefix - suffix
+        )
+        let updatedRange = NSRange(
+            location: prefix,
+            length: updatedText.length - prefix - suffix
         )
         return Change(
-            range: difference.originalRange,
-            replacement: updatedText.substring(
-                with: difference.updatedRange
-            )
+            range: originalRange,
+            replacement: updatedText.substring(with: updatedRange)
         )
+    }
+
+    private func changedCoreIsSupported(
+        in base: String,
+        change: Change,
+        cancellationCheck: () throws -> Void
+    ) throws -> Bool {
+        let baseCore = (base as NSString).substring(with: change.range)
+        guard
+            try textIsWithinChangedCoreLimits(
+                baseCore,
+                cancellationCheck: cancellationCheck
+            )
+        else {
+            return false
+        }
+        return try textIsWithinChangedCoreLimits(
+            change.replacement,
+            cancellationCheck: cancellationCheck
+        )
+    }
+
+    private func textIsWithinChangedCoreLimits(
+        _ text: String,
+        cancellationCheck: () throws -> Void
+    ) throws -> Bool {
+        if let byteCount = text.utf8.withContiguousStorageIfAvailable({ $0.count }),
+            byteCount > Self.maximumChangedCoreUTF8ByteCount
+        {
+            return false
+        }
+
+        var byteCount = 0
+        var lineCount = 0
+        var previousWasCarriageReturn = false
+        var endedWithLineBreak = false
+        for byte in text.utf8 {
+            byteCount += 1
+            guard byteCount <= Self.maximumChangedCoreUTF8ByteCount else {
+                return false
+            }
+            if byte == 0x0A {
+                lineCount += 1
+                previousWasCarriageReturn = false
+                endedWithLineBreak = true
+            } else {
+                if previousWasCarriageReturn {
+                    lineCount += 1
+                }
+                previousWasCarriageReturn = byte == 0x0D
+                endedWithLineBreak = previousWasCarriageReturn
+            }
+            guard lineCount <= Self.maximumChangedLineCount else {
+                return false
+            }
+            if byteCount.isMultiple(of: Self.cancellationStride) {
+                try cancellationCheck()
+            }
+        }
+        if previousWasCarriageReturn {
+            lineCount += 1
+        } else if !text.isEmpty, !endedWithLineBreak {
+            lineCount += 1
+        }
+        try cancellationCheck()
+        return lineCount <= Self.maximumChangedLineCount
+    }
+
+    private func stringsEqual(
+        _ lhs: String,
+        _ rhs: String,
+        _ cancellationCheck: () throws -> Void
+    ) throws -> Bool {
+        let lhsBytes = lhs.utf8
+        let rhsBytes = rhs.utf8
+        guard lhsBytes.count == rhsBytes.count else { return false }
+        var lhsIndex = lhsBytes.startIndex
+        var rhsIndex = rhsBytes.startIndex
+        var compared = 0
+        while lhsIndex < lhsBytes.endIndex {
+            guard lhsBytes[lhsIndex] == rhsBytes[rhsIndex] else { return false }
+            lhsBytes.formIndex(after: &lhsIndex)
+            rhsBytes.formIndex(after: &rhsIndex)
+            compared += 1
+            if compared.isMultiple(of: Self.cancellationStride) {
+                try cancellationCheck()
+            }
+        }
+        try cancellationCheck()
+        return true
     }
 
     private func combineNonoverlapping(
         _ local: [LineChange],
-        _ external: [LineChange]
-    ) -> [LineChange]? {
+        _ external: [LineChange],
+        cancellationCheck: () throws -> Void
+    ) throws -> [LineChange]? {
         var localIndex = 0
         var externalIndex = 0
         var combined: [LineChange] = []
         combined.reserveCapacity(local.count + external.count)
 
         while localIndex < local.count, externalIndex < external.count {
+            try cancellationCheck()
             let localChange = local[localIndex]
             let externalChange = external[externalIndex]
             if localChange == externalChange {
@@ -209,13 +576,17 @@ struct ThreeWayTextMerger: Sendable {
 
     private func lineChanges(
         from base: [Substring],
-        to updated: [Substring]
-    ) -> [LineChange] {
+        to updated: [Substring],
+        cancellationCheck: () throws -> Void
+    ) throws -> [LineChange]? {
         var sharedPrefix = 0
         while sharedPrefix < min(base.count, updated.count),
             base[sharedPrefix] == updated[sharedPrefix]
         {
             sharedPrefix += 1
+            if sharedPrefix.isMultiple(of: 1_024) {
+                try cancellationCheck()
+            }
         }
         var sharedSuffix = 0
         while sharedSuffix < base.count - sharedPrefix,
@@ -224,19 +595,43 @@ struct ThreeWayTextMerger: Sendable {
                 == updated[updated.count - sharedSuffix - 1]
         {
             sharedSuffix += 1
+            if sharedSuffix.isMultiple(of: 1_024) {
+                try cancellationCheck()
+            }
         }
-        let baseCore = Array(
-            base[sharedPrefix..<(base.count - sharedSuffix)]
-        )
+        let baseCoreCount = base.count - sharedPrefix - sharedSuffix
+        let updatedCoreCount = updated.count - sharedPrefix - sharedSuffix
+        guard
+            Self.supportsLineDifference(
+                baseLineCount: baseCoreCount,
+                updatedLineCount: updatedCoreCount
+            )
+        else {
+            return nil
+        }
+        let baseCore = Array(base[sharedPrefix..<(base.count - sharedSuffix)])
         let updatedCore = Array(
             updated[sharedPrefix..<(updated.count - sharedSuffix)]
         )
         guard !baseCore.isEmpty || !updatedCore.isEmpty else { return [] }
+        guard baseCore.count <= Self.maximumChangedLineCount,
+            updatedCore.count <= Self.maximumChangedLineCount
+        else {
+            return [
+                LineChange(
+                    range: sharedPrefix..<(base.count - sharedSuffix),
+                    replacement: updatedCore
+                )
+            ]
+        }
 
+        try cancellationCheck()
         let difference = updatedCore.difference(from: baseCore)
+        try cancellationCheck()
         var removals = Set<Int>()
         var insertions = Set<Int>()
         for change in difference {
+            try cancellationCheck()
             switch change {
             case .remove(let offset, _, _):
                 removals.insert(offset)
@@ -249,6 +644,7 @@ struct ThreeWayTextMerger: Sendable {
         var baseIndex = 0
         var updatedIndex = 0
         while baseIndex < baseCore.count || updatedIndex < updatedCore.count {
+            try cancellationCheck()
             if removals.contains(baseIndex) || insertions.contains(updatedIndex) {
                 let start = sharedPrefix + baseIndex
                 var replacement: [Substring] = []
@@ -307,11 +703,15 @@ struct ThreeWayTextMerger: Sendable {
         return changes
     }
 
-    private func lineTokens(in text: String) -> [Substring] {
+    private func lineTokens(
+        in text: String,
+        cancellationCheck: () throws -> Void
+    ) throws -> [Substring] {
         let scalars = text.unicodeScalars
         var result: [Substring] = []
         var lineStart = scalars.startIndex
         var cursor = scalars.startIndex
+        var scannedScalarCount = 0
         while cursor < scalars.endIndex {
             let scalar = scalars[cursor]
             var tokenEnd = scalars.index(after: cursor)
@@ -328,10 +728,15 @@ struct ThreeWayTextMerger: Sendable {
                 lineStart = tokenEnd
             }
             cursor = tokenEnd
+            scannedScalarCount += 1
+            if scannedScalarCount.isMultiple(of: Self.cancellationStride) {
+                try cancellationCheck()
+            }
         }
         if lineStart < scalars.endIndex {
             result.append(text[lineStart..<scalars.endIndex])
         }
+        try cancellationCheck()
         return result
     }
 }

@@ -1,7 +1,14 @@
 import Darwin
 import Foundation
 
-struct SafeFileCommitter: Sendable {
+struct SafeFileCommitter: DocumentFileCommitting {
+    private struct PreparedCandidate {
+        let url: URL
+        let resourceIdentifier: String
+        let replacementDirectoryURL: URL
+        let replacementDirectoryResourceIdentifier: String
+    }
+
     enum Strategy: Sendable {
         case automatic
         case coordinatedReplacementOnly
@@ -61,16 +68,13 @@ struct SafeFileCommitter: Sendable {
         let requestedTargetURL = token.targetURL
 
         if token.expectedDurableState == nil {
-            try writeNewFileExclusively(
+            let committedFingerprint = try writeNewFileExclusively(
                 token.encodedData,
                 to: requestedTargetURL
             )
             return FileCommitResult(
                 generation: token.generation,
-                committedFingerprint: try Self.fingerprint(
-                    for: requestedTargetURL,
-                    data: token.encodedData
-                ),
+                committedFingerprint: committedFingerprint,
                 displacedPreimage: nil,
                 safety: .coordinatedReplacement
             )
@@ -80,17 +84,59 @@ struct SafeFileCommitter: Sendable {
             throw CommitError.targetMissingBeforeCommit
         }
 
-        let replacementDirectory = try fileManager.url(
-            for: .itemReplacementDirectory,
-            in: .userDomainMask,
-            appropriateFor: targetURL,
-            create: true
-        )
+        let preparedCandidate = try TextFileCodec.withSupportedFileDescriptor(
+            at: targetURL,
+            followingSymbolicLinks: false
+        ) { sourceDescriptor, byteCount in
+            let replacementDirectory = try fileManager.url(
+                for: .itemReplacementDirectory,
+                in: .userDomainMask,
+                appropriateFor: targetURL,
+                create: true
+            )
+            let candidateURL = replacementDirectory.appendingPathComponent(
+                "darth-scriptum-\(UUID().uuidString)"
+            )
+            var didPrepareCandidate = false
+            defer {
+                if !didPrepareCandidate {
+                    _ = candidateURL.path.withCString { Darwin.unlink($0) }
+                    _ = replacementDirectory.path.withCString {
+                        Darwin.rmdir($0)
+                    }
+                }
+            }
+            let replacementDirectoryResourceIdentifier =
+                try DurableFileIO.resourceIdentifier(
+                    for: replacementDirectory
+                )
+            let candidateResourceIdentifier = try prepareCandidate(
+                at: candidateURL,
+                copyingMetadataFrom: sourceDescriptor,
+                data: token.encodedData
+            )
+            let preimage = try TextFileCodec.readSupportedData(
+                from: sourceDescriptor,
+                expectedByteCount: byteCount
+            )
+            try validate(
+                preimage: preimage,
+                descriptor: sourceDescriptor,
+                against: token.expectedDurableState
+            )
+            didPrepareCandidate = true
+            return PreparedCandidate(
+                url: candidateURL,
+                resourceIdentifier: candidateResourceIdentifier,
+                replacementDirectoryURL: replacementDirectory,
+                replacementDirectoryResourceIdentifier:
+                    replacementDirectoryResourceIdentifier
+            )
+        }
+        let replacementDirectory = preparedCandidate.replacementDirectoryURL
         let replacementDirectoryResourceIdentifier =
-            try DurableFileIO.resourceIdentifier(for: replacementDirectory)
-        let candidateURL =
-            replacementDirectory
-            .appendingPathComponent("darth-scriptum-\(UUID().uuidString)")
+            preparedCandidate.replacementDirectoryResourceIdentifier
+        let candidateURL = preparedCandidate.url
         var retainedRecoveryArtifact: CommitRecoveryArtifact?
         defer {
             if retainedRecoveryArtifact == nil,
@@ -110,24 +156,6 @@ struct SafeFileCommitter: Sendable {
             }
         }
 
-        try fileManager.copyItem(at: targetURL, to: candidateURL)
-        let handle = try FileHandle(forWritingTo: candidateURL)
-        do {
-            try handle.truncate(atOffset: 0)
-            try handle.write(contentsOf: token.encodedData)
-            try handle.synchronize()
-            try handle.close()
-        } catch {
-            try? handle.close()
-            throw error
-        }
-
-        let preflight = try Data(contentsOf: targetURL, options: [.mappedIfSafe])
-        try validate(
-            preimage: preflight,
-            at: targetURL,
-            against: token.expectedDurableState
-        )
         guard
             let expectedPreimageFingerprint = token.expectedDurableState?
                 .fingerprint
@@ -143,8 +171,14 @@ struct SafeFileCommitter: Sendable {
             commitGeneration: token.generation,
             expectedPreimageFingerprint: expectedPreimageFingerprint,
             committedPayloadFingerprint: token.contentFingerprint,
-            recoveryDirectory: recoveryDirectory
+            recoveryDirectory: recoveryDirectory,
+            registeringLiveCommit: true
         )
+        defer {
+            CommitRecoveryJournalStore.finishLiveCommit(
+                preparedRecoveryArtifact
+            )
+        }
         // Once the prepared journal exists, its candidate must remain owned
         // until durable acknowledgement completes. Any intervening failure is
         // an uncertain commit that reconciliation must still be able to prove.
@@ -178,12 +212,13 @@ struct SafeFileCommitter: Sendable {
             try DurableFileIO.synchronizeDirectory(
                 replacementDirectory
             )
-            let displacedPreimage = try Data(
-                contentsOf: candidateURL,
-                options: [.mappedIfSafe]
-            )
+            let displacedPayload =
+                try TextFileCodec.readVerifiedFilePayload(
+                    at: candidateURL,
+                    followingSymbolicLinks: false
+                )
             let verifiedDisplacedPreimage = VerifiedFilePayload(
-                data: displacedPreimage
+                data: displacedPayload.data
             )
             let displacedFingerprint = verifiedDisplacedPreimage.fingerprint
             let hasUnexpectedPreimage =
@@ -195,9 +230,10 @@ struct SafeFileCommitter: Sendable {
             }
             return FileCommitResult(
                 generation: token.generation,
-                committedFingerprint: try Self.fingerprint(
-                    for: targetURL,
-                    data: token.encodedData
+                committedFingerprint: FileFingerprint.make(
+                    data: token.encodedData,
+                    resourceIdentifier:
+                        preparedCandidate.resourceIdentifier
                 ),
                 verifiedDisplacedPreimage: verifiedDisplacedPreimage,
                 safety: .atomicSwap,
@@ -226,35 +262,34 @@ struct SafeFileCommitter: Sendable {
     }
 
     static func fingerprint(for url: URL, data: Data? = nil) throws -> FileFingerprint {
-        let contents = try data ?? Data(contentsOf: url, options: [.mappedIfSafe])
-        let identityURL = url.resolvingSymlinksInPath()
-        let attributes = try? FileManager.default.attributesOfItem(
-            atPath: identityURL.path
-        )
-        let device = attributes?[.systemNumber] as? NSNumber
-        let inode = attributes?[.systemFileNumber] as? NSNumber
-        let resourceIdentifier: String? =
-            if let device, let inode {
-                "\(device):\(inode)"
-            } else {
-                nil
+        let payload = try TextFileCodec.readVerifiedFilePayload(at: url)
+        if let data {
+            try TextFileCodec.validateSupportedSize(data)
+            guard data == payload.data else {
+                throw CommitError.targetChangedBeforeCommit
             }
-        return .make(data: contents, resourceIdentifier: resourceIdentifier)
+        }
+        return payload.fingerprint
     }
 
     private func validate(
         preimage: Data,
-        at url: URL,
+        descriptor: Int32,
         against expectedState: DurableFileState?
     ) throws {
         guard let expectedState else {
             throw CommitError.targetChangedBeforeCommit
         }
+        guard preimage.count == expectedState.fingerprint.byteCount else {
+            throw CommitError.targetChangedBeforeCommit
+        }
         let observedFingerprint = try Self.fingerprint(
-            for: url,
+            for: descriptor,
             data: preimage
         )
         guard
+            observedFingerprint.byteCount
+                == expectedState.fingerprint.byteCount,
             observedFingerprint.contentDigest
                 == expectedState.fingerprint.contentDigest,
             observedFingerprint.resourceIdentifier
@@ -264,9 +299,65 @@ struct SafeFileCommitter: Sendable {
         }
     }
 
-    private func writeNewFileExclusively(_ data: Data, to url: URL) throws {
+    private static func fingerprint(
+        for descriptor: Int32,
+        data: Data
+    ) throws -> FileFingerprint {
+        return .make(
+            data: data,
+            resourceIdentifier: try TextFileCodec.resourceIdentifier(
+                for: descriptor
+            )
+        )
+    }
+
+    private func prepareCandidate(
+        at url: URL,
+        copyingMetadataFrom sourceDescriptor: Int32,
+        data: Data
+    ) throws -> String {
         let descriptor = url.path.withCString {
-            Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o666))
+            Darwin.open(
+                $0,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                mode_t(0o600)
+            )
+        }
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { Darwin.close(descriptor) }
+
+        guard
+            fcopyfile(
+                sourceDescriptor,
+                descriptor,
+                nil,
+                copyfile_flags_t(COPYFILE_METADATA)
+            ) == 0
+        else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard Darwin.ftruncate(descriptor, 0) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        try write(data, to: descriptor)
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return try TextFileCodec.resourceIdentifier(for: descriptor)
+    }
+
+    private func writeNewFileExclusively(
+        _ data: Data,
+        to url: URL
+    ) throws -> FileFingerprint {
+        let descriptor = url.path.withCString {
+            Darwin.open(
+                $0,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                mode_t(0o666)
+            )
         }
         guard descriptor >= 0 else {
             if errno == EEXIST {
@@ -286,6 +377,24 @@ struct SafeFileCommitter: Sendable {
             Darwin.close(descriptor)
         }
 
+        try write(data, to: descriptor)
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        try DurableFileIO.synchronizeDirectory(
+            url.deletingLastPathComponent()
+        )
+        let fingerprint = FileFingerprint.make(
+            data: data,
+            resourceIdentifier: try TextFileCodec.resourceIdentifier(
+                for: descriptor
+            )
+        )
+        committed = true
+        return fingerprint
+    }
+
+    private func write(_ data: Data, to descriptor: Int32) throws {
         try data.withUnsafeBytes { bytes in
             guard let baseAddress = bytes.baseAddress else { return }
             var offset = 0
@@ -301,13 +410,6 @@ struct SafeFileCommitter: Sendable {
                 offset += count
             }
         }
-        guard Darwin.fsync(descriptor) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        try DurableFileIO.synchronizeDirectory(
-            url.deletingLastPathComponent()
-        )
-        committed = true
     }
 
     private func removeCreatedFileIfStillOwned(

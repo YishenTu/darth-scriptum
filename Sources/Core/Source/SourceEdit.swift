@@ -3,7 +3,8 @@ import Foundation
 enum DocumentChangeOrigin: Sendable, Equatable {
     case initialLoad
     case localEditor(paneID: UUID)
-    case undoRedo
+    case undo
+    case redo
     case externalReload
     case merge
     case recovery

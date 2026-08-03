@@ -322,6 +322,8 @@ enum DocumentSyncEffect: Sendable, Equatable {
     case schedule(SyncDeadlineRequest)
     case cancelDeadline(SyncDeadline)
     case cancelAllDeadlines
+    case cancelOperation(SyncEffectToken)
+    case cancelAllOperations
     case prepareSave(DocumentSyncSavePreparationRequest)
     case commitSave(DocumentSyncSaveCommitRequest)
     case reconcileCommit(DocumentSyncCommitReconciliationRequest)

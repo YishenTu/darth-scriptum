@@ -34,7 +34,7 @@ extension DocumentSyncReducer {
 
         var effects: [DocumentSyncEffect] = []
         if updated.mergeAttempt != nil {
-            invalidateMerge(&updated)
+            effects += invalidateMerge(&updated)
         }
 
         switch updated.local {
@@ -48,6 +48,24 @@ extension DocumentSyncReducer {
             effects += invalidatePendingSavePreparation(&updated)
         case .clean:
             break
+        }
+        if let baseline = updated.durableBaseline,
+            baseline.snapshot == updated.snapshot,
+            let rebasedBaseline = baseline.rebased(to: revision)
+        {
+            updated.durableBaseline = rebasedBaseline
+            updated.local = .clean(revision)
+            if updated.issue?.failure == .destinationRequiresSaveAs {
+                updated.issue = nil
+            }
+            if updated.externalSignalPending {
+                effects += scheduleExternalRead(&updated)
+                if !effects.isEmpty || updated.external != .idle {
+                    return transition(updated, effects: effects)
+                }
+            }
+            effects += continueSynchronization(&updated)
+            return transition(updated, effects: effects)
         }
         updated.local = .dirty(
             DocumentSyncDirtyState(revision: revision, scheduledToken: nil)
@@ -236,15 +254,18 @@ extension DocumentSyncReducer {
             result.safety == .atomicSwap
             ? nil
             : result.safety
+        var cancellationEffects: [DocumentSyncEffect] = []
         if let merge = updated.mergeAttempt,
             merge.baseline != updated.durableBaseline
         {
-            invalidateMerge(&updated)
+            cancellationEffects += invalidateMerge(&updated)
         }
-        if pendingRevision == attempt.sourceRevision,
-            updated.source == attempt.sourceRevision,
-            updated.format == pendingSave.snapshot.format
+        if updated.snapshot == committedBaseline.snapshot,
+            let rebasedBaseline = committedBaseline.rebased(
+                to: updated.source
+            )
         {
+            updated.durableBaseline = rebasedBaseline
             updated.local = .clean(updated.source)
         } else {
             updated.local = .dirty(
@@ -255,7 +276,10 @@ extension DocumentSyncReducer {
             )
         }
         if let deferred = applyPendingAttachmentTransition(updated) {
-            return deferred
+            return transition(
+                deferred.state,
+                effects: cancellationEffects + deferred.effects
+            )
         }
 
         if let cleanup = updated.recoveryCleanup,
@@ -268,11 +292,14 @@ extension DocumentSyncReducer {
                 target: cleanup.target,
                 purpose: cleanup.discardPurpose
             )
-            return transition(updated, effects: effects)
+            return transition(
+                updated,
+                effects: cancellationEffects + effects
+            )
         }
 
         let effects = continueSynchronization(&updated)
-        return transition(updated, effects: effects)
+        return transition(updated, effects: cancellationEffects + effects)
     }
 
     static func operationFailed(
@@ -719,7 +746,7 @@ extension DocumentSyncReducer {
             guard let token = dirty.scheduledToken else { return [] }
             state.activeTokens.removeValue(forKey: .savePreparation)
             return [.cancelDeadline(SyncDeadline(kind: .localSave, token: token))]
-        case .preparing:
+        case .preparing(let attempt):
             state.activeTokens.removeValue(forKey: .savePreparation)
             state.local = .dirty(
                 DocumentSyncDirtyState(
@@ -727,7 +754,7 @@ extension DocumentSyncReducer {
                     scheduledToken: nil
                 )
             )
-            return []
+            return [.cancelOperation(attempt.token)]
         case .clean, .writing:
             return []
         }

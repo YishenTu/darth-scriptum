@@ -2,17 +2,17 @@ import AppKit
 import SwiftUI
 
 enum AppTheme {
-    static let background = NSColor(hex: 0x1A1614)
+    static let background = adaptive(light: 0xF7F1E8, dark: 0x1A1614)
     static let backgroundOverlayOpacity: CGFloat = 0.55
     static let statusBarOverlayOpacity: CGFloat = 0.66
-    static let foreground = NSColor(hex: 0xE8D5B7)
-    static let accent = NSColor(hex: 0xC4956A)
-    static let selectionBackground = NSColor(hex: 0x4A3A2A)
-    static let mutedForeground = NSColor(hex: 0xA9967D)
-    static let codeBackground = NSColor(hex: 0x2A221E)
-    static let separator = NSColor(hex: 0x5A4638)
-    static let failure = NSColor(hex: 0xE06C75)
-    static let success = NSColor(hex: 0x98C379)
+    static let foreground = adaptive(light: 0x2B211B, dark: 0xE8D5B7)
+    static let accent = adaptive(light: 0xA86735, dark: 0xC4956A)
+    static let selectionBackground = adaptive(light: 0xE7D4BE, dark: 0x4A3A2A)
+    static let mutedForeground = adaptive(light: 0x6F6258, dark: 0xA9967D)
+    static let codeBackground = adaptive(light: 0xEFE5D8, dark: 0x2A221E)
+    static let separator = adaptive(light: 0xD3C0AC, dark: 0x5A4638)
+    static let failure = adaptive(light: 0xB4232F, dark: 0xE06C75)
+    static let success = adaptive(light: 0x477A38, dark: 0x98C379)
 
     static func editorFont(size: CGFloat) -> NSFont {
         let clampedSize = min(max(size, 10), 32)
@@ -89,6 +89,16 @@ enum AppTheme {
         ])
         return NSFont(descriptor: descriptor, size: size) ?? base
     }
+
+    private static func adaptive(light: UInt32, dark: UInt32) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let color =
+                appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                ? dark
+                : light
+            return NSColor(hex: color)
+        }
+    }
 }
 
 extension NSColor {
@@ -99,19 +109,5 @@ extension NSColor {
             blue: CGFloat(hex & 0xFF) / 255,
             alpha: alpha
         )
-    }
-}
-
-struct MaterialView: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .underWindowBackground
-        view.blendingMode = .behindWindow
-        view.state = .active
-        return view
-    }
-
-    func updateNSView(_ view: NSVisualEffectView, context: Context) {
-        view.isHidden = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
     }
 }

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Immutable byte evidence minted only after the codec has encoded the exact
@@ -12,12 +13,13 @@ struct DocumentSyncPreparedSavePayload: Sendable, Equatable {
     fileprivate init(
         id: UUID = UUID(),
         snapshot: DocumentSnapshot,
-        encodedData: Data
+        encodedData: Data,
+        contentFingerprint: FileFingerprint
     ) {
         self.id = id
         self.snapshot = snapshot
         self.encodedData = encodedData
-        contentFingerprint = FileFingerprint.make(data: encodedData)
+        self.contentFingerprint = contentFingerprint
     }
 
     /// This defensive check is intentionally used only by off-main executors.
@@ -60,6 +62,19 @@ struct DocumentSyncDurableBaseline: Sendable, Equatable {
             snapshot: snapshot,
             fingerprint: fingerprint,
             generation: commitGeneration
+        )
+    }
+
+    func rebased(
+        to sourceRevision: SourceRevision
+    ) -> DocumentSyncDurableBaseline? {
+        guard sourceRevision.text == snapshot.text else { return nil }
+        return DocumentSyncDurableBaseline(
+            documentIdentity: documentIdentity,
+            snapshot: snapshot,
+            fingerprint: fingerprint,
+            sourceRevision: sourceRevision,
+            commitGeneration: commitGeneration
         )
     }
 
@@ -145,6 +160,23 @@ struct DocumentSyncExternalChange: Sendable, Equatable {
 }
 
 enum TextFileCodec {
+    static let maximumDocumentByteCount = 64 * 1_024 * 1_024
+
+    enum CodecError: LocalizedError, Equatable {
+        case documentTooLarge(byteCount: Int, maximumByteCount: Int)
+        case unsupportedFileType
+
+        var errorDescription: String? {
+            switch self {
+            case .documentTooLarge(let byteCount, let maximumByteCount):
+                return "The document is \(byteCount) bytes, exceeding the "
+                    + "supported limit of \(maximumByteCount) bytes."
+            case .unsupportedFileType:
+                return "The document must be a regular file."
+            }
+        }
+    }
+
     enum EvidenceError: Error, Equatable {
         case fingerprintDoesNotMatchPayload
         case identityDoesNotMatchTarget
@@ -153,11 +185,20 @@ enum TextFileCodec {
     /// Encodes the supplied immutable snapshot and returns the sole payload
     /// capability accepted by a save commit.
     nonisolated static func prepareSavePayload(
-        for snapshot: DocumentSnapshot
+        for snapshot: DocumentSnapshot,
+        cancellationCheck: () throws -> Void = { try Task.checkCancellation() }
     ) throws -> DocumentSyncPreparedSavePayload {
-        DocumentSyncPreparedSavePayload(
+        let encodedData = try encode(
+            snapshot,
+            cancellationCheck: cancellationCheck
+        )
+        return DocumentSyncPreparedSavePayload(
             snapshot: snapshot,
-            encodedData: try encode(snapshot)
+            encodedData: encodedData,
+            contentFingerprint: try FileFingerprint.makeCancellable(
+                data: encodedData,
+                cancellationCheck: cancellationCheck
+            )
         )
     }
 
@@ -169,6 +210,7 @@ enum TextFileCodec {
         sourceRevision: SourceRevision,
         commitGeneration: UInt64
     ) throws -> DocumentSyncDurableBaseline {
+        try validateSupportedSize(data)
         guard fingerprintMatches(data: data, fingerprint: fingerprint) else {
             throw EvidenceError.fingerprintDoesNotMatchPayload
         }
@@ -191,6 +233,7 @@ enum TextFileCodec {
         identity: DocumentIdentity,
         fingerprint: FileFingerprint
     ) throws -> DocumentSyncExternalReadObservation {
+        try validateSupportedSize(data)
         guard fingerprintMatches(data: data, fingerprint: fingerprint) else {
             throw EvidenceError.fingerprintDoesNotMatchPayload
         }
@@ -211,6 +254,7 @@ enum TextFileCodec {
         identity: DocumentIdentity,
         fingerprint: FileFingerprint
     ) throws -> DocumentSyncExternalChange {
+        try validateSupportedSize(data)
         guard fingerprintMatches(data: data, fingerprint: fingerprint) else {
             throw EvidenceError.fingerprintDoesNotMatchPayload
         }
@@ -231,6 +275,7 @@ enum TextFileCodec {
     }
 
     nonisolated static func decode(_ data: Data) throws -> DocumentSnapshot {
+        try validateSupportedSize(data)
         let encoding: TextEncoding
         let text: String
 
@@ -275,35 +320,110 @@ enum TextFileCodec {
     }
 
     nonisolated static func encode(_ snapshot: DocumentSnapshot) throws -> Data {
-        let encoding: String.Encoding
-        let bom: [UInt8]
+        try encode(snapshot, cancellationCheck: {})
+    }
+
+    private nonisolated static func encode(
+        _ snapshot: DocumentSnapshot,
+        cancellationCheck: () throws -> Void
+    ) throws -> Data {
+        let chunkByteCount = 64 * 1_024
+        try cancellationCheck()
+        let expectedByteCount = try encodedByteCount(of: snapshot)
+        try validateSupportedSize(expectedByteCount)
+        try cancellationCheck()
+
+        var encoded = Data()
+        encoded.reserveCapacity(expectedByteCount)
         switch snapshot.format.encoding {
-        case .utf8:
-            encoding = .utf8
-            bom = []
-        case .utf8WithBOM:
-            encoding = .utf8
-            bom = [0xEF, 0xBB, 0xBF]
-        case .utf16LittleEndian:
-            encoding = .utf16LittleEndian
-            bom = [0xFF, 0xFE]
-        case .utf16BigEndian:
-            encoding = .utf16BigEndian
-            bom = [0xFE, 0xFF]
-        }
-        guard
-            let body = snapshot.text.data(
-                using: encoding,
-                allowLossyConversion: false
+        case .utf8, .utf8WithBOM:
+            if snapshot.format.encoding == .utf8WithBOM {
+                encoded.append(contentsOf: [0xEF, 0xBB, 0xBF])
+            }
+            let bytes = snapshot.text.utf8
+            var cursor = bytes.startIndex
+            while cursor < bytes.endIndex {
+                let end =
+                    bytes.index(
+                        cursor,
+                        offsetBy: chunkByteCount,
+                        limitedBy: bytes.endIndex
+                    ) ?? bytes.endIndex
+                encoded.append(contentsOf: bytes[cursor..<end])
+                try cancellationCheck()
+                cursor = end
+            }
+        case .utf16LittleEndian, .utf16BigEndian:
+            let isLittleEndian =
+                snapshot.format.encoding == .utf16LittleEndian
+            encoded.append(
+                contentsOf: isLittleEndian
+                    ? [0xFF, 0xFE]
+                    : [0xFE, 0xFF]
             )
-        else {
+            let codeUnits = snapshot.text.utf16
+            var chunk: [UInt8] = []
+            chunk.reserveCapacity(chunkByteCount)
+            for codeUnit in codeUnits {
+                if isLittleEndian {
+                    chunk.append(UInt8(truncatingIfNeeded: codeUnit))
+                    chunk.append(UInt8(truncatingIfNeeded: codeUnit >> 8))
+                } else {
+                    chunk.append(UInt8(truncatingIfNeeded: codeUnit >> 8))
+                    chunk.append(UInt8(truncatingIfNeeded: codeUnit))
+                }
+                if chunk.count == chunkByteCount {
+                    encoded.append(contentsOf: chunk)
+                    chunk.removeAll(keepingCapacity: true)
+                    try cancellationCheck()
+                }
+            }
+            if !chunk.isEmpty {
+                encoded.append(contentsOf: chunk)
+                try cancellationCheck()
+            }
+        }
+        guard encoded.count == expectedByteCount else {
             throw CocoaError(.fileWriteInapplicableStringEncoding)
         }
-        var encoded = Data()
-        encoded.reserveCapacity(bom.count + body.count)
-        encoded.append(contentsOf: bom)
-        encoded.append(body)
+        try cancellationCheck()
         return encoded
+    }
+
+    private nonisolated static func encodedByteCount(
+        of snapshot: DocumentSnapshot
+    ) throws -> Int {
+        let bodyByteCount: Int
+        let bomByteCount: Int
+        switch snapshot.format.encoding {
+        case .utf8:
+            bodyByteCount = snapshot.text.utf8.count
+            bomByteCount = 0
+        case .utf8WithBOM:
+            bodyByteCount = snapshot.text.utf8.count
+            bomByteCount = 3
+        case .utf16LittleEndian, .utf16BigEndian:
+            let (count, overflow) = snapshot.text.utf16.count
+                .multipliedReportingOverflow(by: 2)
+            guard !overflow else {
+                throw CodecError.documentTooLarge(
+                    byteCount: .max,
+                    maximumByteCount: maximumDocumentByteCount
+                )
+            }
+            bodyByteCount = count
+            bomByteCount = 2
+        }
+        let (byteCount, overflow) = bodyByteCount.addingReportingOverflow(
+            bomByteCount
+        )
+        guard !overflow else {
+            throw CodecError.documentTooLarge(
+                byteCount: .max,
+                maximumByteCount: maximumDocumentByteCount
+            )
+        }
+        return byteCount
     }
 
     private nonisolated static func countNewlines(
@@ -334,5 +454,154 @@ enum TextFileCodec {
             resourceIdentifier: fingerprint.resourceIdentifier
         )
         return intrinsic == fingerprint
+    }
+
+    nonisolated static func validateSupportedSize(_ data: Data) throws {
+        try validateSupportedSize(data.count)
+    }
+
+    nonisolated static func validateSupportedSize(
+        _ byteCount: Int
+    ) throws {
+        guard byteCount <= maximumDocumentByteCount else {
+            throw CodecError.documentTooLarge(
+                byteCount: byteCount,
+                maximumByteCount: maximumDocumentByteCount
+            )
+        }
+    }
+
+    nonisolated static func readSupportedData(
+        at url: URL,
+        followingSymbolicLinks: Bool = true
+    ) throws -> Data {
+        try withSupportedFileDescriptor(
+            at: url,
+            followingSymbolicLinks: followingSymbolicLinks
+        ) { descriptor, byteCount in
+            try readSupportedData(
+                from: descriptor,
+                expectedByteCount: byteCount
+            )
+        }
+    }
+
+    /// Reads bytes and file identity from one open descriptor. A caller that
+    /// needs durable evidence must not combine these bytes with a later path
+    /// lookup because the path may have been atomically replaced meanwhile.
+    nonisolated static func readVerifiedFilePayload(
+        at url: URL,
+        followingSymbolicLinks: Bool = true,
+        afterReading: () throws -> Void = {}
+    ) throws -> VerifiedFilePayload {
+        try withSupportedFileDescriptor(
+            at: url,
+            followingSymbolicLinks: followingSymbolicLinks
+        ) { descriptor, byteCount in
+            let data = try readSupportedData(
+                from: descriptor,
+                expectedByteCount: byteCount
+            )
+            try afterReading()
+            return VerifiedFilePayload(
+                data: data,
+                resourceIdentifier: try resourceIdentifier(
+                    for: descriptor
+                )
+            )
+        }
+    }
+
+    nonisolated static func resourceIdentifier(
+        for descriptor: Int32
+    ) throws -> String {
+        var metadata = stat()
+        guard Darwin.fstat(descriptor, &metadata) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return "\(metadata.st_dev):\(metadata.st_ino)"
+    }
+
+    nonisolated static func resourceIdentifier(
+        at url: URL,
+        followingSymbolicLinks: Bool = true
+    ) throws -> String {
+        try withSupportedFileDescriptor(
+            at: url,
+            followingSymbolicLinks: followingSymbolicLinks
+        ) { descriptor, _ in
+            try resourceIdentifier(for: descriptor)
+        }
+    }
+
+    nonisolated static func withSupportedFileDescriptor<Value>(
+        at url: URL,
+        followingSymbolicLinks: Bool = true,
+        _ operation: (Int32, Int) throws -> Value
+    ) throws -> Value {
+        let openFlags =
+            O_RDONLY | O_CLOEXEC | O_NONBLOCK
+            | (followingSymbolicLinks ? 0 : O_NOFOLLOW)
+        let descriptor = url.path.withCString {
+            Darwin.open($0, openFlags)
+        }
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let handle = FileHandle(
+            fileDescriptor: descriptor,
+            closeOnDealloc: true
+        )
+        defer { try? handle.close() }
+
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard metadata.st_mode & S_IFMT == S_IFREG else {
+            throw CodecError.unsupportedFileType
+        }
+        guard metadata.st_size >= 0,
+            UInt64(metadata.st_size) <= UInt64(Int.max)
+        else {
+            throw CodecError.documentTooLarge(
+                byteCount: Int.max,
+                maximumByteCount: maximumDocumentByteCount
+            )
+        }
+        try validateSupportedSize(Int(metadata.st_size))
+
+        return try operation(descriptor, Int(metadata.st_size))
+    }
+
+    nonisolated static func readSupportedData(
+        from descriptor: Int32,
+        expectedByteCount: Int
+    ) throws -> Data {
+        guard Darwin.lseek(descriptor, 0, SEEK_SET) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        try validateSupportedSize(expectedByteCount)
+
+        var data = Data()
+        data.reserveCapacity(expectedByteCount)
+        let readChunkSize = 64 * 1_024
+        let handle = FileHandle(
+            fileDescriptor: descriptor,
+            closeOnDealloc: false
+        )
+        while data.count <= maximumDocumentByteCount {
+            let allowance = maximumDocumentByteCount - data.count + 1
+            guard
+                let chunk = try handle.read(
+                    upToCount: min(readChunkSize, allowance)
+                ), !chunk.isEmpty
+            else {
+                break
+            }
+            data.append(chunk)
+        }
+        try validateSupportedSize(data)
+        return data
     }
 }

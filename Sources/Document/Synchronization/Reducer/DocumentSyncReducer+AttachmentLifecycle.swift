@@ -317,7 +317,8 @@ extension DocumentSyncReducer {
         let retainedRecoveryToken = activeRecoveryMutationToken(in: state)
         let hasRecoveryBarrier = state.recoveryMutationBarrier != nil
         var updated = state
-        var effects: [DocumentSyncEffect] = [.cancelAllDeadlines]
+        var effects = cancelCancellableOperations(in: state)
+        effects.append(.cancelAllDeadlines)
         if let attachment = state.fileAttachment {
             effects += stopMonitor(for: state, attachment: attachment)
         }
@@ -451,7 +452,8 @@ extension DocumentSyncReducer {
             !attachmentIdentityMatchesURL
             || (durableBaseline != nil && verifiedBaseline == nil)
             || (verifiedBaseline?.snapshot != state.snapshot)
-        var effects: [DocumentSyncEffect] = [.cancelAllDeadlines]
+        var effects = cancelCancellableOperations(in: state)
+        effects.append(.cancelAllDeadlines)
         if let attachment = state.fileAttachment {
             effects += stopMonitor(for: state, attachment: attachment)
         }

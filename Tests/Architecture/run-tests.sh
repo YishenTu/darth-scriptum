@@ -69,4 +69,6 @@ assert_requires_ripgrep() {
 
 assert_requires_ripgrep
 
+"$script_root/test-suite-boundary-tests.sh"
+
 print "Architecture fixture tests passed."

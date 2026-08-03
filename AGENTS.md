@@ -17,8 +17,10 @@ Sources/
   Resources/
   Configuration/
 Tests/
-  {App,Core,DesignSystem,Document,Editor,Workspace}/
-  {Integration,Performance,Fixtures,Architecture}/
+  Unit/{App,Core,DesignSystem,Document,Editor,Workspace,Fixtures}/
+  E2E/
+  Performance/
+  Architecture/
 scripts/
 ```
 
@@ -26,7 +28,7 @@ scripts/
 - `Document` owns persistence and synchronization, `Editor` owns editing and rendering, and `Workspace` owns window, pane, focus, and shortcut composition.
 - Keep runtime assets in `Resources` and build-owned files in `Configuration`.
 - Keep each domain's entry surface at its root and add subfolders only for durable responsibilities shared by multiple files.
-- Mirror production paths in `Tests`; use `Integration`, `Performance`, `Fixtures`, and `Architecture` only for their named purposes.
+- Mirror production paths in `Tests/Unit`; use `E2E`, `Performance`, `Unit/Fixtures`, and `Architecture` only for their named purposes.
 - Do not create catch-all folders or files such as `Common`, `Shared`, `Utilities`, `Helpers`, `Extensions`, `Models`, or `Misc`. Do not create a folder for one file unless it is an architectural boundary.
 - Keep scoped `AGENTS.md` files only at stable domain roots. Preserve Xcode groups, target membership, build settings, scripts, and test discovery during moves.
 
@@ -55,7 +57,7 @@ scripts/
 ### Routine development
 
 - Run `./scripts/lint.sh` after Swift changes; it is a fast, non-compiling check.
-- Prefer focused tests: `./scripts/test.sh <test-identifier> [...]`. Use `--all` explicitly for the complete non-performance suite.
+- Prefer focused tests: `./scripts/test.sh <test-identifier> [...]`. Use `--unit` or `--e2e` for a complete suite, and `--all` explicitly for both non-performance suites.
 - Before handing back production-code changes, run relevant tests and one Debug build with `./scripts/build-debug.sh`; skip the separate build when the test command already built every affected target.
 - Use Xcode **Build** (`Command-B`) for interactive compilation. Routine scripts reuse repository-local `DerivedData/`.
 - Run `./scripts/check-architecture.sh` after ownership, cross-domain dependency, or scoped-instruction changes.

@@ -31,13 +31,14 @@ final class EditorPaneModel: ObservableObject, Identifiable {
         imageProvider: MarkdownImageProvider? = nil,
         onOpenMarkdownFile: ((URL) -> Void)? = nil
     ) {
-        self.latexRenderer =
+        let activeLaTeXRenderer =
             latexRenderer
             ?? AdaptiveLaTeXRenderer(
                 updateNotification: Notification.Name(
                     "DarthScriptum.LatexRendererDidUpdate.\(UUID().uuidString)"
                 )
             )
+        self.latexRenderer = activeLaTeXRenderer
         self.mermaidRenderer =
             mermaidRenderer
             ?? MermaidRenderer(
@@ -47,7 +48,10 @@ final class EditorPaneModel: ObservableObject, Identifiable {
             )
         self.imageProvider =
             imageProvider
-            ?? MarkdownImageProvider(documentURL: nil)
+            ?? MarkdownImageProvider(
+                documentURL: nil,
+                updateNotification: activeLaTeXRenderer.updateNotification
+            )
         self.onOpenMarkdownFile = onOpenMarkdownFile
     }
 

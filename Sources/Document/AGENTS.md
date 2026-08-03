@@ -5,4 +5,4 @@
 - Route every blocking document or recovery operation through `DocumentFileAccess`; never block the main actor or a Swift cooperative executor with file I/O.
 - Fail closed when attachment, baseline, commit, recovery generation, record ownership, or cleanup safety is unproven; preserve raw evidence and durable-before-memory ordering.
 - Do not import AppKit, SwiftUI, WebKit, or MarkdownEngine or reference app, workspace, or editor host types.
-- Mirror changes under `Tests/Document/` and cover cross-layer lifecycle behavior in `Tests/Integration/`.
+- Mirror changes under `Tests/Unit/Document/` and cover cross-layer lifecycle behavior in `Tests/E2E/`.

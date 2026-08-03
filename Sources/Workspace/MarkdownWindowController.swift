@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @MainActor
@@ -16,6 +17,7 @@ final class MarkdownWindowController: NSWindowController, NSWindowDelegate {
     let workspaceModel: WorkspaceModel
     private weak var observedTabGroup: NSWindowTabGroup?
     private var tabWindowsObservation: NSKeyValueObservation?
+    private var restorationObservations: Set<AnyCancellable> = []
 
     init(
         document: MarkdownDocument,
@@ -43,9 +45,14 @@ final class MarkdownWindowController: NSWindowController, NSWindowDelegate {
         window.isOpaque = false
         window.backgroundColor = .clear
         window.isMovableByWindowBackground = true
+        window.isRestorable = true
+        window.identifier = NSUserInterfaceItemIdentifier(
+            "DarthScriptum.MarkdownDocumentWindow"
+        )
         super.init(window: window)
         window.delegate = self
         window.setAccessibilityLabel("DarthScriptum — \(displayName)")
+        observeWorkspaceRestorationState()
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -58,6 +65,31 @@ final class MarkdownWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         stopObservingTabGroup()
+    }
+
+    override func encodeRestorableState(with coder: NSCoder) {
+        super.encodeRestorableState(with: coder)
+        workspaceModel.restorationState.encode(to: coder)
+    }
+
+    override func restoreState(with coder: NSCoder) {
+        super.restoreState(with: coder)
+        guard let state = WorkspaceRestorationState.decode(from: coder) else {
+            return
+        }
+        workspaceModel.restore(state)
+    }
+
+    override func supplementalTarget(
+        forAction action: Selector,
+        sender: Any?
+    ) -> Any? {
+        if let document = document as? NSObject,
+            document.responds(to: action)
+        {
+            return document
+        }
+        return super.supplementalTarget(forAction: action, sender: sender)
     }
 
     func refreshTabShortcuts() {
@@ -170,6 +202,23 @@ final class MarkdownWindowController: NSWindowController, NSWindowDelegate {
         tabWindowsObservation?.invalidate()
         tabWindowsObservation = nil
         observedTabGroup = nil
+    }
+
+    private func observeWorkspaceRestorationState() {
+        let publishers: [ObservableObjectPublisher] = [
+            workspaceModel.objectWillChange,
+            workspaceModel.primaryPane.objectWillChange,
+            workspaceModel.secondaryPane.objectWillChange,
+        ]
+        for publisher in publishers {
+            publisher
+                .sink { [weak self] in
+                    Task { @MainActor [weak self] in
+                        self?.invalidateRestorableState()
+                    }
+                }
+                .store(in: &restorationObservations)
+        }
     }
 
     func toggleTaskMarker() {

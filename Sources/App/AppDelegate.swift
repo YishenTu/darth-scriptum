@@ -19,13 +19,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldSaveSecureApplicationState(
         _ app: NSApplication
     ) -> Bool {
-        false
+        true
     }
 
     func applicationShouldRestoreSecureApplicationState(
         _ app: NSApplication
     ) -> Bool {
-        false
+        true
+    }
+
+    func applicationSupportsSecureRestorableState(
+        _ app: NSApplication
+    ) -> Bool {
+        true
     }
 
     @objc private func newWindow(_ sender: Any?) {
@@ -80,14 +86,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleTaskMarker(_ sender: Any?) {
         currentDocument?.markdownWindowController?.toggleTaskMarker()
-    }
-
-    @objc private func undoDocument(_ sender: Any?) {
-        currentDocument?.syncCoordinator.sourceBuffer.undo()
-    }
-
-    @objc private func redoDocument(_ sender: Any?) {
-        currentDocument?.syncCoordinator.sourceBuffer.redo()
     }
 
     @objc private func zoomIn(_ sender: Any?) {
@@ -242,6 +240,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         fileMenu.addItem(recentItem)
         openRecentMenu = recentMenu
         fileMenu.addItem(.separator())
+        fileMenu.addItem(
+            withTitle: "Save",
+            action: #selector(NSDocument.save(_:)),
+            keyEquivalent: "s"
+        )
         let saveAsItem = fileMenu.addItem(
             withTitle: "Save As…",
             action: #selector(NSDocument.saveAs(_:)),
@@ -259,18 +262,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mainMenu.addItem(editItem)
         let editMenu = NSMenu(title: "Edit")
         editItem.submenu = editMenu
-        let undoItem = editMenu.addItem(
+        editMenu.addItem(
             withTitle: "Undo",
-            action: #selector(undoDocument(_:)),
+            action: #selector(MarkdownDocument.undoDocument(_:)),
             keyEquivalent: "z"
         )
-        undoItem.target = self
-        let redoItem = editMenu.addItem(
+        editMenu.addItem(
             withTitle: "Redo",
-            action: #selector(redoDocument(_:)),
+            action: #selector(MarkdownDocument.redoDocument(_:)),
             keyEquivalent: "Z"
         )
-        redoItem.target = self
         editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
