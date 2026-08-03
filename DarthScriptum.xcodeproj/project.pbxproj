@@ -25,7 +25,7 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		C00000000000000000000004 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (App/AGENTS.md, App/CLAUDE.md, Configuration/Info.plist, Configuration/Verification.xcconfig, Core/AGENTS.md, Core/CLAUDE.md, Document/AGENTS.md, Document/CLAUDE.md, Editor/AGENTS.md, Editor/CLAUDE.md, Resources/AGENTS.md, Resources/CLAUDE.md, Workspace/AGENTS.md, Workspace/CLAUDE.md,); target = B00000000000000000000001 /* DarthScriptum */; };
+		C00000000000000000000004 = {isa = PBXFileSystemSynchronizedBuildFileExceptionSet; membershipExceptions = (App/AGENTS.md, App/CLAUDE.md, Configuration/Info.plist, Configuration/Verification.xcconfig, Core/AGENTS.md, Core/CLAUDE.md, DesignSystem/AGENTS.md, DesignSystem/CLAUDE.md, Document/AGENTS.md, Document/CLAUDE.md, Editor/AGENTS.md, Editor/CLAUDE.md, Resources/AGENTS.md, Resources/CLAUDE.md, Workspace/AGENTS.md, Workspace/CLAUDE.md,); target = B00000000000000000000001 /* DarthScriptum */; };
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */

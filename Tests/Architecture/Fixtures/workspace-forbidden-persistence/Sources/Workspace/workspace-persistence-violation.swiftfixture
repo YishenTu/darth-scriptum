@@ -1,0 +1,3 @@
+struct WorkspaceViolation {
+    let recoveryStore: SessionRecoveryStore?
+}

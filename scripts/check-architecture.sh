@@ -67,6 +67,7 @@ validate_scoped_instructions() {
     local -a scoped_directories=(
         "$source_root/App"
         "$source_root/Core"
+        "$source_root/DesignSystem"
         "$source_root/Document"
         "$source_root/Editor"
         "$source_root/Workspace"
@@ -157,8 +158,10 @@ first_existing_file() {
 }
 
 core_directory="$source_root/Core"
+design_system_directory="$source_root/DesignSystem"
 document_directory="$source_root/Document"
 editor_directory="$source_root/Editor"
+workspace_directory="$source_root/Workspace"
 
 assert_legacy_ownership_paths_absent() {
     local legacy_path
@@ -183,9 +186,13 @@ fi
 swift_import_prefix='^[[:space:]]*(@[^[:space:]]+[[:space:]]+)*import[[:space:]]+((class|enum|func|let|protocol|struct|var)[[:space:]]+)?'
 forbidden_ui_or_engine_import="${swift_import_prefix}(AppKit|SwiftUI|WebKit|MarkdownEngine|MarkdownEngineLatex|MarkdownEngineCodeBlocks)([[:space:].]|$)"
 forbidden_document_engine_import="${swift_import_prefix}(SwiftUI|WebKit|MarkdownEngine|MarkdownEngineLatex|MarkdownEngineCodeBlocks)([[:space:].]|$)"
+forbidden_design_system_framework_import="${swift_import_prefix}(WebKit|MarkdownEngine|MarkdownEngineLatex|MarkdownEngineCodeBlocks)([[:space:].]|$)"
 appkit_import="${swift_import_prefix}AppKit([[:space:].]|$)"
 upper_layer_reference='\b(MarkdownDocument|MarkdownWindowController|WorkspaceModel|MarkdownWorkspace|LivePreviewTextView|EditorPaneStateCoordinator)\b'
 editor_persistence_reference='\b(DocumentSyncCoordinator|DocumentSyncCoordinatorDelegate|SessionRecoveryStore|SafeFileCommitter|CommitRecoveryJournalStore|SaveTransactionBridge|DirectoryFileMonitor|TextFileCodec|ThreeWayTextMerger|DurableFileIO|PendingSaveToken|DurableFileState|FileFingerprint)\b'
+workspace_persistence_reference='\b(DocumentSyncReducer|DocumentSyncDefaultEffectExecutor|DocumentSyncRecoveryEffectExecutor|SessionRecoveryStore|SafeFileCommitter|CommitRecoveryJournalStore|SaveTransactionBridge|DirectoryFileMonitor|TextFileCodec|ThreeWayTextMerger|DurableFileIO|PendingSaveToken|DurableFileState|FileFingerprint)\b'
+app_host_reference='\b(MarkdownDocument|AppDelegate|ApplicationDocumentOpener|DocumentInitialContentStore)\b'
+design_system_product_reference='\b(MarkdownDocument|MarkdownSourceBuffer|SourceRevision|DocumentSyncCoordinator|SessionRecoveryStore|WorkspaceModel|MarkdownWorkspace|MarkdownWindowController|LivePreviewTextView|EditorPaneStateCoordinator|MarkdownSourcePresentation)\b'
 internal_markdown_engine_key='\b(LatexRenderedImage|LatexImageBounds|LatexIsBlock|LatexBlockOffsetY|ThematicBreak|BlockquoteLevel|BulletListMarker|ScrollableBlockNaturalWidth|ScrollableBlockSourceID|ScrollableBlockTotalHeight|ScrollableBlockFullRange|NodeLinkID|TaskCheckbox)\b'
 
 assert_legacy_ownership_paths_absent \
@@ -206,6 +213,10 @@ scan_pattern \
     "$document_directory" \
     "$appkit_import" \
     "document must not import AppKit"
+scan_pattern \
+    "$design_system_directory" \
+    "$forbidden_design_system_framework_import" \
+    "design system must not import WebKit or MarkdownEngine frameworks"
 
 scan_pattern \
     "$core_directory" \
@@ -219,6 +230,19 @@ scan_pattern \
     "$editor_directory" \
     "$editor_persistence_reference" \
     "editor must not reference concrete synchronization or persistence types"
+scan_pattern \
+    "$workspace_directory" \
+    "$workspace_persistence_reference" \
+    "workspace must not reference concrete synchronization or persistence types"
+scan_pattern \
+    "$workspace_directory" \
+    "$app_host_reference" \
+    "workspace App-host references belong only in MarkdownWindowController.swift" \
+    "$workspace_directory/MarkdownWindowController.swift"
+scan_pattern \
+    "$design_system_directory" \
+    "$design_system_product_reference" \
+    "design system must not reference product-domain types"
 
 markdown_engine_compatibility_file="$(first_existing_file \
     "$editor_directory/Compatibility/MarkdownEngineCompatibility.swift" \

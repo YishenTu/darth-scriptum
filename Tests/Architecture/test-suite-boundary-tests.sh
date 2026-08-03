@@ -214,6 +214,9 @@ assert_file_excludes "$ci_workflow" 'DarthScriptumPerformance'
 assert_file_excludes "$ci_workflow" 'scripts/perf-audit.sh'
 assert_file_excludes "$ci_workflow" 'scripts/verify.sh'
 
+assert_file_contains "$project_file" 'DesignSystem/AGENTS.md'
+assert_file_contains "$project_file" 'DesignSystem/CLAUDE.md'
+
 {
     print '#!/bin/zsh'
     print 'print -r -- "${(q)@}" >> "$DARTH_SCRIPTUM_XCODEBUILD_LOG"'

@@ -1,0 +1,3 @@
+struct DesignSystemViolation {
+    let workspace: WorkspaceModel?
+}

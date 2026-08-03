@@ -24,13 +24,56 @@ Tests/
 scripts/
 ```
 
-- `App` owns lifecycle and dependency wiring; `Core` owns dependency-light cross-domain values and algorithms; `DesignSystem` owns visual primitives.
-- `Document` owns persistence and synchronization, `Editor` owns editing and rendering, and `Workspace` owns window, pane, focus, and shortcut composition.
 - Keep runtime assets in `Resources` and build-owned files in `Configuration`.
 - Keep each domain's entry surface at its root and add subfolders only for durable responsibilities shared by multiple files.
 - Mirror production paths in `Tests/Unit`; use `E2E`, `Performance`, `Unit/Fixtures`, and `Architecture` only for their named purposes.
 - Do not create catch-all folders or files such as `Common`, `Shared`, `Utilities`, `Helpers`, `Extensions`, `Models`, or `Misc`. Do not create a folder for one file unless it is an architectural boundary.
 - Keep scoped `AGENTS.md` files only at stable domain roots. Preserve Xcode groups, target membership, build settings, scripts, and test discovery during moves.
+
+## Architecture rules
+
+### Dependency direction
+
+All sources currently compile into one application target. These rules govern which directories may reference types declared in other directories; they are not Swift module-import rules.
+
+- `Core` and `DesignSystem` are leaf domains. Product domains may depend on them, but they must not depend on `App`, `Document`, `Editor`, or `Workspace`.
+- `Document` may depend on `Core` and system I/O or concurrency frameworks. It must not depend on UI domains or renderer frameworks.
+- `Editor` may depend on `Core`, `DesignSystem`, bundled `Resources`, and renderer frameworks. It must not depend on concrete synchronization, persistence, or recovery implementations.
+- `Workspace` may depend on `Core`, the document coordinator entry surface and its source or status contracts, editor entry surfaces, and `DesignSystem`. It may issue document commands through the coordinator but must not depend on reducer, effect-executor, persistence, recovery, or renderer implementations.
+- `App` is the composition root and may reference every runtime domain to adapt native lifecycle events and wire concrete dependencies. Domain policy must remain in the owning domain.
+- `Workspace/MarkdownWindowController.swift` is the sole permitted lower-layer integration with the App-owned `MarkdownDocument` host. Keep that concrete reference isolated; no other workspace or lower-domain type may reference App types.
+- `Resources` contain runtime data and `Configuration` contains build-owned data; neither is a source of runtime policy.
+
+Reverse dependencies outside the explicit window-document integration are forbidden. Introduce new cross-domain calls through an owning domain's entry surface or contract rather than by referencing its implementation details.
+
+### Ownership
+
+- `App` owns application and `NSDocument` lifecycle integration, native callback adaptation, and concrete dependency wiring.
+- `Core` owns dependency-light cross-domain values and algorithms. `MarkdownSourceBuffer` is the sole in-memory source and revision mutator.
+- `DesignSystem` owns reusable colors, typography, materials, and other visual primitives, but no feature state or policy.
+- `Document` owns file authority, persistence, recovery, and synchronization policy. `DocumentSyncReducer` is the sole synchronization transition authority.
+- `Editor` owns editing composition, `EditorPaneModel` presentation state, native presentation, rendering, compatibility adaptation, and local WebKit lifecycle.
+- `Workspace` owns window, pane identity and composition, tab, split, focus, shortcut, and workspace-restoration composition.
+
+Only the owner may mutate owned state. Non-owners must request changes through the owner's public contract and must not retain independently mutable copies of that state. Coordination does not transfer ownership.
+
+### State lifetimes
+
+- Durable document bytes, file identity, commit evidence, and recovery records are owned by `Document` persistence and recovery components and may survive process restart.
+- The live source and revision are owned by one `MarkdownSourceBuffer` for the document lifetime and are shared by every editor pane.
+- Synchronization workflow state, epochs, and effect tokens are owned by the document reducer and coordinator for one document lifetime; stale or mismatched completions cannot mutate current state.
+- Workspace state owns live window, pane composition, split, and focus. `EditorPaneModel` owns pane-local selection, scroll, position, and renderer association; a versioned workspace restoration snapshot may capture and recreate that presentation but is never source or synchronization authority.
+- Editor view, observation, rendering-cache, and WebKit-session state is disposable and must be rebuilt from owned source, pane, and workspace composition state when recreated.
+
+### Cross-domain invariants
+
+- Split panes share one source buffer; layout, focus, restoration, and tab changes must not create another source authority or alter document lifecycle state.
+- Only `MarkdownSourceBuffer` mutates source revisions, and only `DocumentSyncReducer` selects synchronization transitions.
+- The coordinator applies events serially. Effect requests are immutable and complete, completions echo their full tokens, and stale tokens are rejected.
+- Blocking file and recovery work crosses `DocumentFileAccess`; it never blocks the main actor or a Swift cooperative executor.
+- Durable evidence is committed before corresponding in-memory success is published. Unproven attachment, commit, recovery, ownership, or cleanup safety fails closed.
+- AppKit close and quit callbacks preserve refusal and cancellation and complete exactly once.
+- Renderer inputs and document-derived resource requests remain untrusted and cannot widen file, navigation, window, network, or persistence authority.
 
 ## Naming
 
