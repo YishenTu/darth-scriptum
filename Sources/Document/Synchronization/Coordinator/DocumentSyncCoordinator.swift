@@ -75,7 +75,7 @@ final class DocumentSyncCoordinator: ObservableObject {
     private var isTornDown = false
     private var flushWaiters: [(@MainActor (Bool) -> Void)] = []
 
-    init(
+    convenience init(
         snapshot: DocumentSnapshot,
         initialDurableState: DurableFileState? = nil,
         bridge: SaveTransactionBridge = SaveTransactionBridge(),
@@ -92,7 +92,43 @@ final class DocumentSyncCoordinator: ObservableObject {
         monitorStartHook: (@Sendable () throws -> Void)? = nil,
         monitorDescriptorClosedHook: (@Sendable (Bool) -> Void)? = nil
     ) {
-        sourceBuffer = MarkdownSourceBuffer(snapshot: snapshot)
+        self.init(
+            preparedContent: PreparedSourceContent(snapshot: snapshot),
+            initialDurableState: initialDurableState,
+            bridge: bridge,
+            recoveryStore: recoveryStore,
+            fileAccessLane: fileAccessLane,
+            fileMonitoringEnabled: fileMonitoringEnabled,
+            savePreparationHook: savePreparationHook,
+            externalReadHook: externalReadHook,
+            effectExecutor: effectExecutor,
+            manualScheduler: manualScheduler,
+            initialAttachmentFreshReadCompletedHook:
+                initialAttachmentFreshReadCompletedHook,
+            monitorStartHook: monitorStartHook,
+            monitorDescriptorClosedHook: monitorDescriptorClosedHook
+        )
+    }
+
+    init(
+        preparedContent: PreparedSourceContent,
+        initialDurableState: DurableFileState? = nil,
+        bridge: SaveTransactionBridge = SaveTransactionBridge(),
+        recoveryStore: SessionRecoveryStore = .shared,
+        fileAccessLane: DocumentFileAccessLane =
+            DocumentFileAccess.makeDocumentLane(),
+        fileMonitoringEnabled: Bool = true,
+        savePreparationHook: (@MainActor () async -> Void)? = nil,
+        externalReadHook: (@MainActor (UInt64) async -> Void)? = nil,
+        effectExecutor: DocumentSyncCoordinatorEffectExecuting? = nil,
+        manualScheduler: ManualSyncScheduler? = nil,
+        initialAttachmentFreshReadCompletedHook:
+            (@MainActor () -> Void)? = nil,
+        monitorStartHook: (@Sendable () throws -> Void)? = nil,
+        monitorDescriptorClosedHook: (@Sendable (Bool) -> Void)? = nil
+    ) {
+        let snapshot = preparedContent.snapshot
+        sourceBuffer = MarkdownSourceBuffer(preparedContent: preparedContent)
         format = snapshot.format
         durableState = initialDurableState
         unattachedDurableState = initialDurableState
@@ -196,11 +232,24 @@ final class DocumentSyncCoordinator: ObservableObject {
     }
 
     func loadInitial(_ snapshot: DocumentSnapshot, data: Data, from url: URL?) {
+        loadInitial(
+            PreparedSourceContent(snapshot: snapshot),
+            data: data,
+            from: url
+        )
+    }
+
+    func loadInitial(
+        _ preparedContent: PreparedSourceContent,
+        data: Data,
+        from url: URL?
+    ) {
+        let snapshot = preparedContent.snapshot
         cancelPendingAttachmentRequest()
         initialAttachmentPending = false
         initialAttachmentResult = nil
         let previous = reducerState
-        replaceSource(snapshot.text, origin: .initialLoad)
+        replaceSource(preparedContent, origin: .initialLoad)
         installLoadingInitialSource(
             snapshot,
             targetURL: url?.standardizedFileURL,
@@ -515,7 +564,7 @@ final class DocumentSyncCoordinator: ObservableObject {
                             disposition: .destinationRequiresSaveAs
                         )
                     )
-                case .atomicSwapFailed, .invalidPreparedPayload:
+                case .atomicSwapFailed:
                     dispatch(.commitFailed(token: token, disposition: .notStarted))
                 case .targetMissingBeforeCommit:
                     dispatch(.commitFailed(token: token, disposition: .notStarted))
@@ -920,7 +969,15 @@ final class DocumentSyncCoordinator: ObservableObject {
         if previous.source != next.source,
             sourceBuffer.revision != next.source
         {
-            replaceSource(next.source.text, origin: sourceReplacementOrigin(for: event))
+            let origin = sourceReplacementOrigin(for: event)
+            if let preparedContent = preparedSourceContent(
+                for: event,
+                source: next.source
+            ) {
+                replaceSource(preparedContent, origin: origin)
+            } else {
+                replaceSource(next.source.text, origin: origin)
+            }
         }
         if format != next.format {
             format = next.format
@@ -1316,6 +1373,15 @@ final class DocumentSyncCoordinator: ObservableObject {
         isApplyingReducerSource = false
     }
 
+    private func replaceSource(
+        _ preparedContent: PreparedSourceContent,
+        origin: DocumentChangeOrigin
+    ) {
+        isApplyingReducerSource = true
+        sourceBuffer.replace(with: preparedContent, origin: origin)
+        isApplyingReducerSource = false
+    }
+
     private func sourceReplacementOrigin(
         for event: DocumentSyncEvent?
     ) -> DocumentChangeOrigin {
@@ -1329,6 +1395,42 @@ final class DocumentSyncCoordinator: ObservableObject {
         default:
             .externalReload
         }
+    }
+
+    private func preparedSourceContent(
+        for event: DocumentSyncEvent?,
+        source: SourceRevision
+    ) -> PreparedSourceContent? {
+        let preparedContent: PreparedSourceContent?
+        switch event {
+        case .externalReadFinished(_, .changed(let change)):
+            preparedContent = change.preparedContent
+        case .mergeFinished(_, let result):
+            preparedContent = result.preparedContent
+        case .restoreLocalRecovery:
+            if let cleanup = reducerState.recoveryCleanup,
+                case .decoded(let entry) = cleanup.target
+            {
+                preparedContent = entry.preparedContent
+            } else {
+                preparedContent = nil
+            }
+        case .recoveryFinished(
+            _,
+            .rawPersisted(let result)
+        ):
+            if case .decoded(let change) = result.decodeOutcome {
+                preparedContent = change.preparedContent
+            } else {
+                preparedContent = nil
+            }
+        default:
+            preparedContent = nil
+        }
+        guard preparedContent?.snapshot.text == source.text else {
+            return nil
+        }
+        return preparedContent
     }
 
     private func didAcceptExternalSource(

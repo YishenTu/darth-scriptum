@@ -22,6 +22,7 @@ final class WorkspaceModel: ObservableObject {
                 "DarthScriptum.MermaidRendererDidUpdate.\(UUID().uuidString)"
             )
         )
+        let mermaidBlockIndex = MermaidBlockIndex()
         let imageProvider = MarkdownImageProvider(
             documentURL: nil,
             updateNotification: latexRenderer.updateNotification
@@ -29,6 +30,7 @@ final class WorkspaceModel: ObservableObject {
         let primaryPane = EditorPaneModel(
             latexRenderer: latexRenderer,
             mermaidRenderer: mermaidRenderer,
+            mermaidBlockIndex: mermaidBlockIndex,
             imageProvider: imageProvider,
             onOpenMarkdownFile: onOpenMarkdownFile
         )
@@ -37,6 +39,7 @@ final class WorkspaceModel: ObservableObject {
         secondaryPane = EditorPaneModel(
             latexRenderer: latexRenderer,
             mermaidRenderer: mermaidRenderer,
+            mermaidBlockIndex: mermaidBlockIndex,
             imageProvider: imageProvider,
             onOpenMarkdownFile: onOpenMarkdownFile
         )

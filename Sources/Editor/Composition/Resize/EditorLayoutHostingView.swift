@@ -10,6 +10,7 @@ import SwiftUI
 final class EditorLayoutHostingView: NSHostingView<AnyView> {
     var onWidthWillChange: (@MainActor (CGFloat) -> Void)?
     var onLayoutDidComplete: (@MainActor () -> Void)?
+    var markdownEngineUpdateVersion: UInt64?
 
     private var isCompletingLayout = false
 

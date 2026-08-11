@@ -2,7 +2,7 @@ import AppKit
 import MarkdownEngine
 import SwiftUI
 
-/// Isolates the project assumptions about MarkdownEngine 0.11.0.
+/// Isolates the project assumptions about MarkdownEngine 0.12.0.
 ///
 /// The public wrapper creates an NSScrollView, but the native text view and
 /// overlay attribute keys are internal to the dependency. Keep those
@@ -53,6 +53,113 @@ enum MarkdownEngineCompatibility {
         return candidates[0]
     }
 
+    /// Applies one source-authorized edit through MarkdownEngine's existing
+    /// native text-change lifecycle. The exact transition guards keep display
+    /// transformations such as UUID-backed wiki links on the full rebuild path.
+    @discardableResult
+    static func applyIncrementalSourceEdit(
+        _ edit: SourceEdit,
+        from previousPresentation: MarkdownSourcePresentation,
+        to updatedPresentation: MarkdownSourcePresentation,
+        in textView: NSTextView
+    ) -> Bool {
+        guard
+            previousPresentation.rendersMarkdown
+                == updatedPresentation.rendersMarkdown,
+            previousPresentation.sourceRange.location
+                == updatedPresentation.sourceRange.location,
+            edit.range.location >= previousPresentation.sourceRange.location,
+            NSMaxRange(edit.range)
+                <= NSMaxRange(previousPresentation.sourceRange),
+            let coordinator = textView.delegate
+                as? NativeTextViewCoordinator,
+            !textView.hasMarkedText()
+        else {
+            return false
+        }
+        if #available(macOS 15.0, *), textView.isWritingToolsActive {
+            return false
+        }
+
+        let presentedRange = NSRange(
+            location: edit.range.location
+                - previousPresentation.sourceRange.location,
+            length: edit.range.length
+        )
+        let previousText = previousPresentation.text as NSString
+        guard NSMaxRange(presentedRange) <= previousText.length,
+            textView.string == previousPresentation.text,
+            textView.textStorage?.length == previousText.length
+        else {
+            return false
+        }
+        let expectedText = NSMutableString(string: previousText)
+        expectedText.replaceCharacters(
+            in: presentedRange,
+            with: edit.replacement
+        )
+        guard expectedText as String == updatedPresentation.text,
+            let textStorage = textView.textStorage
+        else {
+            return false
+        }
+
+        // MarkdownEngine exposes its delegate lifecycle but not a dedicated
+        // external-edit API. Register only edits whose replacement cannot
+        // trigger its Markdown smart-input interceptors. This gives its parser
+        // the trusted edit descriptor needed for incremental parsing while
+        // punctuation, structural edits, and batches continue to fail closed.
+        guard
+            isPlainTextEdit(
+                presentedRange,
+                replacement: edit.replacement,
+                in: previousText
+            )
+        else {
+            return false
+        }
+        let unchangedText = textView.string
+        guard
+            coordinator.textView(
+                textView,
+                shouldChangeTextIn: presentedRange,
+                replacementString: edit.replacement
+            ), textView.string == unchangedText
+        else {
+            return false
+        }
+
+        textStorage.beginEditing()
+        textStorage.replaceCharacters(
+            in: presentedRange,
+            with: edit.replacement
+        )
+        textStorage.endEditing()
+        textView.didChangeText()
+        return textView.string == updatedPresentation.text
+    }
+
+    private static func isPlainTextEdit(
+        _ range: NSRange,
+        replacement: String,
+        in source: NSString
+    ) -> Bool {
+        guard range.length <= 1,
+            replacement.utf16.count <= 1
+        else {
+            return false
+        }
+        let replacedText = source.substring(with: range)
+        return (replacedText.isEmpty || isPlainTextCharacter(replacedText))
+            && (replacement.isEmpty || isPlainTextCharacter(replacement))
+    }
+
+    private static func isPlainTextCharacter(_ text: String) -> Bool {
+        text.unicodeScalars.allSatisfy {
+            CharacterSet.alphanumerics.contains($0)
+        }
+    }
+
     /// Restores a drifted text container origin.
     ///
     /// TextKit 2 shifts `textContainerOrigin.x` when laid-out content extends
@@ -76,7 +183,7 @@ enum MarkdownEngineCompatibility {
 
     /// Prevents centered rendered blocks from extending past the leading edge.
     ///
-    /// MarkdownEngine 0.11.0 center-aligns standalone display math and images.
+    /// MarkdownEngine 0.12.0 center-aligns standalone display math and images.
     /// During a shrink, TextKit lays out the stale-width line before the block
     /// can be refreshed. Its negative leading edge permanently shifts
     /// `textContainerOrigin.x`. Left alignment plus an equivalent leading
@@ -192,7 +299,7 @@ enum MarkdownEngineCompatibility {
         return true
     }
 
-    /// MarkdownEngine 0.11.0 treats the configured syntax-highlighter
+    /// MarkdownEngine 0.12.0 treats the configured syntax-highlighter
     /// appearance notification as its public full-restyle invalidation channel.
     /// Keep that dependency-specific contract behind this adapter.
     static func requestFullRestyle(
@@ -212,50 +319,6 @@ enum MarkdownEngineCompatibility {
         notification: Notification.Name
     ) {
         notificationCenter.post(name: notification, object: nil)
-    }
-
-    /// Detects the outer-pipe table syntax supported by MarkdownEngine 0.11.0.
-    ///
-    /// This reads source text instead of rendered attributes, which may not
-    /// exist for an offscreen, lazily laid-out, or actively edited table.
-    static func containsTableCandidate(in source: String) -> Bool {
-        var previousLine: String?
-        var found = false
-        source.enumerateLines { line, stop in
-            if let previousLine,
-                isOuterPipeTableRow(previousLine),
-                isOuterPipeTableSeparator(line)
-            {
-                found = true
-                stop = true
-            } else {
-                previousLine = line
-            }
-        }
-        return found
-    }
-
-    private static func isOuterPipeTableRow(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        return trimmed.count >= 3
-            && trimmed.hasPrefix("|")
-            && trimmed.hasSuffix("|")
-    }
-
-    private static func isOuterPipeTableSeparator(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.count >= 3,
-            trimmed.hasPrefix("|"),
-            trimmed.hasSuffix("|")
-        else {
-            return false
-        }
-        let middle = trimmed.dropFirst().dropLast()
-        return !middle.isEmpty
-            && middle.allSatisfy {
-                $0 == "-" || $0 == ":" || $0 == "|"
-                    || $0 == " " || $0 == "\t"
-            }
     }
 
     private static func renderedBlockContainerWidth(
@@ -308,7 +371,7 @@ enum MarkdownEngineCompatibility {
 
     /// Recomputes caret-sensitive live-preview attributes for a focus change.
     ///
-    /// MarkdownEngine 0.11.0 derives marker visibility from editability and
+    /// MarkdownEngine 0.12.0 derives marker visibility from editability and
     /// selection, but does not accept focus as an input or restyle when an
     /// editor resigns first responder. Drive its public full-restyle channel
     /// with editability suppressed while unfocused, then restore the actual
@@ -425,7 +488,7 @@ enum MarkdownEngineCompatibility {
     }
 
     private enum Attribute {
-        // MarkdownEngine 0.11.0 internal MarkdownTextLayoutFragment keys.
+        // MarkdownEngine 0.12.0 internal MarkdownTextLayoutFragment keys.
         static let renderedImage = NSAttributedString.Key(
             "LatexRenderedImage"
         )

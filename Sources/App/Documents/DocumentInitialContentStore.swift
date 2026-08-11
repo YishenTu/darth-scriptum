@@ -4,7 +4,7 @@ import Foundation
 /// document state without exposing the coordinator across threads.
 final class DocumentInitialContentStore: @unchecked Sendable {
     struct Content: Sendable {
-        let snapshot: DocumentSnapshot
+        let preparedContent: PreparedSourceContent
         let data: Data
     }
 

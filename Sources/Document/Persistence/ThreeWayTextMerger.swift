@@ -11,6 +11,7 @@ struct DocumentSyncMergeResult: Sendable, Equatable {
 
     let request: DocumentSyncMergeRequest
     let outcome: Outcome
+    let preparedContent: PreparedSourceContent?
 
     var token: SyncEffectToken {
         request.token
@@ -22,6 +23,12 @@ struct DocumentSyncMergeResult: Sendable, Equatable {
     ) {
         self.request = request
         self.outcome = outcome
+        switch outcome {
+        case .merged(let snapshot):
+            preparedContent = PreparedSourceContent(snapshot: snapshot)
+        case .conflict:
+            preparedContent = nil
+        }
     }
 }
 

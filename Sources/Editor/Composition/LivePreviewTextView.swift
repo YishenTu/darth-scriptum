@@ -13,12 +13,14 @@ final class EditorPaneModel: ObservableObject, Identifiable {
     let id = UUID()
     let latexRenderer: AdaptiveLaTeXRenderer
     let mermaidRenderer: MermaidRenderer
+    let mermaidBlockIndex: MermaidBlockIndex
     let imageProvider: MarkdownImageProvider
     let onOpenMarkdownFile: ((URL) -> Void)?
     let bindingMutationAccumulator = EditorBindingMutationAccumulator()
     let textBindingContext = EditorTextBindingContext()
     private var cachedConfigurationKey: ConfigurationKey?
     private var cachedConfiguration: MarkdownEditorConfiguration?
+    private(set) var markdownEngineUpdateVersion: UInt64 = 0
     @Published var selectedRange = NSRange(location: 0, length: 0)
     @Published var visibleOrigin = NSPoint.zero
     @Published var line = 1
@@ -28,6 +30,7 @@ final class EditorPaneModel: ObservableObject, Identifiable {
     init(
         latexRenderer: AdaptiveLaTeXRenderer? = nil,
         mermaidRenderer: MermaidRenderer? = nil,
+        mermaidBlockIndex: MermaidBlockIndex? = nil,
         imageProvider: MarkdownImageProvider? = nil,
         onOpenMarkdownFile: ((URL) -> Void)? = nil
     ) {
@@ -46,6 +49,7 @@ final class EditorPaneModel: ObservableObject, Identifiable {
                     "DarthScriptum.MermaidRendererDidUpdate.\(UUID().uuidString)"
                 )
             )
+        self.mermaidBlockIndex = mermaidBlockIndex ?? MermaidBlockIndex()
         self.imageProvider =
             imageProvider
             ?? MarkdownImageProvider(
@@ -79,9 +83,16 @@ final class EditorPaneModel: ObservableObject, Identifiable {
             latexRenderer: latexRenderer,
             imageProvider: imageProvider
         )
+        if cachedConfigurationKey != nil {
+            markdownEngineUpdateVersion &+= 1
+        }
         cachedConfigurationKey = key
         cachedConfiguration = configuration
         return configuration
+    }
+
+    func requireMarkdownEngineUpdate() {
+        markdownEngineUpdateVersion &+= 1
     }
 }
 
@@ -111,9 +122,12 @@ struct LivePreviewTextView: NSViewRepresentable {
         context: Context
     ) -> EditorLayoutHostingView {
         updateTextBindingContext()
+        let initialEditorView = editorView
         let hostingView = EditorLayoutHostingView(
-            rootView: AnyView(editorView)
+            rootView: AnyView(initialEditorView)
         )
+        hostingView.markdownEngineUpdateVersion =
+            pane.markdownEngineUpdateVersion
         hostingView.sizingOptions = []
         let coordinator = context.coordinator
         hostingView.onWidthWillChange = { [weak coordinator] width in
@@ -134,8 +148,15 @@ struct LivePreviewTextView: NSViewRepresentable {
         updateTextBindingContext()
         context.coordinator.setPresentation(presentation)
         context.coordinator.setNormalizesDisplayMathSelection(!usesRawSource)
-        hostingView.rootView = AnyView(editorView)
-        context.coordinator.scheduleAttachment(in: hostingView)
+        let updatedEditorView = editorView
+        if hostingView.markdownEngineUpdateVersion
+            != pane.markdownEngineUpdateVersion
+        {
+            hostingView.rootView = AnyView(updatedEditorView)
+            hostingView.markdownEngineUpdateVersion =
+                pane.markdownEngineUpdateVersion
+            context.coordinator.scheduleAttachment(in: hostingView)
+        }
     }
 
     static func dismantleNSView(
@@ -155,13 +176,14 @@ struct LivePreviewTextView: NSViewRepresentable {
             rawSourceMode: rawSourceMode,
             source: sourceBuffer.revision.text
         )
+        let configuration = pane.configuration(
+            rawSourceMode: rawSourceMode,
+            fontSize: fontSize,
+            documentURL: documentURL
+        )
         return MarkdownEngineCompatibility.makeEditorView(
             text: editorText,
-            configuration: pane.configuration(
-                rawSourceMode: rawSourceMode,
-                fontSize: fontSize,
-                documentURL: documentURL
-            ),
+            configuration: configuration,
             fontName: AppTheme.editorFont(size: fontSize).fontName,
             fontSize: fontSize,
             documentID: pane.id.uuidString
@@ -193,6 +215,13 @@ struct LivePreviewTextView: NSViewRepresentable {
             },
             set: { updatedText in
                 let revision = sourceBuffer.revision
+                if pane.textBindingContext.consumeExpectedSourceEcho(
+                    text: updatedText,
+                    revisionNumber: revision.number
+                ) {
+                    pane.bindingMutationAccumulator.reset()
+                    return
+                }
                 let currentPresentation = pane.textBindingContext.presentation(
                     text: revision.text,
                     metrics: sourceBuffer.metrics

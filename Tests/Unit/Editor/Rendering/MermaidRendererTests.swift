@@ -6,6 +6,78 @@ import XCTest
 
 @MainActor
 final class MermaidRendererTests: XCTestCase {
+    func testBlockIndexCoalescesConcurrentRequestsForOneRevision() async {
+        let recorder = MermaidParseInvocationRecorder()
+        let index = MermaidBlockIndex { source, shouldCancel in
+            recorder.record()
+            return MermaidFencedBlockParser.blocks(
+                in: source,
+                shouldCancel: shouldCancel
+            )
+        }
+        let source = """
+            ```mermaid
+            graph LR
+            A --> B
+            ```
+            """
+        let sourceRange = NSRange(
+            location: 0,
+            length: (source as NSString).length
+        )
+
+        async let first = index.blocks(
+            revisionNumber: 9,
+            sourceRange: sourceRange,
+            source: source,
+            containsCandidate: true
+        )
+        async let second = index.blocks(
+            revisionNumber: 9,
+            sourceRange: sourceRange,
+            source: source,
+            containsCandidate: true
+        )
+        let results = await (first, second)
+
+        XCTAssertEqual(results.0, results.1)
+        XCTAssertEqual(results.0.count, 1)
+        XCTAssertEqual(recorder.count, 1)
+    }
+
+    func testBlockIndexInvalidatesCachedParseWhenRevisionHasNoCandidates() async {
+        let recorder = MermaidParseInvocationRecorder()
+        let index = MermaidBlockIndex { source, shouldCancel in
+            recorder.record()
+            return MermaidFencedBlockParser.blocks(
+                in: source,
+                shouldCancel: shouldCancel
+            )
+        }
+        let source = "```mermaid\ngraph LR\n```"
+        let sourceRange = NSRange(
+            location: 0,
+            length: (source as NSString).length
+        )
+        let parsed = await index.blocks(
+            revisionNumber: 2,
+            sourceRange: sourceRange,
+            source: source,
+            containsCandidate: true
+        )
+
+        let invalidated = await index.blocks(
+            revisionNumber: 2,
+            sourceRange: sourceRange,
+            source: source,
+            containsCandidate: false
+        )
+
+        XCTAssertEqual(parsed.count, 1)
+        XCTAssertTrue(invalidated.isEmpty)
+        XCTAssertEqual(recorder.count, 1)
+    }
+
     func testParserFindsBacktickTildeAndCRLFFences() throws {
         let source = """
             before
@@ -493,6 +565,19 @@ final class MermaidRendererTests: XCTestCase {
         XCTFail("Timed out waiting for Mermaid state.")
     }
 
+}
+
+private final class MermaidParseInvocationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var invocationCount = 0
+
+    var count: Int {
+        lock.withLock { invocationCount }
+    }
+
+    func record() {
+        lock.withLock { invocationCount += 1 }
+    }
 }
 
 @MainActor

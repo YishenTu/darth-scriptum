@@ -204,16 +204,14 @@ final class DocumentSyncDefaultEffectExecutor:
             let payload = try TextFileCodec.readVerifiedFilePayload(
                 at: request.targetURL
             )
-            let data = payload.data
             let fingerprint = payload.fingerprint
             if request.expectedBaseline?.fingerprint == fingerprint {
                 return .finished(
                     .unchanged(
                         try TextFileCodec.externalReadObservation(
-                            data: data,
+                            payload: payload,
                             targetURL: request.targetURL,
-                            identity: request.identity,
-                            fingerprint: fingerprint
+                            identity: request.identity
                         )
                     )
                 )
@@ -221,10 +219,9 @@ final class DocumentSyncDefaultEffectExecutor:
             return .finished(
                 .changed(
                     try TextFileCodec.decodeExternalChange(
-                        data: data,
+                        payload: payload,
                         targetURL: request.targetURL,
-                        identity: request.identity,
-                        fingerprint: fingerprint
+                        identity: request.identity
                     )
                 )
             )

@@ -15,7 +15,6 @@ struct SafeFileCommitter: DocumentFileCommitting {
     }
 
     enum CommitError: LocalizedError, Equatable {
-        case invalidPreparedPayload
         case atomicSwapUnavailable
         case atomicSwapFailed
         case targetChangedBeforeCommit
@@ -23,8 +22,6 @@ struct SafeFileCommitter: DocumentFileCommitting {
 
         var errorDescription: String? {
             switch self {
-            case .invalidPreparedPayload:
-                "The prepared save payload does not match its captured snapshot."
             case .atomicSwapUnavailable:
                 "This filesystem cannot safely replace the file in place. Use Save As to write a new file."
             case .atomicSwapFailed:
@@ -61,9 +58,6 @@ struct SafeFileCommitter: DocumentFileCommitting {
     }
 
     func commit(_ token: PendingSaveToken) throws -> FileCommitResult {
-        guard token.preparedPayload.isExactEncoding() else {
-            throw CommitError.invalidPreparedPayload
-        }
         let fileManager = FileManager.default
         let requestedTargetURL = token.targetURL
 

@@ -142,10 +142,9 @@ final class DocumentSyncRecoveryEffectExecutor {
         do {
             let change = try await DocumentFileAccess.recovery.perform {
                 try TextFileCodec.decodeExternalChange(
-                    data: payload.data,
+                    payload: payload.verifiedPayload,
                     targetURL: payload.targetURL,
-                    identity: identity,
-                    fingerprint: payload.fingerprint
+                    identity: identity
                 )
             }
             return .decoded(change)

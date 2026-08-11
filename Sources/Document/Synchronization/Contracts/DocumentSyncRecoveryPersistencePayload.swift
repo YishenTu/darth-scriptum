@@ -1,7 +1,7 @@
 import Foundation
 
 struct DocumentSyncRawRecoveryPayload: Sendable, Equatable {
-    private let verifiedPayload: VerifiedFilePayload
+    let verifiedPayload: VerifiedFilePayload
     /// The immutable file location whose raw bytes are being preserved. Raw
     /// recovery decoding must not reconstruct it from mutable host state or
     /// an identity implementation detail.

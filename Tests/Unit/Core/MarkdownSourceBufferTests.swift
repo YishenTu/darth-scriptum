@@ -5,6 +5,43 @@ import XCTest
 
 @MainActor
 final class MarkdownSourceBufferTests: XCTestCase {
+    func testPreparedSourceContentInstallsPrecomputedMetrics() async {
+        let snapshot = DocumentSnapshot(
+            text: "# Title\n\n```mermaid\ngraph TD\n```\n",
+            format: .newDocument
+        )
+        let preparedContent = await Task.detached {
+            PreparedSourceContent(snapshot: snapshot)
+        }.value
+
+        let buffer = MarkdownSourceBuffer(preparedContent: preparedContent)
+
+        XCTAssertEqual(buffer.revision.text, snapshot.text)
+        XCTAssertEqual(buffer.metrics, DocumentMetrics(text: snapshot.text))
+    }
+
+    func testPreparedSourceReplacementPublishesPrecomputedMetrics() async {
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(text: "before", format: .newDocument)
+        )
+        let snapshot = DocumentSnapshot(
+            text: "after\n```mermaid\ngraph LR\n```",
+            format: .newDocument
+        )
+        let preparedContent = await Task.detached {
+            PreparedSourceContent(snapshot: snapshot)
+        }.value
+
+        buffer.replace(
+            with: preparedContent,
+            origin: .externalReload
+        )
+
+        XCTAssertEqual(buffer.revision.text, snapshot.text)
+        XCTAssertEqual(buffer.metrics, DocumentMetrics(text: snapshot.text))
+        XCTAssertNil(buffer.lastAppliedEdit)
+    }
+
     func testDocumentMetricsStayExactAcrossCRLFAndMermaidBoundaryEdits() throws {
         let source = "Mermaid\r\nx😀\ny"
         let buffer = MarkdownSourceBuffer(

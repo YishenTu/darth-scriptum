@@ -265,7 +265,10 @@ nonisolated final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHos
     override nonisolated func read(from data: Data, ofType typeName: String) throws {
         let decoded = try TextFileCodec.decode(data)
         initialContentStore.stage(
-            .init(snapshot: decoded, data: data)
+            .init(
+                preparedContent: PreparedSourceContent(snapshot: decoded),
+                data: data
+            )
         )
     }
 
@@ -615,13 +618,22 @@ nonisolated final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHos
         }
         hasUndoManager = true
         let stagedContent = initialContentStore.take()
-        let coordinator = DocumentSyncCoordinator(
-            snapshot: stagedContent?.snapshot
-                ?? DocumentSnapshot(text: "", format: .newDocument),
-            bridge: saveBridge,
-            recoveryStore: recoveryStore,
-            fileAccessLane: fileAccessLane
-        )
+        let coordinator: DocumentSyncCoordinator
+        if let stagedContent {
+            coordinator = DocumentSyncCoordinator(
+                preparedContent: stagedContent.preparedContent,
+                bridge: saveBridge,
+                recoveryStore: recoveryStore,
+                fileAccessLane: fileAccessLane
+            )
+        } else {
+            coordinator = DocumentSyncCoordinator(
+                snapshot: DocumentSnapshot(text: "", format: .newDocument),
+                bridge: saveBridge,
+                recoveryStore: recoveryStore,
+                fileAccessLane: fileAccessLane
+            )
+        }
         syncCoordinatorStorage = coordinator
         coordinator.delegate = self
         sourceObservation = coordinator.sourceBuffer.observe {
@@ -639,7 +651,7 @@ nonisolated final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHos
         }
         if let stagedContent {
             coordinator.loadInitial(
-                stagedContent.snapshot,
+                stagedContent.preparedContent,
                 data: stagedContent.data,
                 from: fileURL
             )
@@ -652,7 +664,7 @@ nonisolated final class MarkdownDocument: NSDocument, DocumentSyncCoordinatorHos
     ) {
         guard let stagedContent = initialContentStore.take() else { return }
         coordinator.loadInitial(
-            stagedContent.snapshot,
+            stagedContent.preparedContent,
             data: stagedContent.data,
             from: fileURL
         )

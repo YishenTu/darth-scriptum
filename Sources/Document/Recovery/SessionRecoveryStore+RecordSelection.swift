@@ -77,7 +77,7 @@ extension SessionRecoveryStore {
                 RecoveryEntry(
                     id: $0.id,
                     documentIdentity: identity,
-                    snapshot: $0.snapshot,
+                    preparedContent: $0.preparedContent,
                     createdAt: $0.createdAt
                 )
             },

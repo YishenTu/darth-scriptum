@@ -314,7 +314,7 @@ extension DocumentSyncReducer {
             RecoveryEntry(
                 id: $0.id,
                 documentIdentity: identity,
-                snapshot: $0.snapshot,
+                preparedContent: $0.preparedContent,
                 createdAt: $0.createdAt
             )
         }
@@ -341,7 +341,7 @@ extension DocumentSyncReducer {
                 RecoveryEntry(
                     id: decoded.id,
                     documentIdentity: identity,
-                    snapshot: decoded.snapshot,
+                    preparedContent: decoded.preparedContent,
                     createdAt: decoded.createdAt
                 )
             )

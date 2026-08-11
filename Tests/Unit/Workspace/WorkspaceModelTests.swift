@@ -17,6 +17,10 @@ final class WorkspaceModelTests: XCTestCase {
                 === model.secondaryPane.mermaidRenderer
         )
         XCTAssertTrue(
+            model.primaryPane.mermaidBlockIndex
+                === model.secondaryPane.mermaidBlockIndex
+        )
+        XCTAssertTrue(
             model.primaryPane.imageProvider
                 === model.secondaryPane.imageProvider
         )

@@ -15,15 +15,13 @@ final class EditorPaneStateCoordinator: NSObject {
     private var focusObservation: NSKeyValueObservation?
     private var revealsActiveSyntax: Bool?
     private lazy var renderedContentResizeCoordinator =
-        RenderedContentResizeCoordinator(
-            presentation: presentation,
-            restyleNotification: pane.latexRenderer.updateNotification
-        ) { [weak self] viewportWidth in
+        RenderedContentResizeCoordinator { [weak self] viewportWidth in
             self?.scheduleMermaidApply(viewportWidth: viewportWidth)
         }
     private var sourceObservation: UUID?
     private var lineIndexObservation: UUID?
     private var lastSourceText: String
+    private var isApplyingSharedSourceEdit = false
     private var hasRestoredState = false
     private var pendingSelectionRestore: NSRange?
     private var mermaidParseTask: Task<Void, Never>?
@@ -152,7 +150,7 @@ final class EditorPaneStateCoordinator: NSObject {
             presentation.sourceRange.location
             != newPresentation.sourceRange.location
         presentation = newPresentation
-        renderedContentResizeCoordinator.updatePresentation(newPresentation)
+        renderedContentResizeCoordinator.presentationDidChange()
         if sourceRangeChanged {
             pendingSelectionRestore = pane.selectedRange
             hasRestoredState = false
@@ -183,6 +181,10 @@ final class EditorPaneStateCoordinator: NSObject {
             }
             textView = candidate
             clipView = candidate.enclosingScrollView?.contentView
+            // MarkdownSourceBuffer owns document undo/redo. Prevent AppKit from
+            // retaining a second attributed-text history that is discarded on
+            // every source revision.
+            candidate.allowsUndo = false
             candidate.setAccessibilityLabel("Markdown editor")
             candidate.identifier = NSUserInterfaceItemIdentifier(
                 "DarthScriptum.MarkdownEditor.\(pane.id.uuidString)"
@@ -280,6 +282,7 @@ final class EditorPaneStateCoordinator: NSObject {
     ) {
         guard let textStorage = notification.object as? NSTextStorage,
             textStorage === textView?.textStorage,
+            !isApplyingSharedSourceEdit,
             textStorage.editedMask.contains(.editedCharacters)
         else {
             return
@@ -402,9 +405,6 @@ final class EditorPaneStateCoordinator: NSObject {
         _ revision: SourceRevision,
         origin: DocumentChangeOrigin
     ) {
-        DispatchQueue.main.async { [weak textView] in
-            textView?.undoManager?.removeAllActions()
-        }
         let isOwnEdit: Bool
         if case .localEditor(let paneID) = origin {
             isOwnEdit = paneID == pane.id
@@ -434,6 +434,7 @@ final class EditorPaneStateCoordinator: NSObject {
                 self?.restorePendingSelectionIfNeeded()
             }
         }
+        let previousPresentation = presentation
         let newPresentation = MarkdownSourcePresentation.make(
             source: revision.text,
             rendersMarkdown: presentation.rendersMarkdown
@@ -447,7 +448,39 @@ final class EditorPaneStateCoordinator: NSObject {
             hasRestoredState = false
         }
         presentation = newPresentation
-        renderedContentResizeCoordinator.updatePresentation(newPresentation)
+        renderedContentResizeCoordinator.presentationDidChange()
+        var nativePresentationIsCurrent =
+            isOwnEdit
+            && textView?.string == newPresentation.text
+        if !isOwnEdit,
+            let textView,
+            let edit = sourceBuffer.lastAppliedEdit,
+            edit.expectedRevision &+ 1 == revision.number
+        {
+            isApplyingSharedSourceEdit = true
+            pane.bindingMutationAccumulator.reset()
+            let didApplyIncrementally =
+                MarkdownEngineCompatibility
+                .applyIncrementalSourceEdit(
+                    edit,
+                    from: previousPresentation,
+                    to: newPresentation,
+                    in: textView
+                )
+            pane.bindingMutationAccumulator.reset()
+            isApplyingSharedSourceEdit = false
+            if didApplyIncrementally {
+                nativePresentationIsCurrent = true
+                pane.textBindingContext.expectSourceEcho(
+                    text: newPresentation.text,
+                    revisionNumber: revision.number
+                )
+                restorePendingSelectionIfNeeded()
+            }
+        }
+        if !nativePresentationIsCurrent {
+            pane.requireMarkdownEngineUpdate()
+        }
         lastSourceText = revision.text
         scheduleMermaidParse()
     }
@@ -556,9 +589,20 @@ final class EditorPaneStateCoordinator: NSObject {
         }
 
         mermaidParseTask?.cancel()
-        guard presentation.rendersMarkdown,
-            sourceBuffer.metrics.containsMermaidCandidate
-        else {
+        guard presentation.rendersMarkdown else {
+            mermaidParseTask = nil
+            mermaidBlocks = []
+            mermaidBlocksRevision = revisionNumber
+            mermaidBlocksSourceRange = expectedSourceRange
+            mermaidParseRevision = nil
+            mermaidParseSourceRange = nil
+            return
+        }
+        guard sourceBuffer.metrics.containsMermaidCandidate else {
+            pane.mermaidBlockIndex.recordNoCandidates(
+                revisionNumber: revisionNumber,
+                sourceRange: expectedSourceRange
+            )
             mermaidParseTask = nil
             mermaidBlocks = []
             mermaidBlocksRevision = revisionNumber
@@ -571,27 +615,29 @@ final class EditorPaneStateCoordinator: NSObject {
         let source = presentation.text
         mermaidParseRevision = revisionNumber
         mermaidParseSourceRange = expectedSourceRange
-        mermaidParseTask = Task.detached(priority: .utility) { [weak self] in
-            let blocks = MermaidFencedBlockParser.blocks(in: source) {
-                Task.isCancelled
-            }
+        let mermaidBlockIndex = pane.mermaidBlockIndex
+        mermaidParseTask = Task { @MainActor [weak self] in
+            let blocks = await mermaidBlockIndex.blocks(
+                revisionNumber: revisionNumber,
+                sourceRange: expectedSourceRange,
+                source: source,
+                containsCandidate: true
+            )
             guard !Task.isCancelled else { return }
-            await MainActor.run { [weak self] in
-                guard let self,
-                    self.sourceBuffer.revision.number == revisionNumber,
-                    self.presentation.sourceRange == expectedSourceRange,
-                    self.presentation.rendersMarkdown
-                else {
-                    return
-                }
-                self.mermaidBlocks = blocks
-                self.mermaidBlocksRevision = revisionNumber
-                self.mermaidBlocksSourceRange = expectedSourceRange
-                self.mermaidParseTask = nil
-                self.mermaidParseRevision = nil
-                self.mermaidParseSourceRange = nil
-                self.scheduleMermaidApply()
+            guard let self,
+                self.sourceBuffer.revision.number == revisionNumber,
+                self.presentation.sourceRange == expectedSourceRange,
+                self.presentation.rendersMarkdown
+            else {
+                return
             }
+            self.mermaidBlocks = blocks
+            self.mermaidBlocksRevision = revisionNumber
+            self.mermaidBlocksSourceRange = expectedSourceRange
+            self.mermaidParseTask = nil
+            self.mermaidParseRevision = nil
+            self.mermaidParseSourceRange = nil
+            self.scheduleMermaidApply()
         }
     }
 

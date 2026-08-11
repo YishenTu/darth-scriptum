@@ -354,13 +354,11 @@ enum CommitRecoveryJournalStore {
         let targetPayload = try TextFileCodec.readVerifiedFilePayload(
             at: request.targetURL
         )
-        let targetData = targetPayload.data
         let targetFingerprint = targetPayload.fingerprint
         let targetObservation = try TextFileCodec.externalReadObservation(
-            data: targetData,
+            payload: targetPayload,
             targetURL: request.targetURL,
-            identity: request.identity,
-            fingerprint: targetFingerprint
+            identity: request.identity
         )
 
         switch pending.terminalState {

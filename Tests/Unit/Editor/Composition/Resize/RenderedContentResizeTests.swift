@@ -7,105 +7,6 @@ import XCTest
 
 @MainActor
 final class RenderedContentResizeTests: XCTestCase {
-    func testFinalTableRestylePreservesMermaidPresentation() async throws {
-        let source =
-            Self.mermaidSource + """
-
-
-                | Name | Value |
-                | --- | ---: |
-                | A | 1 |
-                """
-        let notification = Notification.Name(
-            "RenderedContentResizeTests.mixed.\(UUID().uuidString)"
-        )
-        let renderer = testMermaidRenderer(naturalWidth: 700)
-        let rendered = expectation(
-            forNotification: renderer.updateNotification,
-            object: renderer
-        )
-        let harness = makeHarness(
-            source: source,
-            pane: EditorPaneModel(
-                latexRenderer: AdaptiveLaTeXRenderer(
-                    updateNotification: notification
-                ),
-                mermaidRenderer: renderer
-            )
-        )
-        defer { harness.close() }
-        let textView = try await harness.nativeTextView()
-        let anchor = (source as NSString).range(of: "flowchart").location
-        await fulfillment(of: [rendered], timeout: 2)
-        let initialBlock = try await harness.renderedBlock(
-            in: textView,
-            at: anchor
-        )
-        let sourceIdentity = try XCTUnwrap(initialBlock.sourceIdentity)
-
-        var liveResizeActive = false
-        defer {
-            if liveResizeActive {
-                try? harness.endLiveResize(for: textView)
-            }
-        }
-        try harness.beginLiveResize(for: textView)
-        liveResizeActive = true
-        await harness.resize(through: [760])
-
-        let finalRestyle = expectation(
-            forNotification: notification,
-            object: textView
-        )
-        try harness.endLiveResize(for: textView)
-        liveResizeActive = false
-        await fulfillment(of: [finalRestyle], timeout: 2)
-
-        _ = try await harness.renderedBlock(in: textView, at: anchor) {
-            $0.sourceIdentity == sourceIdentity
-        }
-    }
-
-    func testResizeEndForcesFinalTableRestyleAfterSameWidthQuietUpdate()
-        async throws
-    {
-        let source = "| Name | Value |\n| --- | ---: |\n| A | 1 |\n"
-        let notification = Notification.Name(
-            "RenderedContentResizeTests.finalTable.\(UUID().uuidString)"
-        )
-        let pane = EditorPaneModel(
-            latexRenderer: AdaptiveLaTeXRenderer(
-                updateNotification: notification
-            )
-        )
-        let harness = makeHarness(source: source, pane: pane)
-        defer { harness.close() }
-        let textView = try await harness.nativeTextView()
-
-        var liveResizeActive = false
-        defer {
-            if liveResizeActive {
-                try? harness.endLiveResize(for: textView)
-            }
-        }
-        let quietRestyle = expectation(
-            forNotification: notification,
-            object: textView
-        )
-        try harness.beginLiveResize(for: textView)
-        liveResizeActive = true
-        await harness.resize(through: [760])
-        await fulfillment(of: [quietRestyle], timeout: 2)
-
-        let finalRestyle = expectation(
-            forNotification: notification,
-            object: textView
-        )
-        try harness.endLiveResize(for: textView)
-        liveResizeActive = false
-        await fulfillment(of: [finalRestyle], timeout: 2)
-    }
-
     func testVisibleMermaidReflowsBeforeLiveResizeEnds() async throws {
         let source = Self.mermaidSource
         let renderer = testMermaidRenderer(naturalWidth: 1_000)
@@ -438,22 +339,24 @@ final class RenderedContentResizeTests: XCTestCase {
         )
     }
 
-    func testDelayedTableRestyleKeepsFirstVisibleLinePinned() async throws {
+    func testResizeWhenTableIsInitiallyNarrowReflowsWithoutFullRestyleAndKeepsVisibleLinePinned()
+        async throws
+    {
         let table = """
-            | Legal form | Detailed formation and registration requirements | Recurring accounting taxation and compliance obligations |
-            | --- | --- | --- |
-            | Sole proprietorship with direct owner control | Registration filings professional advice initial licensing and local permit expenses | Bookkeeping annual accounts tax preparation regulatory renewals and continuing professional advice throughout the year |
-            | Partnership governed by a negotiated agreement | Contract drafting registration filings professional advice initial licensing and local permit expenses | Ongoing administration partner reporting tax preparation regulatory renewals and continuing professional advice |
+            | Name | Description |
+            | --- | --- |
+            | A | This cell contains enough prose to use the wide editor while remaining breakable at word boundaries, then wrap onto substantially more lines after the editor becomes narrower. |
             """
         let trailingProse = (0..<150).map { index in
             """
             Section \(index) remains readable while the table above it rewraps \
-            during the delayed full-restyle pass at the end of live resizing.
+            through MarkdownEngine's scoped width-change restyle.
             """
         }.joined(separator: "\n\n")
-        let source = table + "\n\n" + trailingProse
+        let source =
+            "Introductory paragraph.\n\n" + table + "\n\n" + trailingProse
         let notification = Notification.Name(
-            "RenderedContentResizeTests.anchorTable.\(UUID().uuidString)"
+            "RenderedContentResizeTests.engineTable.\(UUID().uuidString)"
         )
         let harness = makeHarness(
             source: source,
@@ -466,10 +369,20 @@ final class RenderedContentResizeTests: XCTestCase {
         )
         defer { harness.close() }
         let textView = try await harness.nativeTextView()
+        let tableAnchor = (source as NSString).range(of: "| Name").location
+        let initialTable = try await harness.renderedBlock(
+            in: textView,
+            at: tableAnchor
+        )
         try await harness.scroll(toVerticalFraction: 0.4, in: textView)
         let anchor = try XCTUnwrap(
             FirstVisibleLineViewportAnchor.capture(in: textView)
         )
+        let fullRestyle = expectation(
+            forNotification: notification,
+            object: textView
+        )
+        fullRestyle.isInverted = true
 
         var liveResizeActive = false
         defer {
@@ -480,13 +393,21 @@ final class RenderedContentResizeTests: XCTestCase {
         try harness.beginLiveResize(for: textView)
         liveResizeActive = true
         await harness.resize(through: [820, 760, 700, 680], display: true)
-        let finalRestyle = expectation(
-            forNotification: notification,
-            object: textView
-        )
+        let reflowedTable = try await harness.renderedBlock(
+            in: textView,
+            at: tableAnchor
+        ) {
+            $0.image !== initialTable.image
+        }
         try harness.endLiveResize(for: textView)
         liveResizeActive = false
-        await fulfillment(of: [finalRestyle], timeout: 2)
+        await fulfillment(of: [fullRestyle], timeout: 0.3)
+
+        XCTAssertLessThan(reflowedTable.bounds.width, initialTable.bounds.width)
+        XCTAssertGreaterThan(
+            reflowedTable.bounds.height,
+            initialTable.bounds.height
+        )
 
         try await harness.waitUntil {
             guard

@@ -80,7 +80,7 @@ extension SessionRecoveryStore {
             return RecoveryEntry(
                 id: entry.id,
                 documentIdentity: identity,
-                snapshot: entry.snapshot,
+                preparedContent: entry.preparedContent,
                 createdAt: entry.createdAt
             )
         }

@@ -6,6 +6,26 @@ import XCTest
 
 @MainActor
 final class SessionRecoveryStoreTests: XCTestCase {
+    func testRecoveryEntryCarriesPreparedSourceContent() async {
+        let snapshot = DocumentSnapshot(
+            text: "recovered\n```mermaid\ngraph TD\n```",
+            format: .newDocument
+        )
+        let preparedContent = await Task.detached {
+            PreparedSourceContent(snapshot: snapshot)
+        }.value
+
+        let entry = RecoveryEntry(
+            id: UUID(),
+            documentIdentity: DocumentIdentity(stableKey: "recovery"),
+            preparedContent: preparedContent,
+            createdAt: Date()
+        )
+
+        XCTAssertEqual(entry.snapshot, snapshot)
+        XCTAssertEqual(entry.preparedContent.metrics, DocumentMetrics(text: snapshot.text))
+    }
+
     func testRawPersistenceRejectsArtifactThatStartupCannotRead()
         async throws
     {

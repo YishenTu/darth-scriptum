@@ -22,15 +22,6 @@ struct DocumentSyncPreparedSavePayload: Sendable, Equatable {
         self.contentFingerprint = contentFingerprint
     }
 
-    /// This defensive check is intentionally used only by off-main executors.
-    /// Reducer transitions use the immutable receipt and never encode or hash.
-    nonisolated func isExactEncoding() -> Bool {
-        guard let expected = try? TextFileCodec.encode(snapshot) else {
-            return false
-        }
-        return expected == encodedData
-            && FileFingerprint.make(data: encodedData) == contentFingerprint
-    }
 }
 
 /// A baseline minted from verified file bytes or a verified committed payload.
@@ -143,8 +134,12 @@ struct DocumentSyncExternalReadObservation: Sendable, Equatable {
 struct DocumentSyncExternalChange: Sendable, Equatable {
     let targetURL: URL
     let identity: DocumentIdentity
-    let snapshot: DocumentSnapshot
+    let preparedContent: PreparedSourceContent
     let fingerprint: FileFingerprint
+
+    var snapshot: DocumentSnapshot {
+        preparedContent.snapshot
+    }
 
     fileprivate init(
         targetURL: URL,
@@ -154,7 +149,7 @@ struct DocumentSyncExternalChange: Sendable, Equatable {
     ) {
         self.targetURL = targetURL
         self.identity = identity
-        self.snapshot = snapshot
+        preparedContent = PreparedSourceContent(snapshot: snapshot)
         self.fingerprint = fingerprint
     }
 }
@@ -228,6 +223,23 @@ enum TextFileCodec {
     }
 
     nonisolated static func externalReadObservation(
+        payload: VerifiedFilePayload,
+        targetURL: URL,
+        identity: DocumentIdentity
+    ) throws -> DocumentSyncExternalReadObservation {
+        try validateSupportedSize(payload.data)
+        let canonicalTargetURL = canonicalTargetURL(targetURL)
+        guard DocumentIdentity.make(url: canonicalTargetURL) == identity else {
+            throw EvidenceError.identityDoesNotMatchTarget
+        }
+        return DocumentSyncExternalReadObservation(
+            targetURL: canonicalTargetURL,
+            identity: identity,
+            fingerprint: payload.fingerprint
+        )
+    }
+
+    nonisolated static func externalReadObservation(
         data: Data,
         targetURL: URL,
         identity: DocumentIdentity,
@@ -245,6 +257,24 @@ enum TextFileCodec {
             targetURL: canonicalTargetURL,
             identity: identity,
             fingerprint: fingerprint
+        )
+    }
+
+    nonisolated static func decodeExternalChange(
+        payload: VerifiedFilePayload,
+        targetURL: URL,
+        identity: DocumentIdentity
+    ) throws -> DocumentSyncExternalChange {
+        try validateSupportedSize(payload.data)
+        let canonicalTargetURL = canonicalTargetURL(targetURL)
+        guard DocumentIdentity.make(url: canonicalTargetURL) == identity else {
+            throw EvidenceError.identityDoesNotMatchTarget
+        }
+        return DocumentSyncExternalChange(
+            targetURL: canonicalTargetURL,
+            identity: identity,
+            snapshot: try decode(payload.data),
+            fingerprint: payload.fingerprint
         )
     }
 

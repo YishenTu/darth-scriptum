@@ -21,7 +21,8 @@ final class MarkdownSourceBuffer: ObservableObject {
 
     private static let maximumHistoryEntries = 512
     private static let maximumHistoryBytes = 32 * 1_024 * 1_024
-    private static let synchronousLineIndexLimit = 2 * 1_024 * 1_024
+    private static let synchronousLineIndexLimit =
+        PreparedSourceContent.synchronousLineIndexLimit
 
     @Published private(set) var revision: SourceRevision
     private(set) var metrics: DocumentMetrics
@@ -36,18 +37,22 @@ final class MarkdownSourceBuffer: ObservableObject {
     private var lineIndex: SourceLineIndex?
     private var lineIndexTask: Task<Void, Never>?
 
-    init(snapshot: DocumentSnapshot = DocumentSnapshot(text: "", format: .newDocument)) {
+    convenience init(
+        snapshot: DocumentSnapshot = DocumentSnapshot(
+            text: "",
+            format: .newDocument
+        )
+    ) {
+        self.init(preparedContent: PreparedSourceContent(snapshot: snapshot))
+    }
+
+    init(preparedContent: PreparedSourceContent) {
+        let snapshot = preparedContent.snapshot
         revision = SourceRevision(number: 0, text: snapshot.text)
-        metrics = DocumentMetrics(text: snapshot.text)
+        metrics = preparedContent.metrics
         lastAppliedEdit = nil
         lastOrigin = .initialLoad
-        if (snapshot.text as NSString).length
-            <= Self.synchronousLineIndexLimit
-        {
-            lineIndex = SourceLineIndex(text: snapshot.text)
-        } else {
-            lineIndex = nil
-        }
+        lineIndex = preparedContent.lineIndex
         if lineIndex == nil {
             scheduleLineIndexBuild(for: revision)
         }
@@ -116,6 +121,22 @@ final class MarkdownSourceBuffer: ObservableObject {
         }
         let next = revision.advanced(to: text)
         replaceRevision(with: next, origin: origin)
+        return next
+    }
+
+    @discardableResult
+    func replace(
+        with preparedContent: PreparedSourceContent,
+        origin: DocumentChangeOrigin
+    ) -> SourceRevision {
+        let text = preparedContent.snapshot.text
+        guard text != revision.text else { return revision }
+        let next = revision.advanced(to: text)
+        replaceRevision(
+            with: next,
+            origin: origin,
+            preparedContent: preparedContent
+        )
         return next
     }
 
@@ -202,7 +223,8 @@ final class MarkdownSourceBuffer: ObservableObject {
 
     private func replaceRevision(
         with next: SourceRevision,
-        origin: DocumentChangeOrigin
+        origin: DocumentChangeOrigin,
+        preparedContent: PreparedSourceContent? = nil
     ) {
         switch origin {
         case .localEditor:
@@ -212,11 +234,13 @@ final class MarkdownSourceBuffer: ObservableObject {
         case .initialLoad, .externalReload, .merge, .recovery:
             clearHistory()
         }
-        metrics = DocumentMetrics(text: next.text)
+        metrics = preparedContent?.metrics ?? DocumentMetrics(text: next.text)
         lastAppliedEdit = nil
         lineIndexTask?.cancel()
         lineIndexTask = nil
-        if (next.text as NSString).length
+        if let preparedContent {
+            lineIndex = preparedContent.lineIndex
+        } else if (next.text as NSString).length
             <= Self.synchronousLineIndexLimit
         {
             lineIndex = SourceLineIndex(text: next.text)

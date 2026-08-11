@@ -933,7 +933,7 @@ actor SessionRecoveryStore {
             return RecoveryEntry(
                 id: entry.id,
                 documentIdentity: request.destinationIdentity,
-                snapshot: entry.snapshot,
+                preparedContent: entry.preparedContent,
                 createdAt: entry.createdAt
             )
         }

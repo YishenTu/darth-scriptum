@@ -5,6 +5,21 @@ import XCTest
 @testable import DarthScriptum
 
 final class TextFileCodecTests: XCTestCase {
+    func testDecodeExternalChangeConsumesVerifiedPayload() throws {
+        let data = Data("verified\ncontent".utf8)
+        let payload = VerifiedFilePayload(data: data)
+        let targetURL = URL(fileURLWithPath: "/tmp/verified-change.md")
+
+        let change = try TextFileCodec.decodeExternalChange(
+            payload: payload,
+            targetURL: targetURL,
+            identity: .make(url: targetURL)
+        )
+
+        XCTAssertEqual(change.snapshot.text, "verified\ncontent")
+        XCTAssertEqual(change.fingerprint, payload.fingerprint)
+    }
+
     func testVerifiedFilePayloadKeepsDescriptorIdentityWhenPathIsReplacedAfterRead()
         throws
     {

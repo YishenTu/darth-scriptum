@@ -552,6 +552,103 @@ final class LivePreviewTextViewTests: XCTestCase {
         _ = window
     }
 
+    func testSplitPaneAppliesPlainSharedSourceEditBeforeSwiftUIRebuild()
+        async throws
+    {
+        let source = "# Heading\n\nalpha omega"
+        let buffer = MarkdownSourceBuffer(
+            snapshot: DocumentSnapshot(text: source, format: .newDocument)
+        )
+        let primaryPane = EditorPaneModel()
+        let secondaryPane = EditorPaneModel()
+        let hostingView = NSHostingView(
+            rootView: HStack {
+                LivePreviewTextView(
+                    sourceBuffer: buffer,
+                    pane: primaryPane,
+                    sourceMode: false,
+                    fontSize: 14,
+                    newlineStyle: .lf
+                )
+                LivePreviewTextView(
+                    sourceBuffer: buffer,
+                    pane: secondaryPane,
+                    sourceMode: false,
+                    fontSize: 14,
+                    newlineStyle: .lf
+                )
+            }
+            .frame(width: 800, height: 400)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 800, height: 400)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        window.layoutIfNeeded()
+        try await waitUntil {
+            let textViews = MarkdownEngineCompatibility.nativeTextViews(
+                in: hostingView
+            )
+            return textViews.count == 2
+                && textViews.allSatisfy { $0.string == source }
+                && Set(textViews.compactMap(\.identifier?.rawValue))
+                    == [
+                        "DarthScriptum.MarkdownEditor."
+                            + primaryPane.id.uuidString,
+                        "DarthScriptum.MarkdownEditor."
+                            + secondaryPane.id.uuidString,
+                    ]
+        }
+        XCTAssertTrue(
+            MarkdownEngineCompatibility.nativeTextViews(in: hostingView)
+                .allSatisfy { !$0.allowsUndo }
+        )
+        let revisionNumber = buffer.revision.number
+        let replacement = "x"
+        let replacementRange = NSRange(
+            location: (source as NSString).length,
+            length: 0
+        )
+        let firstExpected = (source as NSString).replacingCharacters(
+            in: replacementRange,
+            with: replacement
+        )
+
+        try buffer.apply(
+            SourceEdit(
+                range: replacementRange,
+                replacement: replacement,
+                expectedRevision: revisionNumber,
+                origin: .localEditor(paneID: UUID())
+            )
+        )
+        try buffer.apply(
+            SourceEdit(
+                range: NSRange(
+                    location: (firstExpected as NSString).length,
+                    length: 0
+                ),
+                replacement: "y",
+                expectedRevision: revisionNumber + 1,
+                origin: .localEditor(paneID: UUID())
+            )
+        )
+        let expected = firstExpected + "y"
+
+        XCTAssertTrue(
+            MarkdownEngineCompatibility.nativeTextViews(in: hostingView)
+                .allSatisfy { $0.string == expected }
+        )
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(buffer.revision.text, expected)
+        XCTAssertEqual(buffer.revision.number, revisionNumber + 2)
+        _ = window
+    }
+
     func testEngineRendersHeadingBulletAndLaTeX() async throws {
         let source = """
             # Heading
