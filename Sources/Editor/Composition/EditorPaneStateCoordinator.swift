@@ -282,9 +282,22 @@ final class EditorPaneStateCoordinator: NSObject {
     ) {
         guard let textStorage = notification.object as? NSTextStorage,
             textStorage === textView?.textStorage,
-            !isApplyingSharedSourceEdit,
-            textStorage.editedMask.contains(.editedCharacters)
+            !isApplyingSharedSourceEdit
         else {
+            return
+        }
+        if !textStorage.editedMask.contains(.editedCharacters) {
+            guard textStorage.editedMask.contains(.editedAttributes),
+                MarkdownEngineCompatibility.containsWidthAdaptiveTable(
+                    in: textStorage,
+                    range: textStorage.editedRange
+                )
+            else {
+                return
+            }
+            renderedContentResizeCoordinator.renderedContentDidUpdate(
+                mayContainCenteredBlocks: false
+            )
             return
         }
         let editedRange = textStorage.editedRange

@@ -185,6 +185,29 @@ final class MarkdownEngineCompatibilityTests: XCTestCase {
         )
     }
 
+    func testWidthAdaptiveTableDetectionUsesEngineAnchorAttribute() {
+        let storage = NSTextStorage(string: "table\nprose")
+        let tableRange = NSRange(location: 0, length: 5)
+        storage.addAttribute(
+            NSAttributedString.Key("ScrollableBlockFullRange"),
+            value: NSValue(range: tableRange),
+            range: NSRange(location: 0, length: 1)
+        )
+
+        XCTAssertTrue(
+            MarkdownEngineCompatibility.containsWidthAdaptiveTable(
+                in: storage,
+                range: tableRange
+            )
+        )
+        XCTAssertFalse(
+            MarkdownEngineCompatibility.containsWidthAdaptiveTable(
+                in: storage,
+                range: NSRange(location: 6, length: 5)
+            )
+        )
+    }
+
     func testCenteredRenderedBlockIsLeftPinnedAndRecentersAtNewWidth() throws {
         let textView = NSTextView(
             frame: NSRect(x: 0, y: 0, width: 300, height: 200)

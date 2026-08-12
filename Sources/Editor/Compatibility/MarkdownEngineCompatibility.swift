@@ -473,6 +473,29 @@ enum MarkdownEngineCompatibility {
         return found
     }
 
+    /// Identifies an engine-rendered table whose image is recomputed when the
+    /// text container width changes. MarkdownEngine performs that restyle as
+    /// an attribute-only edit, so callers cannot infer it from source changes.
+    static func containsWidthAdaptiveTable(
+        in textStorage: NSTextStorage,
+        range: NSRange
+    ) -> Bool {
+        guard isValid(range, in: textStorage), range.length > 0 else {
+            return false
+        }
+        var found = false
+        textStorage.enumerateAttribute(
+            Attribute.widthAdaptiveTableRange,
+            in: range
+        ) { value, _, stop in
+            if value is NSValue {
+                found = true
+                stop.pointee = true
+            }
+        }
+        return found
+    }
+
     static func isBulletListMarker(
         in textStorage: NSTextStorage,
         at location: Int
@@ -499,6 +522,9 @@ enum MarkdownEngineCompatibility {
         )
         static let bulletListMarker = NSAttributedString.Key(
             "BulletListMarker"
+        )
+        static let widthAdaptiveTableRange = NSAttributedString.Key(
+            "ScrollableBlockFullRange"
         )
 
         // Project-owned metadata used to avoid reapplying Mermaid presentation.

@@ -397,7 +397,18 @@ final class RenderedContentResizeTests: XCTestCase {
             in: textView,
             at: tableAnchor
         ) {
-            $0.image !== initialTable.image
+            return $0.image !== initialTable.image
+                && $0.bounds.height > initialTable.bounds.height
+        }
+        try await harness.waitUntil {
+            guard
+                let currentOffset = anchor.currentViewportOffset(
+                    in: textView
+                )
+            else {
+                return false
+            }
+            return abs(currentOffset - anchor.viewportOffset) <= 1
         }
         try harness.endLiveResize(for: textView)
         liveResizeActive = false
