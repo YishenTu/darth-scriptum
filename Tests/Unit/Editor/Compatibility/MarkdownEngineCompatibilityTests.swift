@@ -118,6 +118,7 @@ final class MarkdownEngineCompatibilityTests: XCTestCase {
                     source: updated.text,
                     rendersMarkdown: true
                 ),
+                restoringSelection: textView.selectedRange(),
                 in: textView
             )
         )

@@ -1,7 +1,7 @@
 import Foundation
 
 struct DocumentMetrics: Sendable, Equatable {
-    private static let mermaidNeedle: [unichar] = Array("mermaid".utf16)
+    private static let mermaidNeedle = Array("mermaid".utf8)
     private static let editContextLength = mermaidNeedle.count
 
     let utf8ByteCount: Int
@@ -13,10 +13,12 @@ struct DocumentMetrics: Sendable, Equatable {
     }
 
     init(text: String) {
-        let source = text as NSString
-        utf8ByteCount = text.utf8.count
-        lineCount = Self.logicalLineBreakCount(in: source) + 1
-        mermaidCandidateCount = Self.mermaidCount(in: source)
+        let counts =
+            text.utf8.withContiguousStorageIfAvailable(Self.scan)
+            ?? Array(text.utf8).withUnsafeBufferPointer(Self.scan)
+        utf8ByteCount = counts.bytes
+        lineCount = counts.lineBreaks + 1
+        mermaidCandidateCount = counts.mermaid
     }
 
     func applying(_ edit: SourceEdit, to previous: String) -> DocumentMetrics {
@@ -50,6 +52,8 @@ struct DocumentMetrics: Sendable, Equatable {
             with: edit.replacement
         )
 
+        let oldMetrics = DocumentMetrics(text: oldContext as String)
+        let newMetrics = DocumentMetrics(text: newContext as String)
         let removed = source.substring(with: edit.range).utf8.count
         return DocumentMetrics(
             utf8ByteCount: max(
@@ -59,14 +63,14 @@ struct DocumentMetrics: Sendable, Equatable {
             lineCount: max(
                 1,
                 lineCount
-                    - Self.logicalLineBreakCount(in: oldContext)
-                    + Self.logicalLineBreakCount(in: newContext)
+                    - oldMetrics.lineCount
+                    + newMetrics.lineCount
             ),
             mermaidCandidateCount: max(
                 0,
                 mermaidCandidateCount
-                    - Self.mermaidCount(in: oldContext)
-                    + Self.mermaidCount(in: newContext)
+                    - oldMetrics.mermaidCandidateCount
+                    + newMetrics.mermaidCandidateCount
             )
         )
     }
@@ -81,51 +85,43 @@ struct DocumentMetrics: Sendable, Equatable {
         self.mermaidCandidateCount = mermaidCandidateCount
     }
 
-    private static func logicalLineBreakCount(in text: NSString) -> Int {
-        var count = 0
-        var index = 0
-        while index < text.length {
-            switch text.character(at: index) {
-            case 0x000D:
-                count += 1
-                if index + 1 < text.length,
-                    text.character(at: index + 1) == 0x000A
-                {
-                    index += 1
+    // UTF-8 preserves ASCII delimiters verbatim. Scan the native bytes once,
+    // including the two Unicode line separators, without bridging the document
+    // to NSString or sending an Objective-C message for each code unit.
+    private static func scan(
+        _ bytes: UnsafeBufferPointer<UInt8>
+    ) -> (bytes: Int, lineBreaks: Int, mermaid: Int) {
+        var lineBreaks = 0
+        var mermaid = 0
+        for index in bytes.indices {
+            let byte = bytes[index]
+            if byte == 0x0D {
+                lineBreaks += 1
+            } else if byte == 0x0A {
+                if index == 0 || bytes[index - 1] != 0x0D {
+                    lineBreaks += 1
                 }
-            case 0x000A, 0x2028, 0x2029:
-                count += 1
-            default:
-                break
+            } else if byte == 0xE2, index + 2 < bytes.count,
+                bytes[index + 1] == 0x80,
+                bytes[index + 2] == 0xA8 || bytes[index + 2] == 0xA9
+            {
+                lineBreaks += 1
             }
-            index += 1
-        }
-        return count
-    }
-
-    private static func mermaidCount(in text: NSString) -> Int {
-        guard text.length >= mermaidNeedle.count else { return 0 }
-        var count = 0
-        let lastStart = text.length - mermaidNeedle.count
-        for start in 0...lastStart {
-            var matches = true
-            for offset in mermaidNeedle.indices {
-                let character = text.character(at: start + offset)
-                let folded: unichar
-                if character >= 0x0041, character <= 0x005A {
-                    folded = character + 0x0020
-                } else {
-                    folded = character
+            if byte | 0x20 == mermaidNeedle[0],
+                bytes.count - index >= mermaidNeedle.count
+            {
+                var matches = true
+                for offset in 1..<mermaidNeedle.count {
+                    if bytes[index + offset] | 0x20 != mermaidNeedle[offset] {
+                        matches = false
+                        break
+                    }
                 }
-                if folded != mermaidNeedle[offset] {
-                    matches = false
-                    break
+                if matches {
+                    mermaid += 1
                 }
-            }
-            if matches {
-                count += 1
             }
         }
-        return count
+        return (bytes.count, lineBreaks, mermaid)
     }
 }

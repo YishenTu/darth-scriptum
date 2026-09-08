@@ -112,37 +112,32 @@ private struct CompleteSourceLineIndex: @unchecked Sendable {
             return reset(to: updated)
         }
 
-        let startContext = max(0, edit.range.location - 1)
-        var rescanStartIndex = lineIndex(containing: startContext)
-        if rescanStartIndex > 0 {
-            rescanStartIndex -= 1
+        // Only line breaks inside the edit and its immediate CRLF context can
+        // change. Starting at a line boundary would rescan an arbitrarily long
+        // unchanged line on every keystroke.
+        var rescanStart = max(0, edit.range.location - 1)
+        if rescanStart > 0,
+            previous.character(at: rescanStart) == 0x000A,
+            previous.character(at: rescanStart - 1) == 0x000D
+        {
+            rescanStart -= 1
         }
-        guard let rescanStart = value(at: rescanStartIndex) else {
-            return reset(to: updated)
+        var oldRescanEnd = min(previous.length, NSMaxRange(edit.range) + 1)
+        if oldRescanEnd < previous.length,
+            previous.character(at: oldRescanEnd - 1) == 0x000D,
+            previous.character(at: oldRescanEnd) == 0x000A
+        {
+            oldRescanEnd += 1
         }
-
-        let endContext = min(
-            previous.length,
-            NSMaxRange(edit.range) + 1
-        )
-        let firstStartAfterContext = upperBound(of: endContext)
-        let preservedSuffixIndex = min(
-            root?.entryCount ?? 0,
-            firstStartAfterContext + 1
-        )
-        let oldRescanEnd =
-            value(at: preservedSuffixIndex)
-            ?? previous.length
+        let preservedPrefixCount = upperBound(of: rescanStart)
+        let preservedSuffixIndex = upperBound(of: oldRescanEnd)
         let lengthDelta = updated.length - previous.length
-        let newRescanEnd = min(
-            updated.length,
-            max(rescanStart, oldRescanEnd + lengthDelta)
-        )
+        let newRescanEnd = oldRescanEnd + lengthDelta
 
-        let (prefix, remaining) = split(root, at: rescanStartIndex)
+        let (prefix, remaining) = split(root, at: preservedPrefixCount)
         let (_, unshiftedSuffix) = split(
             remaining,
-            at: preservedSuffixIndex - rescanStartIndex
+            at: preservedSuffixIndex - preservedPrefixCount
         )
         unshiftedSuffix?.applyShift(lengthDelta)
         guard
@@ -154,16 +149,9 @@ private struct CompleteSourceLineIndex: @unchecked Sendable {
         else {
             return false
         }
-        var rescanned: SourceLineIndexNode? = rescannedRoot
-        if let rescannedRoot = rescanned,
-            let unshiftedSuffix,
-            lastValue(in: rescannedRoot) == firstValue(in: unshiftedSuffix)
-        {
-            (rescanned, _) = split(
-                rescannedRoot,
-                at: rescannedRoot.entryCount - 1
-            )
-        }
+        // makeTree includes its starting offset; that synthetic entry already
+        // belongs to the preserved prefix or lies inside an existing line.
+        let (_, rescanned) = split(rescannedRoot, at: 1)
         root = merge(prefix, merge(rescanned, unshiftedSuffix))
         textLength = updated.length
         return storedEntryCount <= Self.maximumStoredLineStarts
@@ -266,22 +254,6 @@ private struct CompleteSourceLineIndex: @unchecked Sendable {
             in: node.right!,
             at: index - leftCount - node.blockCount
         )
-    }
-
-    private func firstValue(in node: SourceLineIndexNode) -> Int {
-        node.pushPendingShift()
-        guard let left = node.left else {
-            return node.value(at: 0)
-        }
-        return firstValue(in: left)
-    }
-
-    private func lastValue(in node: SourceLineIndexNode) -> Int {
-        node.pushPendingShift()
-        guard let right = node.right else {
-            return node.value(at: node.blockCount - 1)
-        }
-        return lastValue(in: right)
     }
 
     private mutating func split(

@@ -13,6 +13,54 @@ final class EditPipelinePerformanceAuditTests: XCTestCase {
         let capturedMutationP95BudgetMilliseconds: Double
     }
 
+    func testLongLineIndexEditsStayWithinIncrementalBudget() throws {
+        let source = String(repeating: "x", count: 1_024 * 1_024)
+        let updated = source + "y"
+        var index = SourceLineIndex(text: source)
+        let insertion = SourceEdit(
+            range: NSRange(location: source.utf16.count, length: 0),
+            replacement: "y",
+            expectedRevision: 0,
+            origin: .localEditor(paneID: UUID())
+        )
+        let removal = SourceEdit(
+            range: NSRange(location: source.utf16.count, length: 1),
+            replacement: "",
+            expectedRevision: 1,
+            origin: .undo
+        )
+        let samples = try measureSamples {
+            XCTAssertTrue(index.apply(insertion, previousText: source, updatedText: updated))
+            XCTAssertEqual(
+                index.position(atUTF16Location: updated.utf16.count, in: updated).column,
+                updated.utf16.count + 1)
+            XCTAssertTrue(index.apply(removal, previousText: updated, updatedText: source))
+        }
+        XCTAssertLessThanOrEqual(
+            report(name: "line-index-long-line-1mib", samples: samples),
+            1,
+            "Small edits must not rescan the surrounding long line."
+        )
+    }
+
+    func testFourMiBMetadataPreparationStaysWithinBudget() throws {
+        let line = "中文 😀 e\u{301} MeRmAiD\r\nparagraph\u{2028}next\u{2029}end\r"
+        let repetitions = 4 * 1_024 * 1_024 / line.utf8.count
+        let text = String(repeating: line, count: repetitions)
+        var metrics: DocumentMetrics?
+        let samples = try measureSamples {
+            metrics = DocumentMetrics(text: text)
+        }
+        XCTAssertEqual(metrics?.utf8ByteCount, text.utf8.count)
+        XCTAssertEqual(metrics?.lineCount, repetitions * 4 + 1)
+        XCTAssertEqual(metrics?.mermaidCandidateCount, repetitions)
+        XCTAssertLessThanOrEqual(
+            report(name: "metadata-unicode-4mib", samples: samples),
+            10,
+            "Metadata preparation must avoid per-code-unit Foundation dispatch."
+        )
+    }
+
     @MainActor
     func testPreparedFourMiBInstallationStaysWithinMainActorBudget() async throws {
         let source = source(byteCount: 4 * 1_024 * 1_024)
@@ -116,6 +164,7 @@ final class EditPipelinePerformanceAuditTests: XCTestCase {
         var insertionLocation = NSMaxRange(target)
         var samples: [Double] = []
         var originatingPaneSamples: [Double] = []
+        let secondaryUpdateVersion = workspace.secondaryPane.markdownEngineUpdateVersion
         for index in 0..<9 {
             let replacement = String(index)
             let expected = NSMutableString(string: buffer.revision.text)
@@ -143,6 +192,10 @@ final class EditPipelinePerformanceAuditTests: XCTestCase {
                     && textViews.allSatisfy { $0.string == expectedText }
             }
             samples.append(milliseconds(ContinuousClock.now - start))
+            XCTAssertEqual(
+                workspace.secondaryPane.markdownEngineUpdateVersion, secondaryUpdateVersion)
+            XCTAssertEqual(buffer.revision.number, UInt64(index + 1))
+            XCTAssertEqual(buffer.lastAppliedEdit?.range, insertionRange)
         }
 
         _ = report(
@@ -155,7 +208,7 @@ final class EditPipelinePerformanceAuditTests: XCTestCase {
         )
         XCTAssertLessThanOrEqual(
             p95,
-            1_000,
+            250,
             "The 128 KiB continuous-list workload must avoid full pane rebuilds."
         )
         window.contentView = nil
@@ -186,9 +239,14 @@ final class EditPipelinePerformanceAuditTests: XCTestCase {
             }
 
             XCTAssertEqual(resultLength, source.utf16.count + 1)
-            report(
+            let p95 = report(
                 name: "legacy-binding-\(workload.name)",
                 samples: samples
+            )
+            XCTAssertLessThanOrEqual(
+                p95,
+                workload.capturedMutationP95BudgetMilliseconds,
+                "Fallback reconciliation must scan unchanged spans in bulk."
             )
         }
     }
