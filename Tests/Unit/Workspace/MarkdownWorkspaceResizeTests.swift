@@ -5,7 +5,60 @@ import XCTest
 
 @MainActor
 final class MarkdownWorkspaceResizeTests: XCTestCase {
-    func testVisibleTableRewrapsDuringLiveResize() async throws {
+    func testTableWidthSettlesImmediatelyWhenLiveResizeEnds() async throws {
+        let source = """
+            Introductory paragraph.
+
+            | Position | Market view | Maximum loss at expiry | Upside at expiry |
+            |:--|:--|--:|:--|
+            | Long call | Bullish, with limited downside | Premium paid | Theoretically unlimited |
+            | Short call | Neutral or bearish | Theoretically unlimited | Premium received |
+            | Long put | Bearish or protective | Premium paid | Limited by zero underlying price |
+            | Short put | Neutral or bullish | Large but limited | Premium received |
+
+            Trailing paragraph.
+            """
+        let (harness, syncCoordinator, _) = makeHarness(source: source)
+        defer {
+            harness.close()
+            syncCoordinator.close()
+        }
+        let textView = try await harness.nativeTextView()
+        let location = (source as NSString).range(of: "| Position").location
+        await harness.resize(through: [1_600], display: true)
+        let initialWidth = try XCTUnwrap(textView.textContainer?.size.width)
+        let initialTable = try await harness.renderedBlock(
+            in: textView,
+            at: location
+        ) {
+            $0.bounds.width > 800 && $0.bounds.width < initialWidth
+        }
+        let naturalWidth = initialTable.bounds.width
+        let textStorage = try XCTUnwrap(textView.textStorage)
+        try harness.beginLiveResize(for: textView)
+
+        for windowWidth in [900.0, 820, 680, 740, 928, 1_120, 760] {
+            // Retain the same image while dragging, even when layout runs.
+            harness.resizeImmediately(to: windowWidth, display: true)
+            let table = try XCTUnwrap(
+                MarkdownEngineCompatibility.renderedBlock(
+                    in: textStorage,
+                    at: location
+                )
+            )
+            XCTAssertTrue(table.image === initialTable.image)
+            XCTAssertEqual(textView.string, source)
+        }
+        try harness.endLiveResize(for: textView)
+        let containerWidth = try XCTUnwrap(textView.textContainer?.size.width)
+        let settled = try XCTUnwrap(
+            MarkdownEngineCompatibility.renderedBlock(in: textStorage, at: location)
+        )
+        XCTAssertEqual(settled.bounds.width, min(naturalWidth, containerWidth), accuracy: 2)
+        XCTAssertEqual(textView.string, source)
+    }
+
+    func testVisibleTableRewrapsWhenLiveResizeEnds() async throws {
         let (harness, syncCoordinator, _) = makeHarness(
             source: Self.tableSource
         )
@@ -35,16 +88,12 @@ final class MarkdownWorkspaceResizeTests: XCTestCase {
         liveResizeActive = true
         await harness.resize(through: [820, 760])
 
-        let liveContainerWidth = try XCTUnwrap(
-            textView.textContainer?.containerSize.width
+        let liveBlock = try XCTUnwrap(
+            MarkdownEngineCompatibility.renderedBlock(
+                in: try XCTUnwrap(textView.textStorage), at: tableLocation
+            )
         )
-        _ = try await harness.renderedBlock(
-            in: textView,
-            at: tableLocation
-        ) {
-            $0.bounds.width <= liveContainerWidth + 0.5
-                && $0.bounds.width < initialBlock.bounds.width - 20
-        }
+        XCTAssertTrue(liveBlock.image === initialBlock.image)
 
         await harness.resize(through: [700, 680])
         try harness.endLiveResize(for: textView)
@@ -64,7 +113,7 @@ final class MarkdownWorkspaceResizeTests: XCTestCase {
         XCTAssertLessThan(finalBlock.bounds.width, initialBlock.bounds.width)
     }
 
-    func testOffscreenTableRewrapsDuringLiveResize() async throws {
+    func testOffscreenTableRewrapsWhenLiveResizeEnds() async throws {
         let source =
             Self.tableSource
             + "\n\n"
@@ -112,6 +161,9 @@ final class MarkdownWorkspaceResizeTests: XCTestCase {
         liveResizeActive = true
         await harness.resize(through: [820, 760, 700, 680])
 
+        try harness.endLiveResize(for: textView)
+        liveResizeActive = false
+
         let containerWidth = try XCTUnwrap(
             textView.textContainer?.containerSize.width
         )
@@ -130,9 +182,6 @@ final class MarkdownWorkspaceResizeTests: XCTestCase {
             currentBlock.bounds.width,
             initialBlock.bounds.width - 20
         )
-
-        try harness.endLiveResize(for: textView)
-        liveResizeActive = false
     }
 
     private func makeHarness(

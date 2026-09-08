@@ -393,6 +393,8 @@ final class RenderedContentResizeTests: XCTestCase {
         try harness.beginLiveResize(for: textView)
         liveResizeActive = true
         await harness.resize(through: [820, 760, 700, 680], display: true)
+        try harness.endLiveResize(for: textView)
+        liveResizeActive = false
         let reflowedTable = try await harness.renderedBlock(
             in: textView,
             at: tableAnchor
@@ -410,8 +412,6 @@ final class RenderedContentResizeTests: XCTestCase {
             }
             return abs(currentOffset - anchor.viewportOffset) <= 1
         }
-        try harness.endLiveResize(for: textView)
-        liveResizeActive = false
         await fulfillment(of: [fullRestyle], timeout: 0.3)
 
         XCTAssertLessThan(reflowedTable.bounds.width, initialTable.bounds.width)

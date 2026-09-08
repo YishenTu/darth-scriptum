@@ -13,10 +13,9 @@
     {
       "identity" : "swift-markdown-engine",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/nodes-app/swift-markdown-engine.git",
+      "location" : "https://github.com/YishenTu/swift-markdown-engine.git",
       "state" : {
-        "revision" : "e5f7607fc4021181056ef7a09dbb7573dc0237d9",
-        "version" : "0.12.0"
+        "revision" : "98dc290a7820ee044ad7f8312c7d9d439fc7eba2"
       }
     },
     {

@@ -43,6 +43,7 @@ enum MarkdownConfigurationFactory {
         )
         var configuration = MarkdownEditorConfiguration.default
         configuration.theme = theme
+        configuration.rendersTablesDuringLiveResize = false
         configuration.services = MarkdownEditorServices(
             images: imageProvider
                 ?? MarkdownImageProvider(
