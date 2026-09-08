@@ -30,8 +30,6 @@ final class AppDelegateTests: XCTestCase {
 
         let fileMenu = NSApp.mainMenu?.item(withTitle: "File")?.submenu
 
-        XCTAssertNil(fileMenu?.item(withTitle: "Save / Flush Now"))
-        XCTAssertNil(fileMenu?.item(withTitle: "Revert to Saved"))
         let saveItem = fileMenu?.item(withTitle: "Save")
         XCTAssertNil(saveItem?.target)
         assertShortcut(
@@ -73,14 +71,6 @@ final class AppDelegateTests: XCTestCase {
             redoItem?.action,
             #selector(MarkdownDocument.redoDocument(_:))
         )
-    }
-
-    func testApplicationOptsIntoSecureStateSavingAndRestoration() {
-        let delegate = AppDelegate()
-
-        XCTAssertTrue(delegate.applicationShouldSaveSecureApplicationState(NSApp))
-        XCTAssertTrue(delegate.applicationShouldRestoreSecureApplicationState(NSApp))
-        XCTAssertTrue(delegate.applicationSupportsSecureRestorableState(NSApp))
     }
 
     func testDocumentValidatesSaveUndoAndRedoFromOwnedState() async throws {

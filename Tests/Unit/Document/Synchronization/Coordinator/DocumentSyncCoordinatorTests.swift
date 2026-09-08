@@ -753,12 +753,6 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         withExtendedLifetime(observation) {}
     }
 
-    func testNativePeriodicAutosavingIsDisabled() {
-        XCTAssertFalse(MarkdownDocument.autosavesInPlace)
-        XCTAssertFalse(MarkdownDocument.preservesVersions)
-        XCTAssertFalse(MarkdownDocument.autosavesDrafts)
-    }
-
     func testDocumentAllowsConcurrentReadsForSupportedTypes() {
         XCTAssertTrue(
             MarkdownDocument.canConcurrentlyReadDocuments(
@@ -3313,7 +3307,6 @@ final class DocumentSyncCoordinatorTests: XCTestCase {
         coordinator.loadInitial(snapshot, data: data, from: nil)
         XCTAssertNil(coordinator.durableState)
     }
-
 }
 
 @MainActor

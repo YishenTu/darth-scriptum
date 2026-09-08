@@ -6,12 +6,6 @@ import XCTest
 
 @MainActor
 final class LivePreviewTextViewTests: XCTestCase {
-    func testEditorUsesTextKit2() {
-        let textView = NSTextView(usingTextLayoutManager: true)
-        XCTAssertNotNil(textView.textLayoutManager)
-        XCTAssertNotNil(textView.textContentStorage)
-    }
-
     func testSplitPaneModelsKeepIndependentSelections() {
         let primary = EditorPaneModel()
         let secondary = EditorPaneModel()

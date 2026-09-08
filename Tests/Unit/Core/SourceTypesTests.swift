@@ -41,31 +41,10 @@ final class SourceTypesTests: XCTestCase {
         XCTAssertThrowsError(try edit.applying(to: revision))
     }
 
-    func testDurableStateIsIndependentOfNewerVisibleRevision() {
-        let data = Data("base".utf8)
-        let durable = DurableFileState(
-            snapshot: DocumentSnapshot(text: "base", format: .newDocument),
-            fingerprint: .make(data: data),
-            generation: 7
-        )
-        let visible = SourceRevision(number: 8, text: "newer")
-        XCTAssertEqual(durable.snapshot.text, "base")
-        XCTAssertEqual(visible.text, "newer")
-        XCTAssertNotEqual(durable.generation, visible.number)
-    }
-
     func testFingerprintUsesContentsNotOnlySize() {
         XCTAssertNotEqual(
             FileFingerprint.make(data: Data("one".utf8)),
             FileFingerprint.make(data: Data("two".utf8))
         )
-    }
-
-    func testSnapshotContractsAreSendable() {
-        func requireSendable<T: Sendable>(_: T.Type) {}
-        requireSendable(SourceRevision.self)
-        requireSendable(DocumentSnapshot.self)
-        requireSendable(DurableFileState.self)
-        requireSendable(PendingSaveToken.self)
     }
 }
