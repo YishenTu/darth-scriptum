@@ -1,21 +1,6 @@
-# Core boundary
+# Source contracts
 
-## Ownership
-
-- Own canonical source values, revisions, edits, formats, identities, fingerprints, history, line indexing, and `MarkdownSourceBuffer`.
-- Keep `MarkdownSourceBuffer` as the sole in-memory source and revision authority for a document.
-
-## Dependencies and boundary
-
-- Depend only on dependency-light system frameworks such as Foundation, Combine, and CryptoKit.
-- Do not import UI, WebKit, or MarkdownEngine frameworks, perform file I/O, or reference App, Workspace, Document-host, or Editor types.
-- Expose values and algorithms without acquiring lifecycle, persistence, presentation, or feature policy.
-
-## State and invariants
-
-- All source mutations pass through `MarkdownSourceBuffer`; non-owners may observe it or request edits but must not maintain another mutable source revision.
-- Preserve expected-revision validation, monotonic revision history, change-origin semantics, and deterministic source transformations.
-
-## Verification
-
-- Verify Core changes in the matching `Tests/Unit/Core/` files and run the architecture guard.
+- Keep source operations free of file I/O and document lifecycle or presentation policy.
+- Edit/selection offsets use UTF-16 (`NSRange`/`NSString`), not Swift character counts. Reject stale expected revisions and ranges splitting surrogate pairs; cover non-BMP and combining-character cases when changing range transforms.
+- Undo/redo share one history across panes. Preserve change origins and external-replacement history invalidation so synchronization and native dirty-state adaptation distinguish local edits, undo/redo, and reloads.
+- Prepared metrics/indexes must describe the exact revision being installed. Preserve stale-result rejection and deferred indexing for large documents instead of adding unconditional whole-document scans on the main actor.

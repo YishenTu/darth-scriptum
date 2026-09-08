@@ -5,29 +5,21 @@ import XCTest
 
 @MainActor
 final class AppThemeTests: XCTestCase {
-    func testWarmColorTokensAdaptBetweenAquaAndDarkAqua() throws {
+    func testColorTokensWhenAppearanceChangesResolveDistinctColors() throws {
         let aqua = try XCTUnwrap(NSAppearance(named: .aqua))
         let darkAqua = try XCTUnwrap(NSAppearance(named: .darkAqua))
-        let lightBackground = AppTheme.background.hexRGB(in: aqua)
-        let darkBackground = AppTheme.background.hexRGB(in: darkAqua)
-
-        XCTAssertEqual(lightBackground, 0xF7F1E8)
-        XCTAssertEqual(darkBackground, 0x1A1614)
-        XCTAssertNotEqual(lightBackground, darkBackground)
-        XCTAssertLessThan(AppTheme.backgroundOverlayOpacity, 0.7)
-        XCTAssertGreaterThan(AppTheme.backgroundOverlayOpacity, 0)
-        XCTAssertLessThan(AppTheme.statusBarOverlayOpacity, 0.78)
-        XCTAssertGreaterThan(AppTheme.statusBarOverlayOpacity, 0)
-        XCTAssertEqual(AppTheme.foreground.hexRGB(in: darkAqua), 0xE8D5B7)
-        XCTAssertEqual(AppTheme.accent.hexRGB(in: darkAqua), 0xC4956A)
-        XCTAssertEqual(
-            AppTheme.selectionBackground.hexRGB(in: darkAqua),
-            0x4A3A2A
-        )
-        XCTAssertNotEqual(
-            AppTheme.codeBackground.hexRGB(in: aqua),
-            AppTheme.codeBackground.hexRGB(in: darkAqua)
-        )
+        for color in [
+            AppTheme.background,
+            AppTheme.foreground,
+            AppTheme.accent,
+            AppTheme.selectionBackground,
+            AppTheme.codeBackground,
+        ] {
+            XCTAssertNotEqual(
+                try XCTUnwrap(color.hexRGB(in: aqua)),
+                try XCTUnwrap(color.hexRGB(in: darkAqua))
+            )
+        }
     }
 
     func testMaterialTracksWindowActivityAndReduceTransparencyFallback() {
@@ -55,12 +47,18 @@ final class AppThemeTests: XCTestCase {
         view.appearance = aqua
         view.refresh()
 
-        XCTAssertEqual(view.opaqueFallbackHexRGB(in: aqua), 0xF7F1E8)
+        XCTAssertEqual(
+            view.opaqueFallbackHexRGB(in: aqua),
+            try XCTUnwrap(AppTheme.background.hexRGB(in: aqua))
+        )
 
         view.appearance = darkAqua
 
         XCTAssertTrue(view.usesOpaqueFallback)
-        XCTAssertEqual(view.opaqueFallbackHexRGB(in: darkAqua), 0x1A1614)
+        XCTAssertEqual(
+            view.opaqueFallbackHexRGB(in: darkAqua),
+            try XCTUnwrap(AppTheme.background.hexRGB(in: darkAqua))
+        )
     }
 
     func testFontSizeIsClamped() {

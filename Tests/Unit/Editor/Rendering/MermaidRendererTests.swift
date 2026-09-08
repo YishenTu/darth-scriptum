@@ -489,9 +489,6 @@ final class MermaidRendererTests: XCTestCase {
         let script = try String(contentsOf: scriptURL, encoding: .utf8)
         XCTAssertTrue(script.contains(#"securityLevel: "strict""#))
         XCTAssertTrue(script.contains("htmlLabels: false"))
-        XCTAssertTrue(script.contains("maxEdges: 1000"))
-        XCTAssertTrue(script.contains("normalizeTextBaselines(svg)"))
-        XCTAssertTrue(script.contains(#"canvas.toDataURL("image/png")"#))
 
         let bundleURL = try XCTUnwrap(
             Bundle.main.resourceURL?

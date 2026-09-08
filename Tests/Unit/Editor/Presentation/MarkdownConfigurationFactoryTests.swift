@@ -5,17 +5,6 @@ import XCTest
 
 @MainActor
 final class MarkdownConfigurationFactoryTests: XCTestCase {
-    func testEditorUsesComfortableSymmetricContentInsets() {
-        let configuration = MarkdownConfigurationFactory.make(
-            rawSourceMode: false,
-            fontSize: 14,
-            documentURL: nil
-        )
-
-        XCTAssertEqual(configuration.textInsets.horizontal, 48)
-        XCTAssertEqual(configuration.textInsets.vertical, 28)
-    }
-
     func testConfiguredSyntaxHighlighterHighlightsPythonCode() throws {
         let configuration = MarkdownConfigurationFactory.make(
             rawSourceMode: false,
@@ -61,8 +50,14 @@ final class MarkdownConfigurationFactoryTests: XCTestCase {
         let lightBackground = highlighter.backgroundColor().hexRGB(in: aqua)
         let darkBackground = highlighter.backgroundColor().hexRGB(in: darkAqua)
 
-        XCTAssertEqual(lightBackground, 0xEFE5D8)
-        XCTAssertEqual(darkBackground, 0x2A221E)
+        XCTAssertEqual(
+            lightBackground,
+            try XCTUnwrap(AppTheme.codeBackground.hexRGB(in: aqua))
+        )
+        XCTAssertEqual(
+            darkBackground,
+            try XCTUnwrap(AppTheme.codeBackground.hexRGB(in: darkAqua))
+        )
         XCTAssertNotEqual(lightBackground, darkBackground)
     }
 

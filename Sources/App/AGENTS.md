@@ -1,21 +1,5 @@
-# App boundary
+# Native document lifecycle
 
-## Ownership
-
-- Own application lifecycle, menus, `NSDocument` host integration, window construction, AppKit callback adaptation, and concrete dependency wiring.
-- Treat `MarkdownDocument` as a native lifecycle adapter around document-owned source, persistence, recovery, and synchronization contracts; it is not the synchronization policy owner.
-
-## Dependencies and boundary
-
-- As the composition root, App may reference every runtime domain to construct and connect concrete dependencies.
-- Translate native events into document or workspace contract calls. Do not move synchronization, persistence, workspace, editor, or renderer policy into this layer.
-- Lower domains must not reference App types except for the isolated `MarkdownWindowController` to `MarkdownDocument` integration permitted by the root architecture rules.
-
-## State and invariants
-
-- Retain native close and quit callbacks until the owning document lifecycle reaches a decision.
-- Translate callbacks to full reducer tokens, preserve every refusal or cancellation, reject stale completions, and complete each callback exactly once.
-
-## Verification
-
-- Verify app behavior in `Tests/Unit/App/` and close or quit behavior in `Tests/E2E/`.
+- `NSDocumentController` may construct/read `MarkdownDocument` on its opening queue. Preserve the inherited Objective-C initializer and staged `DocumentInitialContentStore` handoff; a main-actor initializer or coordinator access from `read(from:ofType:)` breaks concurrent opening. Install live state on the main actor. Cover changes with `CrossBoundaryRegressionTests`.
+- Keep native autosave-in-place, drafts, and versions disabled while Document owns synchronization/recovery. Managed in-place writes require a matching `SaveTransactionBridge` request and run off-main through the document's file-access lane; preserve `unblockUserInteraction()` before the blocking commit.
+- Retain close/quit callbacks until Document decides; preserve refusal/cancellation, reject stale tokens, and complete callbacks exactly once. A positive `canClose` answer can reenter `close()` immediately: retain the authorized token before forwarding the answer and publish commitment only after native close. Cover changes with `DocumentCloseCharacterizationTests`.

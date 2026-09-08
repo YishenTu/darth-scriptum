@@ -1,25 +1,8 @@
-# Editor boundary
+# Editing and rendering constraints
 
-## Ownership
-
-- Own native presentation, editor composition, `EditorPaneModel` presentation state, MarkdownEngine adaptation, rendering, and local WebKit lifecycle.
-- Own native-view observations and disposable rendering state, but not document source, synchronization state, or workspace navigation state.
-
-## Dependencies and boundary
-
-- Depend on Core source contracts, DesignSystem primitives, bundled Resources, and renderer frameworks through Editor-owned adapters.
-- Do not implement persistence, recovery, or file synchronization or reference their concrete types.
-- Keep native text-view traversal and raw MarkdownEngine internal-key assumptions isolated in `Compatibility/MarkdownEngineCompatibility.swift`.
-- Treat document and renderer input as untrusted: preserve vendored-local resources, exact file read roots, deny-by-default CSP, non-persistent storage, denied navigation, windows, and network, and bounded teardown.
-
-## State and invariants
-
-- Submit edits through `MarkdownSourceBuffer` and rebuild presentation from its owned revision; never keep an independently mutable document source.
-- Keep native text-view undo disabled; document undo and redo belong exclusively to `MarkdownSourceBuffer`.
-- Mirror source-authorized peer edits through the compatibility adapter only when the prior native presentation and exact transition are proven. Display transformations, smart-input-sensitive edits, and ambiguous state must fall back to a full binding rebuild, and mirroring must never publish another source mutation.
-- Keep native selection and viewport state synchronized through `EditorPaneModel`; Workspace may capture or restore that model through its exposed state but must not create a second pane-state authority.
-- Tear down observations, tasks, renderer sessions, caches, and WebKit state within their owning editor lifecycle.
-
-## Verification
-
-- Mirror each compatibility, composition, presentation, rendering, or web change in the matching `Tests/Unit/Editor/` boundary.
+- Keep native text-view traversal in the compatibility adapter and raw MarkdownEngine attribute-key assumptions in `Compatibility/MarkdownEngineCompatibility.swift`. Engine upgrades require compatibility tests and affected rendering checks; compilation does not establish compatibility with internals.
+- Keep native text-view undo disabled; route undo/redo to the source buffer's history.
+- Mirror source-authorized peer edits only when prior native presentation and the exact transition are proven. Display transformations, smart-input-sensitive edits, and ambiguous state require a full binding rebuild. Mirroring must never publish another source mutation.
+- Preserve selection/viewport through `EditorPaneModel` when rebuilding native views. Tear down view-owned observations/tasks without disposing rendering services still shared by another pane.
+- WebKit rendering uses vendored resources, an exact canonical bundle read root, deny-by-default CSP, non-persistent storage, and bounded teardown. Permit only the entry/blank navigation allowed by `LocalWebResourcePolicy`; deny other navigation, new windows, and network access.
+- Image loading/watching must use the same authorized file request. Preserve descriptor-based containment, symlink-race protection, load/cache bounds, and rejection of completions from obsolete roots or disposed providers. A URL-prefix check alone is insufficient file authority.

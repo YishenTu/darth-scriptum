@@ -1,23 +1,7 @@
-# Document boundary
+# Synchronization and durability
 
-## Ownership
-
-- Own file authority, codecs, monitoring, merge, durability, recovery, and synchronization state.
-- Keep `DocumentSyncReducer` as the sole synchronization policy and transition owner. The coordinator owns serialized event application; effect executors perform requested work without selecting policy.
-
-## Dependencies and boundary
-
-- Depend on Core source values and system I/O or concurrency frameworks.
-- Expose source, status, lifecycle, and effect contracts without leaking concrete persistence or recovery implementations into UI domains.
-- Do not import AppKit, SwiftUI, WebKit, or MarkdownEngine or reference App, Workspace, or Editor host types.
-- Route every blocking document or recovery operation through `DocumentFileAccess`; never block the main actor or a Swift cooperative executor with file I/O.
-
-## State and invariants
-
-- Keep coordinator event application serialized and effect requests complete and immutable, with full tokens echoed on completion and stale tokens rejected.
-- Treat attachment identity, durable baselines, commit generations, recovery records, cleanup receipts, and raw evidence as document-owned state.
-- Fail closed when attachment, baseline, commit, recovery generation, record ownership, or cleanup safety is unproven; preserve raw evidence and durable-before-memory ordering.
-
-## Verification
-
-- Mirror changes under `Tests/Unit/Document/` and cover cross-layer lifecycle behavior in `Tests/E2E/`.
+- Apply coordinator events serially. Executors perform immutable requests without selecting synchronization policy. Echo complete effect tokens and reject stale revisions, attachment epochs, or attempts before changing state.
+- Run blocking document work through its injected `DocumentFileAccessLane`; recovery stores share the `DocumentFileAccess.recovery` FIFO lane. Do not serialize unrelated documents through recovery or move blocking I/O into `Task`/`Task.detached`. Synchronous access exists for AppKit worker callbacks, never the main thread or a Swift cooperative executor.
+- Durable baselines, attachment identity, commit generations, recovery records, and cleanup receipts are evidence, not values to reconstruct from current editor text. Preserve codec/commit contracts tying snapshots and fingerprints to the same bytes and target.
+- Commit durable evidence before publishing in-memory success. Fail closed when attachment, baseline, commit, recovery generation, record ownership, or cleanup safety is unproven; retain raw evidence.
+- Recovery schema/journal changes must survive restart and interrupted deletion/migration. Preserve unknown future schemas, malformed records, and incomplete raw payload/metadata pairs instead of silently skipping/deleting them. Exercise disk interruption hooks and reopen the store in durability tests.

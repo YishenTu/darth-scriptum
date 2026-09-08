@@ -1,22 +1,10 @@
-# Test boundary
+# Test execution constraints
 
-## Ownership
-
-- Mirror production ownership under `Unit`, place cross-boundary behavior under `E2E`, and keep architecture and performance coverage in their dedicated suites.
-- Keep fixtures and test support owned by the narrowest suite that exercises their contract.
-
-## Dependencies and boundary
-
-- Test through the owning domain's public or internal test surface; do not make production ownership ambiguous solely to simplify a test.
-- Do not use external network services. An isolated loopback listener is allowed only to prove that hostile renderer content makes zero requests.
-- Create unique temporary directories and stores, clean them up, and never read, write, migrate, or delete real user documents or recovery data.
-
-## State and invariants
-
-- Prefer `ManualSyncScheduler`, injected executors, hooks, continuations, and explicit terminal-state waits over wall-clock sleeps or timing assumptions.
-- Keep fixtures deterministic and repository-local, and assert durable ordering, token rejection, fail-closed behavior, and exactly-once completion where those contracts apply.
-- Add or update architecture fixtures when introducing or tightening a dependency, ownership, or scoped-instruction rule.
-
-## Verification
-
-- Run the narrowest owning suite. Run `Tests/Architecture/run-tests.sh` for architecture-guard or scoped-instruction changes.
+- Do not test statically defined values whose correctness is already established by their source or type declaration. Test the observable behavior that consumes them only when that behavior has meaningful regression risk.
+- When logic is deleted, do not add negative tests that merely prove the removed path no longer exists. Cover only the observable replacement behavior or contract that could realistically regress.
+- Unit, E2E, and Performance compile into separate targets. Keep support in the narrowest owning suite; Unit helpers are not automatically available to E2E or Performance. Keep fixtures deterministic and repository-local.
+- Do not use external network services. Isolated loopback listeners are allowed only to prove hostile renderer content makes zero requests.
+- Inject unique temporary document directories/recovery stores and clean them up. Never access real user documents in tests or mutate/clean up the production shared recovery store.
+- Drive races with `ManualSyncScheduler`, injected executors, hooks, continuations, or terminal-state waits. Assert the intended interleaving and outcome instead of relying on elapsed sleeps.
+- Performance selectors use `DarthScriptumPerformanceTests/<Class>[/<Method>]` and run in `Benchmark`, not Debug. Use `./scripts/perf-audit.sh` for the edit-pipeline audit; ordinary `--all` runs exclude performance.
+- Add architecture fixtures when changing enforced dependency/scope rules. `Tests/Architecture/run-tests.sh` also checks Xcode suite ownership, schemes, and test routing with a stubbed `xcodebuild`; it does not compile the app.

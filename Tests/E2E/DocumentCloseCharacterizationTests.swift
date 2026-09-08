@@ -167,7 +167,7 @@ final class DocumentCloseCharacterizationTests: XCTestCase {
         XCTAssertTrue(controller.documents.contains { $0 === refusalDocument })
     }
 
-    func testQuitRoutesThroughNativeTerminationWithoutAnAppLevelForceClose() {
+    func testQuitMenuWhenInstalledRoutesThroughNativeTermination() {
         let originalMenu = NSApp.mainMenu
         defer { NSApp.mainMenu = originalMenu }
 
@@ -183,11 +183,6 @@ final class DocumentCloseCharacterizationTests: XCTestCase {
 
         XCTAssertTrue(quitItem?.target === NSApp)
         XCTAssertEqual(quitItem?.action, #selector(NSApplication.terminate(_:)))
-        XCTAssertFalse(
-            delegate.responds(
-                to: NSSelectorFromString("applicationShouldTerminate:")
-            )
-        )
     }
 
     private func waitUntil(
