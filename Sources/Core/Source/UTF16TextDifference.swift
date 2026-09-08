@@ -8,28 +8,25 @@ struct UTF16TextDifference: Sendable, Equatable {
         original: NSString,
         updated: NSString
     ) -> UTF16TextDifference {
-        var prefix = 0
         let sharedLength = min(original.length, updated.length)
-        while prefix < sharedLength,
-            original.character(at: prefix)
-                == updated.character(at: prefix)
-        {
-            prefix += 1
-        }
+        var prefix = matchingLength(
+            original: original,
+            updated: updated,
+            limit: sharedLength,
+            backwards: false
+        )
         if splitsSurrogatePair(at: prefix, in: original)
             || splitsSurrogatePair(at: prefix, in: updated)
         {
             prefix -= 1
         }
 
-        var suffix = 0
-        while suffix < original.length - prefix,
-            suffix < updated.length - prefix,
-            original.character(at: original.length - suffix - 1)
-                == updated.character(at: updated.length - suffix - 1)
-        {
-            suffix += 1
-        }
+        var suffix = matchingLength(
+            original: original,
+            updated: updated,
+            limit: sharedLength - prefix,
+            backwards: true
+        )
         if splitsSurrogatePair(
             at: original.length - suffix,
             in: original
@@ -52,6 +49,49 @@ struct UTF16TextDifference: Sendable, Equatable {
                 length: updated.length - prefix - suffix
             )
         )
+    }
+
+    private static func matchingLength(
+        original: NSString,
+        updated: NSString,
+        limit: Int,
+        backwards: Bool
+    ) -> Int {
+        guard limit > 0 else { return 0 }
+        let capacity = 1_024
+        // Bound scratch space independently of document size. Bulk extraction
+        // avoids millions of character(at:) dispatches for unchanged spans.
+        return withUnsafeTemporaryAllocation(of: unichar.self, capacity: capacity * 2) { buffer in
+            let oldUnits = buffer.baseAddress!
+            let newUnits = oldUnits + capacity
+            var matched = 0
+            while matched < limit {
+                let count = min(capacity, limit - matched)
+                original.getCharacters(
+                    oldUnits,
+                    range: NSRange(
+                        location: backwards ? original.length - matched - count : matched,
+                        length: count
+                    ))
+                updated.getCharacters(
+                    newUnits,
+                    range: NSRange(
+                        location: backwards ? updated.length - matched - count : matched,
+                        length: count
+                    ))
+                if memcmp(oldUnits, newUnits, count * MemoryLayout<unichar>.stride) == 0 {
+                    matched += count
+                    continue
+                }
+                for offset in 0..<count {
+                    let index = backwards ? count - offset - 1 : offset
+                    if oldUnits[index] != newUnits[index] {
+                        return matched + offset
+                    }
+                }
+            }
+            return matched
+        }
     }
 
     static func splitsSurrogatePair(

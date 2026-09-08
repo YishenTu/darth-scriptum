@@ -357,7 +357,7 @@ enum MarkdownEditorTextAdapter {
 
         let presented = presentedSource as NSString
         let edited = editorText as NSString
-        let difference = UTF16TextDifference.between(
+        let difference = differenceForNewlineNormalization(
             original: presented,
             updated: edited
         )
@@ -426,15 +426,29 @@ enum MarkdownEditorTextAdapter {
             return nil
         }
 
+        // TextKit can coalesce character and styling changes into a wider
+        // edited range. Trim only that bounded window so a single keystroke
+        // remains an incremental source edit and leaves neighboring newlines
+        // untouched by normalization.
+        let source = currentRevision.text as NSString
+        let capturedSourceRange = NSRange(
+            location: sourceRange.location + capturedMutation.range.location,
+            length: capturedMutation.range.length
+        )
+        let replacement = capturedMutation.replacement as NSString
+        let difference = differenceForNewlineNormalization(
+            original: source.substring(with: capturedSourceRange) as NSString,
+            updated: replacement
+        )
         let normalizedReplacement = normalizeNewlines(
-            capturedMutation.replacement,
+            replacement.substring(with: difference.updatedRange),
             to: newlineStyle
         )
         return SourceEdit(
             range: NSRange(
-                location: sourceRange.location
-                    + capturedMutation.range.location,
-                length: capturedMutation.range.length
+                location: capturedSourceRange.location
+                    + difference.originalRange.location,
+                length: difference.originalRange.length
             ),
             replacement: terminatingFrontMatterNewlineIfNeeded(
                 normalizedReplacement,
@@ -501,6 +515,36 @@ enum MarkdownEditorTextAdapter {
             || character == 0x0D
             || character == 0x2028
             || character == 0x2029
+    }
+
+    private static func differenceForNewlineNormalization(
+        original: NSString,
+        updated: NSString
+    ) -> UTF16TextDifference {
+        let difference = UTF16TextDifference.between(original: original, updated: updated)
+        var start = difference.originalRange.location
+        var originalEnd = NSMaxRange(difference.originalRange)
+        var updatedEnd = NSMaxRange(difference.updatedRange)
+        // A common prefix/suffix can end between CR and LF. Normalize the
+        // entire pair so retaining its other half cannot duplicate a newline
+        // or turn a CRLF into a lone CR/LF. Both binding paths share this rule.
+        if splitsCRLF(at: start, in: original) || splitsCRLF(at: start, in: updated) {
+            start -= 1
+        }
+        if splitsCRLF(at: originalEnd, in: original) || splitsCRLF(at: updatedEnd, in: updated) {
+            originalEnd += 1
+            updatedEnd += 1
+        }
+        return UTF16TextDifference(
+            originalRange: NSRange(location: start, length: originalEnd - start),
+            updatedRange: NSRange(location: start, length: updatedEnd - start)
+        )
+    }
+
+    private static func splitsCRLF(at location: Int, in text: NSString) -> Bool {
+        location > 0 && location < text.length
+            && text.character(at: location - 1) == 0x0D
+            && text.character(at: location) == 0x0A
     }
 
     private static func normalizeNewlines(

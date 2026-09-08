@@ -55,6 +55,75 @@ final class LivePreviewTextViewTests: XCTestCase {
         XCTAssertEqual(try edit.applying(to: revision).text, "alpha\nxomega")
     }
 
+    func testEditorTextAdapterTrimsRestyledContextFromCapturedMutation() throws {
+        let source = "---\ntitle: Test\n---\n\nalpha **fast** 😀 e\u{301}\r\nomega"
+        let revision = SourceRevision(number: 7, text: source)
+        let presentation = MarkdownSourcePresentation.make(source: source, rendersMarkdown: true)
+        let original = presentation.text as NSString
+        let location = NSMaxRange(original.range(of: "fast"))
+        let updated = original.replacingCharacters(
+            in: NSRange(location: location, length: 0), with: "x")
+        let edit = try XCTUnwrap(
+            MarkdownEditorTextAdapter.sourceEdit(
+                editorText: updated,
+                capturedMutation: EditorBindingMutation(
+                    range: NSRange(location: 0, length: original.length),
+                    replacement: updated,
+                    sourceRevisionNumber: revision.number,
+                    presentedSourceRange: presentation.sourceRange,
+                    originalPresentedLength: original.length,
+                    updatedPresentedLength: original.length + 1
+                ),
+                currentRevision: revision,
+                newlineStyle: .lf,
+                origin: .localEditor(paneID: UUID()),
+                presentedSourceRange: presentation.sourceRange
+            ))
+
+        XCTAssertEqual(
+            edit.range, NSRange(location: presentation.sourceRange.location + location, length: 0))
+        XCTAssertEqual(edit.replacement, "x")
+        XCTAssertEqual(
+            try edit.applying(to: revision).text,
+            (source as NSString).replacingCharacters(
+                in: NSRange(location: presentation.sourceRange.location + location, length: 0),
+                with: "x"))
+    }
+
+    func testEditorTextAdapterKeepsCRLFPairsIntactWhenTrimmingReplacements() throws {
+        let changes: [(String, String, NewlineStyle, String)] = [
+            ("\n", "\r\n", .lf, "\n"),
+            ("\r\n", "\n", .crlf, "\r\n"),
+            ("\r", "\r\n", .crlf, "\r\n"),
+            ("\r\n", "\r", .lf, "\n"),
+            ("\rX\n", "\r\n", .lf, "\n"),
+        ]
+        for (old, replacement, style, expected) in changes {
+            let source = "a" + old + "b"
+            let edited = "a" + replacement + "b"
+            let revision = SourceRevision(number: 7, text: source)
+            for usesCapture in [false, true] {
+                let mutation = EditorBindingMutation(
+                    range: NSRange(location: 1, length: old.utf16.count),
+                    replacement: replacement,
+                    sourceRevisionNumber: revision.number,
+                    presentedSourceRange: NSRange(location: 0, length: source.utf16.count),
+                    originalPresentedLength: source.utf16.count,
+                    updatedPresentedLength: edited.utf16.count
+                )
+                let edit = try XCTUnwrap(
+                    MarkdownEditorTextAdapter.sourceEdit(
+                        editorText: edited,
+                        capturedMutation: usesCapture ? mutation : nil,
+                        currentRevision: revision,
+                        newlineStyle: style,
+                        origin: .localEditor(paneID: UUID())
+                    ))
+                XCTAssertEqual(try edit.applying(to: revision).text, "a" + expected + "b")
+            }
+        }
+    }
+
     func testEditorTextAdapterFallsBackForStaleCapturedMutation() throws {
         let source = "alpha\nomega"
         let revision = SourceRevision(number: 7, text: source)
@@ -544,6 +613,63 @@ final class LivePreviewTextViewTests: XCTestCase {
         )
         XCTAssertEqual(secondaryTextView.selectedRange().location, 15)
         _ = window
+    }
+
+    func testSplitPaneNativeTypingPreservesUnfocusedSyntaxAndSelection() async throws {
+        let source = "# Heading\n\nalpha **fast** omega"
+        let caretInBody = NSMaxRange((source as NSString).range(of: "fast"))
+        for initialSelection in [0, caretInBody] {
+            let buffer = MarkdownSourceBuffer(
+                snapshot: DocumentSnapshot(text: source, format: .newDocument))
+            let primaryPane = EditorPaneModel()
+            let secondaryPane = EditorPaneModel()
+            secondaryPane.selectedRange = NSRange(location: initialSelection, length: 0)
+            let hostingView = NSHostingView(
+                rootView: HStack {
+                    LivePreviewTextView(
+                        sourceBuffer: buffer, pane: primaryPane,
+                        sourceMode: false, fontSize: 14, newlineStyle: .lf)
+                    LivePreviewTextView(
+                        sourceBuffer: buffer, pane: secondaryPane,
+                        sourceMode: false, fontSize: 14, newlineStyle: .lf)
+                }.frame(width: 800, height: 400))
+            hostingView.frame = NSRect(x: 0, y: 0, width: 800, height: 400)
+            let window = NSWindow(
+                contentRect: hostingView.frame, styleMask: [.borderless],
+                backing: .buffered, defer: false)
+            window.contentView = hostingView
+            window.layoutIfNeeded()
+            defer { window.contentView = nil }
+            try await waitUntil {
+                let views = MarkdownEngineCompatibility.nativeTextViews(in: hostingView)
+                return views.count == 2
+                    && views.allSatisfy { $0.identifier != nil && $0.string == source }
+            }
+            let textViews = MarkdownEngineCompatibility.nativeTextViews(in: hostingView)
+            let primary = try XCTUnwrap(
+                textViews.first {
+                    $0.identifier?.rawValue
+                        == "DarthScriptum.MarkdownEditor.\(primaryPane.id.uuidString)"
+                })
+            let secondary = try XCTUnwrap(textViews.first { $0 !== primary })
+            let location = NSMaxRange((source as NSString).range(of: "fast"))
+            let insertion = NSRange(location: location, length: 0)
+            primary.setSelectedRange(insertion)
+            primary.insertText("x", replacementRange: insertion)
+            let expected = (source as NSString).replacingCharacters(in: insertion, with: "x")
+            try await waitUntil {
+                buffer.revision.text == expected && secondary.string == expected
+            }
+            let storage = try XCTUnwrap(secondary.textStorage)
+            XCTAssertTrue(isSyntaxHidden(in: storage, at: 0))
+            let expectedSelection = NSRange(
+                location: initialSelection == 0 ? 0 : initialSelection + 1, length: 0)
+            XCTAssertEqual(secondary.selectedRange(), expectedSelection)
+            XCTAssertEqual(secondaryPane.selectedRange, expectedSelection)
+            XCTAssertTrue(secondary.isEditable)
+            XCTAssertTrue(
+                isSyntaxHidden(in: storage, at: (source as NSString).range(of: "**").location))
+        }
     }
 
     func testSplitPaneAppliesPlainSharedSourceEditBeforeSwiftUIRebuild()

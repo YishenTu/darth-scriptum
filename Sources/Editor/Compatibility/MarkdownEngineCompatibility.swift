@@ -61,6 +61,7 @@ enum MarkdownEngineCompatibility {
         _ edit: SourceEdit,
         from previousPresentation: MarkdownSourcePresentation,
         to updatedPresentation: MarkdownSourcePresentation,
+        restoringSelection selectedRange: NSRange,
         in textView: NSTextView
     ) -> Bool {
         guard
@@ -118,6 +119,12 @@ enum MarkdownEngineCompatibility {
         else {
             return false
         }
+        // The engine uses editability to decide whether selection reveals
+        // syntax. Keep peer edits and selection restoration in one focus-aware
+        // styling scope, just like the full-restyle path below.
+        let wasEditable = textView.isEditable
+        textView.isEditable = wasEditable && textView.window?.firstResponder === textView
+        defer { textView.isEditable = wasEditable }
         let unchangedText = textView.string
         guard
             coordinator.textView(
@@ -136,6 +143,9 @@ enum MarkdownEngineCompatibility {
         )
         textStorage.endEditing()
         textView.didChangeText()
+        if textView.selectedRange() != selectedRange {
+            textView.setSelectedRange(selectedRange)
+        }
         return textView.string == updatedPresentation.text
     }
 

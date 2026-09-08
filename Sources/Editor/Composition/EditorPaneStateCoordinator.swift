@@ -478,6 +478,9 @@ final class EditorPaneStateCoordinator: NSObject {
                     edit,
                     from: previousPresentation,
                     to: newPresentation,
+                    restoringSelection: newPresentation.presentedRange(
+                        forSourceRange: pendingSelectionRestore ?? pane.selectedRange
+                    ),
                     in: textView
                 )
             pane.bindingMutationAccumulator.reset()
